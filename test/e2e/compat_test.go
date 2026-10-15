@@ -345,8 +345,8 @@ func TestBrowserCORS(t *testing.T) {
 
 func TestSignatureVerification(t *testing.T) {
 	srv := startServer(t, true, map[string]string{
-		"TULE_S3_AccessKeyID":     "AKIDTEST",
-		"TULE_S3_SecretAccessKey": "s3cr3t",
+		"TULE_Auth_AccessKeyID":     "AKIDTEST",
+		"TULE_Auth_SecretAccessKey": "s3cr3t",
 	})
 	creds := func(id, secret string) func(*s3.Options) {
 		return func(o *s3.Options) {

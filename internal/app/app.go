@@ -81,14 +81,12 @@ func installMiddleware(r *gas.Router, cfg *Config) {
 
 	r.UseMiddlewareFunc(gas.RequestLogger[httpx.RequestLogger]())
 
-	if s := cfg.S3; s.AccessKeyID != "" {
-		r.UseMiddlewareFunc(verifySignature(sigv4.NewVerifier(sigv4.Credentials{
-			AccessKeyID:     s.AccessKeyID,
-			SecretAccessKey: s.SecretAccessKey,
-		})))
-	}
-	if cfg.S3.Domain != "" {
-		r.UseMiddlewareFunc(virtualHost(cfg.S3.Domain))
+	r.UseMiddlewareFunc(verifySignature(sigv4.NewVerifier(sigv4.Credentials{
+		AccessKeyID:     cfg.Auth.AccessKeyID,
+		SecretAccessKey: cfg.Auth.SecretAccessKey,
+	})))
+	if cfg.Server.Domain != "" {
+		r.UseMiddlewareFunc(virtualHost(cfg.Server.Domain))
 	}
 
 	var hsts string

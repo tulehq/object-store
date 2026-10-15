@@ -1,6 +1,7 @@
 package app
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -17,7 +18,11 @@ type logSettings struct {
 	ShippingAPIKey   string
 }
 
+// serverSettings configures the HTTP server. Domain enables
+// virtual-hosted-style addressing: a request to <bucket>.<Domain> addresses
+// that bucket.
 type serverSettings struct {
+	Domain         string
 	RequestTimeout time.Duration `validate:"required"`
 }
 
@@ -27,15 +32,16 @@ type hstsSettings struct {
 	MaxAge time.Duration
 }
 
-// s3Settings configures the S3 endpoint. Domain enables virtual-hosted-style
-// addressing: a request to <bucket>.<Domain> addresses that bucket. Setting
-// AccessKeyID and SecretAccessKey turns on SigV4 request verification;
-// without them any credentials are accepted.
-type s3Settings struct {
-	Domain          string
-	AccessKeyID     string `validate:"required_with=SecretAccessKey"`
-	SecretAccessKey string `validate:"required_with=AccessKeyID"`
+// authSettings holds the one access key the server accepts. Every request
+// must be SigV4-signed with it, so both fields are required.
+type authSettings struct {
+	AccessKeyID     string
+	SecretAccessKey string
 }
+
+// errNoCredentials is returned when the access key is not configured.
+var errNoCredentials = errors.New("config: TULE_Auth_AccessKeyID and " +
+	"TULE_Auth_SecretAccessKey must be set; every request is verified against them")
 
 // Config is the bound application configuration. It keeps the store it was
 // bound from, which the app registers as the gas.ConfigProvider so services
@@ -44,7 +50,7 @@ type Config struct {
 	Log     *logSettings
 	Server  *serverSettings `validate:"required"`
 	HSTS    *hstsSettings
-	S3      *s3Settings       `validate:"required"`
+	Auth    *authSettings
 	Storage *dirimpl.Settings `validate:"required"`
 
 	store gas.ConfigProvider
@@ -101,6 +107,9 @@ func bindConfig(store gas.ConfigProvider, env gasenv.Environment) (*Config, erro
 	if err := store.Bind(&cfg); err != nil {
 		return nil, fmt.Errorf("config: %w", err)
 	}
+	if cfg.Auth == nil || cfg.Auth.AccessKeyID == "" || cfg.Auth.SecretAccessKey == "" {
+		return nil, errNoCredentials
+	}
 
 	return &cfg, nil
 }
@@ -109,5 +118,5 @@ func applyDefaults(store gas.ConfigProvider, _ gasenv.Environment) {
 	store.SetDefault("Server.Port", 9000)
 	store.SetDefault("Server.RequestTimeout", "30s")
 	store.SetDefault("Storage.RootDir", "./data")
-	store.SetDefault("S3.Domain", "localhost")
+	store.SetDefault("Server.Domain", "localhost")
 }

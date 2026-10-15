@@ -22,12 +22,12 @@ LABEL org.opencontainers.image.source=https://github.com/tulehq/object-store \
 COPY --from=build /out/tule-object-store /tule-object-store
 COPY --from=build --chown=nonroot:nonroot /out/data /data
 
-# Set TULE_S3_AccessKeyID and TULE_S3_SecretAccessKey to require SigV4
-# signatures. TULE_S3_Domain enables <bucket>.<domain> virtual-hosted-style
-# requests.
+# TULE_Auth_AccessKeyID and TULE_Auth_SecretAccessKey must be set at run time;
+# every request is verified against them. TULE_Server_Domain enables
+# <bucket>.<domain> virtual-hosted-style requests.
 ENV TULE_GasEnv=development \
     TULE_Storage_RootDir=/data \
-    TULE_S3_Domain=localhost
+    TULE_Server_Domain=localhost
 
 EXPOSE 9000
 VOLUME /data

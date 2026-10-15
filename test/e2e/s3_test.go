@@ -38,12 +38,15 @@ func startClient(t *testing.T, useTLS bool) *s3.Client {
 }
 
 // startServer starts the app in-process on a fresh storage root, with env
-// setting extra TULE_ variables.
+// setting extra TULE_ variables. It accepts the test/test credentials
+// clientFor signs with unless env changes them.
 func startServer(t *testing.T, useTLS bool, env map[string]string) *httptest.Server {
 	t.Helper()
 
 	t.Setenv("TULE_GasEnv", "testing")
 	t.Setenv("TULE_Storage_RootDir", t.TempDir())
+	t.Setenv("TULE_Auth_AccessKeyID", "test")
+	t.Setenv("TULE_Auth_SecretAccessKey", "test")
 	for k, v := range env {
 		t.Setenv(k, v)
 	}

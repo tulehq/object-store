@@ -13,14 +13,16 @@ no replication, and listings walk the bucket directory on every call.
 With Docker:
 
 ```sh
-docker run --rm -p 9000:9000 -v s3data:/data ghcr.io/tulehq/object-store:latest
+docker run --rm -p 9000:9000 -v s3data:/data \
+  -e TULE_Auth_AccessKeyID=test -e TULE_Auth_SecretAccessKey=test \
+  ghcr.io/tulehq/object-store:latest
 ```
 
 From source (Go 1.27):
 
 ```sh
 make build
-TULE_Storage_RootDir=./data ./build/tule-object-store
+TULE_Auth_AccessKeyID=test TULE_Auth_SecretAccessKey=test ./build/tule-object-store
 ```
 
 It listens on port 9000.
@@ -35,18 +37,21 @@ Settings come from environment variables prefixed with `TULE_`, and from a
 | `TULE_Server_Port` | `9000` | Listen port |
 | `TULE_Storage_RootDir` | `./data` (`/data` in the image) | Where buckets and objects are stored |
 | `TULE_HSTS_MaxAge` | unset | `Strict-Transport-Security` max age; the header is only sent when set |
-| `TULE_S3_Domain` | `localhost` | Enables virtual-hosted-style requests to `<bucket>.<domain>` |
-| `TULE_S3_AccessKeyID` | unset | With the secret below, turns on SigV4 signature verification |
-| `TULE_S3_SecretAccessKey` | unset | |
+| `TULE_Server_Domain` | `localhost` | Enables virtual-hosted-style requests to `<bucket>.<domain>` |
+| `TULE_Auth_AccessKeyID` | required | The access key clients sign requests with |
+| `TULE_Auth_SecretAccessKey` | required | Its secret |
 | `TULE_GasEnv` | | `development` logs at trace level, `testing` disables logging |
 
-Without credentials configured, any access key and signature are accepted.
+The server refuses to start without credentials, and every request must be
+signed with them (SigV4) or carry a presigned URL made with them. Any web page
+you visit can send requests to a server on localhost; signatures are what stop
+it from using this one.
 
 ## Connecting a client
 
 Use any region; buckets report `us-east-1`. Path-style addressing always
 works. Virtual-hosted style works when the client can resolve
-`<bucket>.<TULE_S3_Domain>` to the server.
+`<bucket>.<TULE_Server_Domain>` to the server.
 
 Go (AWS SDK v2):
 
@@ -99,9 +104,10 @@ any origin, and response headers such as `ETag` are exposed.
   coexist: with `a` stored, writing `a/b` fails with `409 KeyConflict`, and the
   reverse too. Keys ending in `/` (folder markers) or containing empty, `.` or
   `..` segments are rejected with `400 InvalidArgument`.
-- **Signature verification is request-level.** When enabled, header and
-  presigned-URL signatures, expiry, clock skew and hex payload hashes are
-  checked; the per-chunk signatures of streaming uploads are not.
+- **Signature verification is request-level.** Header and presigned-URL
+  signatures, expiry, clock skew and hex payload hashes are checked; the
+  per-chunk signatures of streaming uploads are not. There is one access key,
+  with access to everything.
 - **Not implemented** (requests return `501 NotImplemented`): enabling
   versioning, tagging, ACLs, bucket policies, CORS and lifecycle configuration,
   object lock, UploadPartCopy, and browser POST-policy uploads.
