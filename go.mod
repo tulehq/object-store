@@ -1,6 +1,6 @@
 module tule.dev/object-store
 
-go 1.27.1
+go 1.27.2
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.47.3
@@ -8,10 +8,10 @@ require (
 	github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager v0.4.16
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.114.3
 	github.com/aws/smithy-go v1.28.5
-	github.com/gasmod/gas v0.5.5
-	github.com/gasmod/gas/config v0.5.5
-	github.com/gasmod/gas/log v0.5.5
-	github.com/gasmod/gas/storage v0.5.5
+	github.com/gasmod/gas v0.5.6
+	github.com/gasmod/gas/config v0.5.6
+	github.com/gasmod/gas/log v0.5.6
+	github.com/gasmod/gas/storage v0.5.6
 	github.com/go-chi/chi/v5 v5.5.0
 	github.com/go-chi/cors v1.2.2
 	github.com/rs/zerolog v1.35.1
