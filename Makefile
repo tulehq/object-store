@@ -1,4 +1,4 @@
-.PHONY: default fmt test test-e2e test-clean build lint image push
+.PHONY: default fmt test test-e2e test-clean build lint image smoke push
 
 define run
 	@fail=0; \
@@ -39,6 +39,9 @@ VERSION ?= dev
 
 image:
 	docker build --build-arg VERSION=$(VERSION) -t $(IMAGE):$(VERSION) .
+
+smoke: image
+	test/smoke/run.sh $(IMAGE):$(VERSION)
 
 push:
 	docker buildx build --platform linux/amd64,linux/arm64 \

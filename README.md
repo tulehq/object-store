@@ -143,6 +143,7 @@ make test       # unit tests
 make test-e2e   # end-to-end tests: the app in-process, driven by the AWS SDK
 make lint
 make image      # build ghcr.io/tulehq/object-store:dev
+make smoke      # build the image, run it, and check it serves signed requests
 make push VERSION=0.1.0   # build for amd64 and arm64 and push
 ```
 
