@@ -33,6 +33,7 @@ type Service struct {
 var (
 	_ contracts.StorageProvider = (*Service)(nil)
 	_ gas.Service               = (*Service)(nil)
+	_ gas.ReadyReporter         = (*Service)(nil)
 )
 
 // NewService returns the constructor gas uses to build a Service from
@@ -57,6 +58,15 @@ func (s *Service) Init(context.Context) (err error) {
 
 	if s.dir, err = dir.NewProvider(dir.WithRoot(s.root))(s.config); err != nil {
 		return fmt.Errorf("%s: %w", s.Name(), errors.Join(err, s.root.Close()))
+	}
+	return nil
+}
+
+// CheckReady reports whether the bucket registry can be read, which fails
+// once the service is closed or the storage root goes away.
+func (s *Service) CheckReady(context.Context) error {
+	if _, err := s.root.Stat(bucketsDir); err != nil {
+		return fmt.Errorf("%s: %w", s.Name(), err)
 	}
 	return nil
 }

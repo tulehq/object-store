@@ -3,6 +3,8 @@
 package app
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -13,6 +15,7 @@ import (
 	"tule.dev/object-store/internal/contracts"
 	"tule.dev/object-store/internal/httpx"
 	"tule.dev/object-store/internal/modules/bucket"
+	"tule.dev/object-store/internal/modules/health"
 	"tule.dev/object-store/internal/modules/object"
 	"tule.dev/object-store/internal/services/storage/dirimpl"
 	"tule.dev/object-store/internal/sigv4"
@@ -36,6 +39,7 @@ func New(cfg *Config, extra ...gas.Option) (*gas.App, error) {
 	registerAppServices(app, cfg)
 	registerAppModules(app, cfg)
 	installMiddleware(app.Router(), cfg)
+	app.ReadyFunc(createBuckets(cfg.Storage.Buckets))
 
 	return app, nil
 }
@@ -53,6 +57,29 @@ func registerAppServices(app *gas.App, cfg *Config) {
 func registerAppModules(app *gas.App, _ *Config) {
 	app.RegisterSingletonService[*bucket.Module](bucket.NewModule)
 	app.RegisterSingletonService[*object.Module](object.NewModule)
+	app.RegisterSingletonService[*health.Module](health.NewModule)
+}
+
+// createBuckets returns a ready hook that creates each of names that does not
+// exist yet. Ready hooks run before the server listens, so clients never see
+// the store without them.
+func createBuckets(names []string) func(*gas.ServiceContainer) error {
+	return func(sc *gas.ServiceContainer) error {
+		storage, err := sc.Resolve[contracts.StorageProvider]()
+		if err != nil {
+			return fmt.Errorf("app: failed to resolve storage: %w", err)
+		}
+		for _, name := range names {
+			if name == "" {
+				continue
+			}
+			_, cErr := storage.CreateBucket(context.Background(), name)
+			if cErr != nil && !errors.Is(cErr, contracts.ErrBucketExists) {
+				return fmt.Errorf("app: failed to create bucket %q: %w", name, cErr)
+			}
+		}
+		return nil
+	}
 }
 
 func installMiddleware(r *gas.Router, cfg *Config) {
@@ -84,7 +111,7 @@ func installMiddleware(r *gas.Router, cfg *Config) {
 	r.UseMiddlewareFunc(verifySignature(sigv4.NewVerifier(sigv4.Credentials{
 		AccessKeyID:     cfg.Auth.AccessKeyID,
 		SecretAccessKey: cfg.Auth.SecretAccessKey,
-	})))
+	}), cfg.Server.Domain))
 	if cfg.Server.Domain != "" {
 		r.UseMiddlewareFunc(virtualHost(cfg.Server.Domain))
 	}

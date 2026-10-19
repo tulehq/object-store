@@ -15,8 +15,13 @@ With Docker:
 ```sh
 docker run --rm -p 9000:9000 -v s3data:/data \
   -e TULE_Auth_AccessKeyID=test -e TULE_Auth_SecretAccessKey=test \
+  -e TULE_Storage_Buckets=uploads,assets \
   ghcr.io/tulehq/object-store:latest
 ```
+
+The image is based on Alpine, so `docker exec -it <container> sh` gives you a
+shell. It runs as the unprivileged `nonroot` user, and its Docker health check
+polls `/_ready`.
 
 From source (Go 1.27):
 
@@ -36,6 +41,7 @@ Settings come from environment variables prefixed with `TULE_`, and from a
 |---|---|---|
 | `TULE_Server_Port` | `9000` | Listen port |
 | `TULE_Storage_RootDir` | `./data` (`/data` in the image) | Where buckets and objects are stored |
+| `TULE_Storage_Buckets` | unset | Comma-separated buckets to create at startup, if missing |
 | `TULE_HSTS_MaxAge` | unset | `Strict-Transport-Security` max age; the header is only sent when set |
 | `TULE_Server_Domain` | `localhost` | Enables virtual-hosted-style requests to `<bucket>.<domain>` |
 | `TULE_Auth_AccessKeyID` | required | The access key clients sign requests with |
@@ -46,6 +52,16 @@ The server refuses to start without credentials, and every request must be
 signed with them (SigV4) or carry a presigned URL made with them. Any web page
 you visit can send requests to a server on localhost; signatures are what stop
 it from using this one.
+
+## Health checks
+
+`GET /_health` (liveness) and `GET /_ready` (readiness) answer without a
+signature. They respond `200` when every service reports healthy or ready and
+`503` otherwise, with a JSON object of each service's status. Readiness fails
+when the storage root cannot be read.
+
+Startup buckets are created before the server listens, so once either probe
+answers, they exist.
 
 ## Connecting a client
 
