@@ -368,7 +368,7 @@ func TestSignatureVerification(t *testing.T) {
 	_, err = clientFor(srv, creds("OTHER", "s3cr3t")).ListBuckets(ctx, &s3.ListBucketsInput{})
 	requireCode(t, err, "InvalidAccessKeyId")
 
-	status, _ := doWith(t, srv.Client(), http.MethodGet, srv.URL+"/auth/stream", nil)
+	status, _ := getWith(t, srv.Client(), srv.URL+"/auth/stream")
 	requireEqual(t, status, http.StatusForbidden, "unsigned request")
 
 	presigner := s3.NewPresignClient(c)
@@ -376,7 +376,7 @@ func TestSignatureVerification(t *testing.T) {
 		Bucket: aws.String("auth"), Key: aws.String("dir/a b=c.txt"),
 	})
 	requireNoErr(t, err, "presign get")
-	status, body = doWith(t, srv.Client(), http.MethodGet, getReq.URL, nil)
+	status, body = getWith(t, srv.Client(), getReq.URL)
 	requireEqual(t, status, http.StatusOK, "presigned get status")
 	requireEqual(t, string(body), "signed", "presigned get body")
 
@@ -387,18 +387,17 @@ func TestSignatureVerification(t *testing.T) {
 	q := u.Query()
 	q.Set("X-Amz-Date", time.Now().UTC().Add(-2*time.Hour).Format("20060102T150405Z"))
 	u.RawQuery = q.Encode()
-	status, body = doWith(t, srv.Client(), http.MethodGet, u.String(), nil)
+	status, body = getWith(t, srv.Client(), u.String())
 	requireEqual(t, status, http.StatusForbidden, "expired presigned get status")
 	requireEqual(t, strings.Contains(string(body), "Request has expired"), true, "expired message")
 }
 
-func doWith(t *testing.T, client *http.Client, method, rawURL string, body []byte) (int, []byte) {
+func getWith(t *testing.T, client *http.Client, rawURL string) (int, []byte) {
 	t.Helper()
-	req, err := http.NewRequestWithContext(context.Background(), method, rawURL,
-		bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, rawURL, nil)
 	requireNoErr(t, err, "build request")
 	res, err := client.Do(req)
-	requireNoErr(t, err, method+" "+rawURL)
+	requireNoErr(t, err, "GET "+rawURL)
 	defer func() { _ = res.Body.Close() }()
 	var buf bytes.Buffer
 	_, err = buf.ReadFrom(res.Body)
