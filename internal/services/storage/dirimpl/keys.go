@@ -3,13 +3,7 @@ package dirimpl
 import (
 	"context"
 	"errors"
-	"fmt"
-	"io/fs"
-	"path"
-	"path/filepath"
-	"strings"
 	"sync"
-	"syscall"
 
 	"github.com/gasmod/gas/storage"
 
@@ -54,81 +48,6 @@ func (l *keyLocks) lock(bucket, key string) func() {
 		}
 		l.mu.Unlock()
 	}
-}
-
-// supportedKey reports whether key maps onto a file path one-to-one. Keys
-// with a trailing slash or empty, "." or ".." segments would be stored under
-// a different key than the one written.
-func supportedKey(key string) bool {
-	return !strings.HasSuffix(key, "/") && path.Clean(key) == key
-}
-
-// isNotDir reports whether err comes from using a file as a directory, which
-// is how a path under an object key fails.
-func isNotDir(err error) bool {
-	return errors.Is(err, syscall.ENOTDIR)
-}
-
-// checkWritable returns contracts.ErrUnsupportedKey or contracts.ErrKeyConflict
-// when key cannot be written to bucket. A directory left at key by deleted
-// nested keys does not count as a conflict and is removed.
-func (s *Service) checkWritable(bucket, key string) error {
-	if !supportedKey(key) {
-		return contracts.ErrUnsupportedKey
-	}
-
-	segments := strings.Split(key, "/")
-	for i := 1; i < len(segments); i++ {
-		info, err := s.root.Stat(filepath.Join(bucket, filepath.Join(segments[:i]...)))
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil
-		}
-		if err != nil {
-			return fmt.Errorf("%s: check key %q: %w", s.Name(), key, err)
-		}
-		if !info.IsDir() {
-			return contracts.ErrKeyConflict
-		}
-	}
-
-	name := filepath.Join(bucket, key)
-	info, err := s.root.Stat(name)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("%s: check key %q: %w", s.Name(), key, err)
-	}
-	if !info.IsDir() {
-		return nil
-	}
-
-	return s.removeEmptyDir(name)
-}
-
-// removeEmptyDir removes the directory tree at name when it holds no files,
-// and returns contracts.ErrKeyConflict when it does.
-func (s *Service) removeEmptyDir(name string) error {
-	err := fs.WalkDir(s.root.FS(), name, func(_ string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if !d.IsDir() {
-			return contracts.ErrKeyConflict
-		}
-		return nil
-	})
-	if err != nil {
-		if errors.Is(err, contracts.ErrKeyConflict) {
-			return contracts.ErrKeyConflict
-		}
-		return fmt.Errorf("%s: check key %q: %w", s.Name(), name, err)
-	}
-
-	if err = s.root.RemoveAll(name); err != nil {
-		return fmt.Errorf("%s: remove empty directory %q: %w", s.Name(), name, err)
-	}
-	return nil
 }
 
 // checkPrecondition returns contracts.ErrPreconditionFailed when cond does not

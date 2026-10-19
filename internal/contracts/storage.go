@@ -7,8 +7,6 @@ import (
 	"errors"
 	"io"
 	"time"
-
-	"github.com/gasmod/gas"
 )
 
 var (
@@ -40,15 +38,6 @@ var (
 	// ErrPreconditionFailed is returned when a write's Precondition does not
 	// hold.
 	ErrPreconditionFailed = errors.New("storage: precondition failed")
-
-	// ErrKeyConflict is returned when a key cannot be stored because an object
-	// already uses it as a prefix, or a prefix of it is already an object.
-	// Keys map to file paths, so "a" and "a/b" cannot both exist.
-	ErrKeyConflict = errors.New("storage: key conflicts with an existing object or prefix")
-
-	// ErrUnsupportedKey is returned for keys that do not map onto a file path
-	// one-to-one: a trailing slash, or an empty, "." or ".." segment.
-	ErrUnsupportedKey = errors.New("storage: unsupported key")
 )
 
 // MinPartSize is the smallest size S3 allows for every multipart part but the
@@ -58,18 +47,17 @@ const MinPartSize = 5 << 20
 // MaxPartNumber is the highest part number S3 allows.
 const MaxPartNumber = 10000
 
-// StorageProvider is the object store the S3 API is served from: the gas
-// object storage operations plus the bucket, listing, conditional write and
-// multipart operations S3 needs.
+// StorageProvider is the object store the S3 API is served from: the bucket,
+// object, listing, conditional write and multipart operations S3 needs.
 type StorageProvider interface {
-	gas.StorageProvider
-
 	ListBuckets(ctx context.Context) ([]BucketInfo, error)
 	ListObjects(ctx context.Context, bucket string, in ListObjectsInput) (*ListObjectsOutput, error)
 	HeadBucket(ctx context.Context, bucket string) (*BucketInfo, error)
 	CreateBucket(ctx context.Context, bucket string) (*BucketInfo, error)
 	DeleteBucket(ctx context.Context, bucket string) error
 	StatObject(ctx context.Context, bucket, key string) (*ObjectInfo, error)
+	GetObject(ctx context.Context, bucket, key string) (*Object, error)
+	DeleteObject(ctx context.Context, bucket, key string) error
 	PutObject(
 		ctx context.Context,
 		bucket, key string,
@@ -121,6 +109,12 @@ type ObjectInfo struct {
 	ETag         string
 	PartSizes    []int64
 	Size         int64
+}
+
+// Object is an object opened for reading. The caller must close Body.
+type Object struct {
+	Body io.ReadCloser
+	ObjectInfo
 }
 
 // ListObjectsInput selects the keys a ListObjects call returns, following

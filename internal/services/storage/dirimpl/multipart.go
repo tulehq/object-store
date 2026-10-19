@@ -19,16 +19,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gasmod/gas"
-	"github.com/gasmod/gas/storage/dir"
-
 	"tule.dev/object-store/internal/contracts"
 )
-
-// multipartDir is where in-progress multipart uploads are staged, one
-// directory per upload ID. It is not a valid bucket name, so it can never
-// collide with a bucket.
-const multipartDir = ".multipart"
 
 const manifestFile = "upload.json"
 
@@ -66,11 +58,8 @@ func (s *Service) CreateMultipartUpload(
 	if _, err := s.HeadBucket(ctx, bucket); err != nil {
 		return "", err
 	}
-	if !filepath.IsLocal(key) {
-		return "", fmt.Errorf("%s: create upload %q: %w", s.Name(), key, dir.ErrInvalidPath)
-	}
-	if !supportedKey(key) {
-		return "", contracts.ErrUnsupportedKey
+	if err := s.checkKey(ctx, bucket, key); err != nil {
+		return "", err
 	}
 
 	id := rand.Text()
@@ -202,9 +191,6 @@ func (s *Service) CompleteMultipartUpload(
 	unlock := s.locks.lock(bucket, key)
 	defer unlock()
 
-	if err = s.checkWritable(bucket, key); err != nil {
-		return nil, err
-	}
 	if err = s.checkPrecondition(ctx, bucket, key, cond); err != nil {
 		return nil, err
 	}
@@ -218,18 +204,13 @@ func (s *Service) CompleteMultipartUpload(
 	meta[etagMetaKey] = etag
 	joinParts(meta, sizes)
 
-	opts := []gas.StorageOption{gas.InBucket(bucket), gas.WithMetadata(meta)}
-	if m.Put.ContentType != "" {
-		opts = append(opts, gas.WithContentType(m.Put.ContentType))
-	}
-
 	names := make([]string, len(parts))
 	for i, p := range parts {
 		names[i] = partFile(uploadID, p.PartNumber)
 	}
 	r := &partsReader{root: s.root, names: names}
 
-	err = s.dir.Upload(ctx, key, r, opts...)
+	info, err := s.putObject(ctx, bucket, key, r, m.Put.ContentType, meta)
 	if cErr := r.Close(); cErr != nil {
 		err = errors.Join(err, cErr)
 	}
@@ -241,7 +222,7 @@ func (s *Service) CompleteMultipartUpload(
 		return nil, fmt.Errorf("%s: complete upload %s: %w", s.Name(), uploadID, err)
 	}
 
-	return s.StatObject(ctx, bucket, key)
+	return info, nil
 }
 
 // checkParts validates a completion's part list against the uploaded parts

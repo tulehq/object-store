@@ -62,7 +62,7 @@ func (m *Module) deleteOne(ctx gas.Context, bucket string, obj s3api.ObjectIdent
 	if obj.VersionID != "" {
 		return s3api.ErrNotImplemented("Deleting a specific object version is not supported.")
 	}
-	if err := m.storage.Delete(ctx, obj.Key, gas.InBucket(bucket)); err != nil {
+	if err := m.storage.DeleteObject(ctx, bucket, obj.Key); err != nil {
 		return fmt.Errorf("delete %q: %w", obj.Key, err)
 	}
 	return nil

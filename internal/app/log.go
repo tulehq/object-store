@@ -15,7 +15,7 @@ import (
 
 func newLogger(s *logSettings, env gasenv.Environment) (gas.Logger, error) {
 	if env.IsTesting() {
-		return gas.NewNopLogger()(), nil
+		return &gas.NopLogger{}, nil
 	}
 	if env.IsProductionLike() {
 		return newProdLogger(s)
@@ -29,7 +29,7 @@ func newProdLogger(_ *logSettings) (gas.Logger, error) {
 	zl := zerolog.New(out).Level(zerolog.WarnLevel).With().Timestamp().
 		Str("app_ver", buildinfo.Version).Logger()
 
-	return log.NewZeroLogLogger(log.WithZeroLogInstance(&zl))(), nil
+	return log.NewZeroLogLogger(log.WithZeroLogInstance(&zl))()
 }
 
 func newDevLogger(_ *logSettings) (gas.Logger, error) {
@@ -38,7 +38,7 @@ func newDevLogger(_ *logSettings) (gas.Logger, error) {
 	zl := zerolog.New(out).Level(zerolog.TraceLevel).With().Timestamp().
 		Str("app_ver", buildinfo.Version).Logger()
 
-	return log.NewZeroLogLogger(log.WithZeroLogInstance(&zl))(), nil
+	return log.NewZeroLogLogger(log.WithZeroLogInstance(&zl))()
 }
 
 func resolveRequestLogger(l gas.Logger) httpx.RequestLogger {

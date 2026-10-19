@@ -71,50 +71,37 @@ func TestConditionalWrites(t *testing.T) {
 	requireNoErr(t, err, "complete after failed precondition")
 }
 
-func TestKeyConflicts(t *testing.T) {
+// TestNestedKeys checks that keys are opaque strings, as on S3: an object and
+// keys nested under it coexist, and folder markers and "." or ".." segments
+// are ordinary keys.
+func TestNestedKeys(t *testing.T) {
 	c := newClient(t)
 	ctx := context.Background()
 	createBucket(t, c, "keys")
 	bucket := aws.String("keys")
 
-	put(t, c, "keys", "a", []byte("a"))
-	_, err := c.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: bucket, Key: aws.String("a/b"), Body: strings.NewReader("x"),
-	})
-	requireCode(t, err, "KeyConflict")
+	keys := []string{"a", "a/b", "dir/", "x//y", "../up", "p/./q"}
+	for _, k := range keys {
+		put(t, c, "keys", k, []byte(k))
+	}
+	for _, k := range keys {
+		_, body := get(t, c, &s3.GetObjectInput{Bucket: bucket, Key: aws.String(k)})
+		requireEqual(t, string(body), k, "body of "+k)
+	}
+	requireEqual(t, strings.Join(listKeys(t, c, "keys"), ","),
+		"../up,a,a/b,dir/,p/./q,x//y", "listed keys")
 
-	put(t, c, "keys", "c/d", []byte("d"))
-	_, err = c.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: bucket, Key: aws.String("c"), Body: strings.NewReader("x"),
-	})
-	requireCode(t, err, "KeyConflict")
-
-	_, err = c.GetObject(ctx, &s3.GetObjectInput{Bucket: bucket, Key: aws.String("a/b")})
-	requireAs[*types.NoSuchKey](t, err)
-	_, err = c.GetObject(ctx, &s3.GetObjectInput{Bucket: bucket, Key: aws.String("c")})
-	requireAs[*types.NoSuchKey](t, err)
-
-	// Deleting a key that is only a prefix is a no-op, as on S3.
-	_, err = c.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: bucket, Key: aws.String("c")})
-	requireNoErr(t, err, "delete prefix-only key")
-	_, err = c.HeadObject(ctx, &s3.HeadObjectInput{Bucket: bucket, Key: aws.String("c/d")})
-	requireNoErr(t, err, "nested object survives")
-
-	// Once the nested key is gone, its leftover directory does not block c.
-	_, err = c.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: bucket, Key: aws.String("c/d")})
-	requireNoErr(t, err, "delete nested key")
-	put(t, c, "keys", "c", []byte("c"))
+	_, err := c.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: bucket, Key: aws.String("a")})
+	requireNoErr(t, err, "delete a")
+	_, body := get(t, c, &s3.GetObjectInput{Bucket: bucket, Key: aws.String("a/b")})
+	requireEqual(t, string(body), "a/b", "a/b survives deleting a")
+	requireEqual(t, strings.Join(listKeys(t, c, "keys"), ","),
+		"../up,a/b,dir/,p/./q,x//y", "listed keys after delete")
 
 	_, err = c.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: bucket, Key: aws.String("dir/"), Body: strings.NewReader(""),
+		Bucket: bucket, Key: aws.String("ends/."), Body: strings.NewReader("x"),
 	})
 	requireCode(t, err, "InvalidArgument")
-	_, err = c.GetObject(ctx, &s3.GetObjectInput{Bucket: bucket, Key: aws.String("a/")})
-	requireAs[*types.NoSuchKey](t, err)
-	_, err = c.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: bucket, Key: aws.String("a/")})
-	requireNoErr(t, err, "delete unsupported key")
-	_, body := get(t, c, &s3.GetObjectInput{Bucket: bucket, Key: aws.String("a")})
-	requireEqual(t, string(body), "a", "a survives deleting a/")
 }
 
 func TestBucketConfigReads(t *testing.T) {

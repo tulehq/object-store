@@ -3,6 +3,7 @@
 package object
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/gasmod/gas"
@@ -35,13 +36,13 @@ func (m *Module) Name() string {
 }
 
 // Init registers the module's routes.
-func (m *Module) Init() error {
+func (m *Module) Init(context.Context) error {
 	m.registerRoutes()
 	return nil
 }
 
 // Close releases nothing; the module holds no resources of its own.
-func (m *Module) Close() error {
+func (m *Module) Close(context.Context) error {
 	return nil
 }
 

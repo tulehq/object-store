@@ -13,15 +13,15 @@ import (
 )
 
 // etagMetaKey is the metadata key the object's ETag is stored under, next to
-// the user metadata in the backend's sidecar file.
+// the user metadata in the backend's metadata file.
 const etagMetaKey = "__TULE_ETAG__"
 
 // etagReader hashes everything read through it and records the hex digest in
 // meta once the underlying reader reports EOF.
 //
-// The dir backend reads the body to EOF before it copies the metadata map it
-// was given, which is what lets the digest land in the sidecar written for
-// this same upload. TestUploadRecordsETag guards that ordering.
+// The dir backend reads the body to EOF before it stores the metadata map it
+// was given, which is what lets the digest land in the metadata written for
+// this same upload. TestPutRecordsETag guards that ordering.
 type etagReader struct {
 	r    io.Reader
 	h    hash.Hash

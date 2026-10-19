@@ -11,14 +11,14 @@ import (
 // separately from the application-wide one.
 type RequestLogger interface{ gas.Logger }
 
-var nop = gas.NewNopLogger()()
+var nop = &gas.NopLogger{}
 
 // Logger returns the logger carried by ctx, tagged with the authenticated
 // subject when ctx has a principal. It falls back to a no-op logger so callers
 // never have to nil-check the result.
 func Logger(ctx context.Context) gas.Logger {
 	if l := gas.LoggerFromContext(ctx); l != nil {
-		if principal := gas.PrincipalFromContext(ctx); principal != nil {
+		if principal, ok := gas.PrincipalFromContext(ctx); ok {
 			return l.With().Str("sub", principal.Subject()).Logger()
 		}
 		return l

@@ -6,7 +6,7 @@ AWS SDK at it and the usual bucket, object, multipart and presigned-URL calls
 work.
 
 It is not a production object store. There is one storage root on one machine,
-no replication, and listings walk the bucket directory on every call.
+no replication, and listings read the bucket's whole key index on every call.
 
 ## Running it
 
@@ -100,10 +100,14 @@ any origin, and response headers such as `ETag` are exposed.
 
 ## Differences from S3
 
-- **Keys map to file paths.** An object and keys nested under it cannot
-  coexist: with `a` stored, writing `a/b` fails with `409 KeyConflict`, and the
-  reverse too. Keys ending in `/` (folder markers) or containing empty, `.` or
-  `..` segments are rejected with `400 InvalidArgument`.
+- **Keys.** Keys are opaque strings, as on S3: `a` and `a/b` coexist, and
+  folder markers and `.` or `..` segments are ordinary keys. A key must be 1
+  to 1024 bytes of valid UTF-8 and must not end in a `.` segment (`a/.`);
+  other keys are rejected with `400 InvalidArgument`.
+- **Storage layout.** Objects are stored by the gas `storage/dir` backend
+  under hashed names, so the storage root is not browsable as files.
+  Directories written by earlier versions, which stored keys as file paths,
+  are not readable by this one.
 - **Signature verification is request-level.** Header and presigned-URL
   signatures, expiry, clock skew and hex payload hashes are checked; the
   per-chunk signatures of streaming uploads are not. There is one access key,

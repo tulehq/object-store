@@ -8,7 +8,6 @@ import (
 
 	"github.com/gasmod/gas"
 	"github.com/gasmod/gas/storage"
-	"github.com/gasmod/gas/storage/dir"
 	"github.com/go-chi/chi/v5/middleware"
 
 	"tule.dev/object-store/internal/contracts"
@@ -151,6 +150,8 @@ var sentinelErrors = []struct {
 		"The bucket you tried to delete is not empty.")},
 	{contracts.ErrInvalidBucketName, NewError(http.StatusBadRequest, "InvalidBucketName",
 		"The specified bucket is not valid.")},
+	{storage.ErrInvalidBucket, NewError(http.StatusBadRequest, "InvalidBucketName",
+		"The specified bucket is not valid.")},
 	{contracts.ErrNoSuchUpload, NewError(http.StatusNotFound, "NoSuchUpload",
 		"The specified multipart upload does not exist. The upload ID might be invalid, "+
 			"or the multipart upload might have been aborted or completed.")},
@@ -161,12 +162,8 @@ var sentinelErrors = []struct {
 		"The list of parts was not in ascending order. Parts must be ordered by part number.")},
 	{contracts.ErrEntityTooSmall, NewError(http.StatusBadRequest, "EntityTooSmall",
 		"Your proposed upload is smaller than the minimum allowed object size.")},
-	{dir.ErrInvalidPath, ErrInvalidArgument("The specified key is not valid for this store.")},
-	{contracts.ErrUnsupportedKey, ErrInvalidArgument("This store cannot hold keys that end " +
-		"with a slash or contain empty, \".\" or \"..\" segments.")},
-	{contracts.ErrKeyConflict, NewError(http.StatusConflict, "KeyConflict",
-		"This store cannot hold both an object and keys nested under it, such as "+
-			"\"a\" and \"a/b\". The key conflicts with an existing object or prefix.")},
+	{storage.ErrInvalidKey, ErrInvalidArgument("The specified key is not valid. Keys must be " +
+		"1 to 1024 bytes of UTF-8 and must not end in a \".\" path segment.")},
 	{contracts.ErrPreconditionFailed, ErrPreconditionFailed()},
 }
 

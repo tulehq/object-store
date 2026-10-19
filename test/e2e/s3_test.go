@@ -63,7 +63,7 @@ func startServer(t *testing.T, useTLS bool, env map[string]string) *httptest.Ser
 	if err != nil {
 		t.Fatalf("new app: %v", err)
 	}
-	if err = a.Start(); err != nil {
+	if err = a.Start(context.Background()); err != nil {
 		t.Fatalf("start app: %v", err)
 	}
 
@@ -75,7 +75,7 @@ func startServer(t *testing.T, useTLS bool, env map[string]string) *httptest.Ser
 	}
 	t.Cleanup(func() {
 		srv.Close()
-		if sErr := a.Shutdown(); sErr != nil {
+		if sErr := a.Shutdown(context.Background()); sErr != nil {
 			t.Errorf("shutdown: %v", sErr)
 		}
 	})

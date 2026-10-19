@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"path/filepath"
 	"regexp"
-	"slices"
 	"strings"
 
 	"github.com/gasmod/gas/storage"
@@ -14,30 +14,20 @@ import (
 	"tule.dev/object-store/internal/contracts"
 )
 
-// The dir backend keeps these next to each object. They mirror unexported
-// constants in github.com/gasmod/gas/storage/dir and must stay in sync with it.
-const (
-	backendMetaFilePrefix = ".__GAS_FILE_METADATA__"
-	backendTmpFilePrefix  = ".__GAS_FILE_TMP__"
-)
-
 // bucketNameRe is the core of the S3 general purpose bucket naming rules:
 // 3-63 characters of lowercase letters, digits, dots and hyphens, starting and
 // ending with a letter or digit.
 var bucketNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$`)
 
-// ListBuckets returns every bucket: the root's subdirectories that are valid
-// bucket names. A bucket's creation date is its directory's modification time.
+// ListBuckets returns every bucket in the bucket registry.
 func (s *Service) ListBuckets(_ context.Context) ([]contracts.BucketInfo, error) {
-	entries, err := fs.ReadDir(s.root.FS(), ".")
+	entries, err := fs.ReadDir(s.root.FS(), bucketsDir)
 	if err != nil {
-		return nil, fmt.Errorf("%s: failed to read root directory: %w", s.Name(), err)
+		return nil, fmt.Errorf("%s: failed to read bucket registry: %w", s.Name(), err)
 	}
 
 	buckets := make([]contracts.BucketInfo, 0, len(entries))
 	for _, e := range entries {
-		// Directories that are not valid bucket names, such as the multipart
-		// staging area, are not buckets.
 		if !e.IsDir() || !bucketNameRe.MatchString(e.Name()) {
 			continue
 		}
@@ -54,14 +44,14 @@ func (s *Service) ListBuckets(_ context.Context) ([]contracts.BucketInfo, error)
 	return buckets, nil
 }
 
-// ListObjects lists one page of bucket. Every call walks the whole bucket
-// directory, which is fine at local-development scale.
+// ListObjects lists one page of bucket. Every call reads the bucket's whole
+// key index, which is fine at local-development scale.
 func (s *Service) ListObjects(
 	ctx context.Context,
 	bucket string,
 	in contracts.ListObjectsInput,
 ) (*contracts.ListObjectsOutput, error) {
-	keys, err := s.bucketKeys(bucket)
+	keys, err := s.bucketKeys(ctx, bucket)
 	if err != nil {
 		return nil, err
 	}
@@ -94,16 +84,41 @@ func (s *Service) ListObjects(
 			out.IsTruncated = true
 			break
 		}
-		info, sErr := s.StatObject(ctx, bucket, key)
-		if sErr != nil {
-			return nil, sErr
+		if err = s.listObject(ctx, bucket, key, out); err != nil {
+			return nil, err
 		}
-		out.Objects = append(out.Objects, *info)
-		out.NextStartAfter = key
-		count++
+		count = len(out.CommonPrefixes) + len(out.Objects)
 	}
 
 	return out, nil
+}
+
+// bucketKeys returns the keys in bucket's index, sorted, or
+// storage.ErrBucketNotFound when there is no such bucket.
+func (s *Service) bucketKeys(ctx context.Context, bucket string) ([]string, error) {
+	if _, err := s.HeadBucket(ctx, bucket); err != nil {
+		return nil, err
+	}
+	return s.indexedKeys(bucket)
+}
+
+// listObject adds the object at key to out. An indexed key that holds no
+// object is skipped.
+func (s *Service) listObject(
+	ctx context.Context,
+	bucket, key string,
+	out *contracts.ListObjectsOutput,
+) error {
+	info, err := s.StatObject(ctx, bucket, key)
+	if errors.Is(err, storage.ErrKeyNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	out.Objects = append(out.Objects, *info)
+	out.NextStartAfter = key
+	return nil
 }
 
 // isAfter reports whether key sorts after the listing's start point. A start
@@ -133,48 +148,14 @@ func commonPrefix(key, prefix, delimiter string) string {
 	return key[:len(prefix)+i+len(delimiter)]
 }
 
-// bucketKeys returns every object key in bucket, sorted. It skips the dir
-// backend's metadata and temp files, and directories, which are left behind
-// when nested keys are deleted and do not count as objects.
-func (s *Service) bucketKeys(bucket string) ([]string, error) {
-	if !bucketNameRe.MatchString(bucket) {
-		return nil, storage.ErrBucketNotFound
-	}
-
-	var keys []string
-	err := fs.WalkDir(s.root.FS(), bucket, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			return nil
-		}
-		name := d.Name()
-		if strings.HasPrefix(name, backendMetaFilePrefix) ||
-			strings.HasPrefix(name, backendTmpFilePrefix) {
-			return nil
-		}
-		keys = append(keys, strings.TrimPrefix(p, bucket+"/"))
-		return nil
-	})
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil, storage.ErrBucketNotFound
-		}
-		return nil, fmt.Errorf("%s: failed to list bucket %s: %w", s.Name(), bucket, err)
-	}
-
-	slices.Sort(keys)
-	return keys, nil
-}
-
-// HeadBucket returns storage.ErrBucketNotFound when bucket does not exist.
+// HeadBucket returns storage.ErrBucketNotFound when bucket is not in the
+// bucket registry.
 func (s *Service) HeadBucket(_ context.Context, bucket string) (*contracts.BucketInfo, error) {
 	if !bucketNameRe.MatchString(bucket) {
 		return nil, storage.ErrBucketNotFound
 	}
 
-	info, err := s.root.Stat(bucket)
+	info, err := s.root.Stat(filepath.Join(bucketsDir, bucket))
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, storage.ErrBucketNotFound
@@ -190,41 +171,61 @@ func (s *Service) HeadBucket(_ context.Context, bucket string) (*contracts.Bucke
 
 // CreateBucket creates bucket. It returns contracts.ErrInvalidBucketName for a
 // name S3 would reject and contracts.ErrBucketExists when it already exists.
-func (s *Service) CreateBucket(_ context.Context, bucket string) (*contracts.BucketInfo, error) {
+//
+// The bucket is created in the backend and given an index directory before
+// it is added to the registry, which is what makes it exist, so an
+// interrupted create is completed by the next one.
+func (s *Service) CreateBucket(ctx context.Context, bucket string) (*contracts.BucketInfo, error) {
 	if !bucketNameRe.MatchString(bucket) {
 		return nil, contracts.ErrInvalidBucketName
 	}
+	if _, err := s.HeadBucket(ctx, bucket); err == nil {
+		return nil, contracts.ErrBucketExists
+	} else if !errors.Is(err, storage.ErrBucketNotFound) {
+		return nil, err
+	}
 
-	if err := s.root.Mkdir(bucket, 0o755); err != nil {
+	if _, err := s.dir.CreateBucket(ctx, &storage.CreateBucketInput{Bucket: bucket}); err != nil {
+		return nil, fmt.Errorf("%s: failed to create bucket: %s: %w", s.Name(), bucket, err)
+	}
+	if err := s.root.MkdirAll(filepath.Join(indexDir, bucket), 0o750); err != nil {
+		return nil, fmt.Errorf("%s: failed to create bucket: %s: %w", s.Name(), bucket, err)
+	}
+	if err := s.root.Mkdir(filepath.Join(bucketsDir, bucket), 0o750); err != nil {
 		if errors.Is(err, fs.ErrExist) {
 			return nil, contracts.ErrBucketExists
 		}
 		return nil, fmt.Errorf("%s: failed to create bucket: %s: %w", s.Name(), bucket, err)
 	}
 
-	info, err := s.root.Stat(bucket)
-	if err != nil {
-		return nil, fmt.Errorf("%s: failed to stat bucket: %s: %w", s.Name(), bucket, err)
-	}
-
-	return &contracts.BucketInfo{Name: bucket, CreationDate: info.ModTime()}, nil
+	return s.HeadBucket(ctx, bucket)
 }
 
 // DeleteBucket removes an empty bucket. It returns contracts.ErrBucketNotEmpty
 // while the bucket holds objects.
-func (s *Service) DeleteBucket(_ context.Context, bucket string) error {
-	keys, err := s.bucketKeys(bucket)
+//
+// The backend cannot delete buckets, so its directories for the bucket stay
+// behind, empty. Creating the bucket again reuses them.
+func (s *Service) DeleteBucket(ctx context.Context, bucket string) error {
+	keys, err := s.bucketKeys(ctx, bucket)
 	if err != nil {
 		return err
 	}
-	if len(keys) > 0 {
-		return contracts.ErrBucketNotEmpty
+	for _, key := range keys {
+		_, sErr := s.StatObject(ctx, bucket, key)
+		if sErr == nil {
+			return contracts.ErrBucketNotEmpty
+		}
+		if !errors.Is(sErr, storage.ErrKeyNotFound) {
+			return sErr
+		}
 	}
 
-	// Anything left is empty directories from deleted nested keys or orphaned
-	// backend temp files, none of which S3 would count as objects.
-	if err = s.root.RemoveAll(bucket); err != nil {
+	if err = s.root.Remove(filepath.Join(bucketsDir, bucket)); err != nil {
 		return fmt.Errorf("%s: failed to delete bucket: %s: %w", s.Name(), bucket, err)
+	}
+	if err = s.root.RemoveAll(filepath.Join(indexDir, bucket)); err != nil {
+		return fmt.Errorf("%s: failed to delete bucket index: %s: %w", s.Name(), bucket, err)
 	}
 
 	return nil

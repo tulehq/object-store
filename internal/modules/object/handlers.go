@@ -40,17 +40,7 @@ func (m *Module) getObject(ctx gas.Context) error {
 		return s3api.WriteError(ctx, t, err)
 	}
 
-	info, err := m.storage.StatObject(ctx, t.Bucket, t.Key)
-	if err != nil {
-		return s3api.WriteError(ctx, t, err)
-	}
-
-	serve, err := partRequest(w, r, info)
-	if err != nil {
-		return s3api.WriteError(ctx, t, err)
-	}
-
-	obj, err := m.storage.Download(ctx, t.Key, gas.InBucket(t.Bucket))
+	obj, err := m.storage.GetObject(ctx, t.Bucket, t.Key)
 	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
@@ -59,6 +49,12 @@ func (m *Module) getObject(ctx gas.Context) error {
 			m.logger.Warn("failed to close object body").Err("error", cErr).Send()
 		}
 	}()
+	info := &obj.ObjectInfo
+
+	serve, err := partRequest(w, r, info)
+	if err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
 
 	// The dir backend hands back the *os.File itself.
 	rs, ok := obj.Body.(io.ReadSeeker)
@@ -235,7 +231,7 @@ func (m *Module) deleteObject(ctx gas.Context) error {
 		return s3api.WriteError(ctx, t, err)
 	}
 
-	if err := m.storage.Delete(ctx, t.Key, gas.InBucket(t.Bucket)); err != nil {
+	if err := m.storage.DeleteObject(ctx, t.Bucket, t.Key); err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
 

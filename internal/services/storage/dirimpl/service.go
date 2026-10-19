@@ -1,8 +1,15 @@
 // Package dirimpl implements contracts.StorageProvider on a local directory,
-// one subdirectory per bucket, on top of the gas dir storage backend.
+// on top of the gas dir storage backend.
+//
+// The backend stores objects under hashes of their bucket names and keys and
+// has no listing, so this package keeps what S3 needs on top of it under
+// stateDir in the same root: a registry of bucket names, an index of the keys
+// in each bucket, and the staging area of multipart uploads.
 package dirimpl
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 
@@ -14,8 +21,9 @@ import (
 
 // Service stores buckets and objects under Settings.RootDir.
 type Service struct {
-	dir *dir.Service
+	dir *dir.Provider
 
+	config   gas.ConfigProvider
 	logger   gas.Logger
 	settings *Settings
 	root     *os.Root
@@ -29,9 +37,9 @@ var (
 
 // NewService returns the constructor gas uses to build a Service from
 // settings.
-func NewService(settings *Settings) func(logger gas.Logger) *Service {
-	return func(logger gas.Logger) *Service {
-		return &Service{settings: settings, logger: logger}
+func NewService(settings *Settings) func(config gas.ConfigProvider, logger gas.Logger) *Service {
+	return func(config gas.ConfigProvider, logger gas.Logger) *Service {
+		return &Service{settings: settings, config: config, logger: logger}
 	}
 }
 
@@ -40,24 +48,22 @@ func (s *Service) Name() string {
 	return "tule/services/storage/dir"
 }
 
-// Init creates the storage root if needed and opens it.
-func (s *Service) Init() (err error) {
+// Init creates the storage root if needed, opens it, and builds the backend
+// on it.
+func (s *Service) Init(context.Context) (err error) {
 	if s.root, err = s.openRoot(); err != nil {
 		return fmt.Errorf("%s: %w", s.Name(), err)
 	}
 
-	s.dir = dir.New(dir.WithRoot(s.root))(nil, s.logger)
-	if err = s.dir.Init(); err != nil {
-		return fmt.Errorf("%s: %w", s.Name(), err)
+	if s.dir, err = dir.NewProvider(dir.WithRoot(s.root))(s.config); err != nil {
+		return fmt.Errorf("%s: %w", s.Name(), errors.Join(err, s.root.Close()))
 	}
-	return
+	return nil
 }
 
-// Close closes the backend and the storage root.
-func (s *Service) Close() error {
-	if err := s.dir.Close(); err != nil {
-		return fmt.Errorf("%s: %w", s.Name(), err)
-	}
+// Close closes the storage root. The backend holds nothing open between
+// calls, so it has nothing to close.
+func (s *Service) Close(context.Context) error {
 	if err := s.root.Close(); err != nil {
 		return fmt.Errorf("%s: %w", s.Name(), err)
 	}

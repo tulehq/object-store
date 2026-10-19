@@ -5,100 +5,41 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"path/filepath"
-	"time"
 
-	"github.com/gasmod/gas"
 	"github.com/gasmod/gas/storage"
+	"github.com/gasmod/gas/storage/dir"
 
 	"tule.dev/object-store/internal/contracts"
 )
 
-// Upload stores an object and records the MD5 of its body as its ETag.
-func (s *Service) Upload(
-	ctx context.Context,
-	key string,
-	data io.Reader,
-	opts ...gas.StorageOption,
-) error {
-	_, _, meta := gas.ApplyStorageOptions(opts)
-	er := newETagReader(data, meta)
-	opts = append(opts, gas.WithMetadata(er.meta))
-
-	if err := s.dir.Upload(ctx, key, er, opts...); err != nil {
-		return fmt.Errorf("%s: upload %q: %w", s.Name(), key, err)
-	}
-	return nil
+// objectInput addresses key in bucket in the backend.
+func objectInput(bucket, key string) storage.BaseObjectInput {
+	return storage.BaseObjectInput{Bucket: &bucket, Key: key}
 }
 
-// Download opens an object for reading. The caller must close its Body.
-func (s *Service) Download(
-	ctx context.Context,
-	key string,
-	opts ...gas.StorageOption,
-) (*gas.StorageObject, error) {
-	obj, err := s.dir.Download(ctx, key, opts...)
+// objectInfo returns the stored object info, with the ETag, system headers
+// and part sizes split out of the backend metadata.
+func objectInfo(key string, info *storage.ObjectInfo) (*contracts.ObjectInfo, error) {
+	meta := info.Metadata
+	if meta == nil {
+		meta = make(map[string]string)
+	}
+
+	parts, err := splitParts(meta)
 	if err != nil {
-		if isNotDir(err) {
-			err = storage.ErrKeyNotFound
-		}
-		return nil, fmt.Errorf("%s: download %q: %w", s.Name(), key, err)
-	}
-	splitETag(obj.Metadata)
-	splitHeaders(obj.Metadata)
-	if _, err = splitParts(obj.Metadata); err != nil {
-		return nil, errors.Join(
-			fmt.Errorf("%s: download %q: %w", s.Name(), key, err), obj.Body.Close())
-	}
-	return obj, nil
-}
-
-// Delete removes an object. Deleting a key that holds no object succeeds,
-// including a key that names a directory of nested keys or one this store
-// cannot hold; the backend would otherwise remove the wrong file or fail.
-func (s *Service) Delete(ctx context.Context, key string, opts ...gas.StorageOption) error {
-	bucket, _, _ := gas.ApplyStorageOptions(opts)
-	if _, err := s.HeadBucket(ctx, bucket); err != nil {
-		return err
+		return nil, err
 	}
 
-	unlock := s.locks.lock(bucket, key)
-	defer unlock()
-
-	if !supportedKey(key) {
-		return nil
-	}
-	info, err := s.root.Stat(filepath.Join(bucket, key))
-	if (err == nil && info.IsDir()) || isNotDir(err) {
-		return nil
-	}
-
-	if err = s.dir.Delete(ctx, key, opts...); err != nil {
-		return fmt.Errorf("%s: delete %q: %w", s.Name(), key, err)
-	}
-	return nil
-}
-
-// Head returns an object's content type, size, modification time and user
-// metadata.
-func (s *Service) Head(
-	ctx context.Context,
-	key string,
-	opts ...gas.StorageOption,
-) (*gas.ObjectInfo, error) {
-	info, err := s.dir.Head(ctx, key, opts...)
-	if err != nil {
-		if isNotDir(err) {
-			err = storage.ErrKeyNotFound
-		}
-		return nil, fmt.Errorf("%s: head %q: %w", s.Name(), key, err)
-	}
-	splitETag(info.Metadata)
-	splitHeaders(info.Metadata)
-	if _, err = splitParts(info.Metadata); err != nil {
-		return nil, fmt.Errorf("%s: head %q: %w", s.Name(), key, err)
-	}
-	return info, nil
+	return &contracts.ObjectInfo{
+		Key:          key,
+		ETag:         splitETag(meta),
+		Headers:      splitHeaders(meta),
+		PartSizes:    parts,
+		Size:         info.Size,
+		ContentType:  info.ContentType,
+		LastModified: info.LastModified,
+		Metadata:     meta,
+	}, nil
 }
 
 // StatObject returns an object's metadata, with its ETag split out of the
@@ -107,36 +48,68 @@ func (s *Service) StatObject(
 	ctx context.Context,
 	bucket, key string,
 ) (*contracts.ObjectInfo, error) {
-	if !supportedKey(key) {
-		if _, err := s.HeadBucket(ctx, bucket); err != nil {
-			return nil, err
-		}
-		return nil, storage.ErrKeyNotFound
+	if _, err := s.HeadBucket(ctx, bucket); err != nil {
+		return nil, err
 	}
 
-	info, err := s.dir.Head(ctx, key, gas.InBucket(bucket))
+	info, err := s.dir.HeadObject(ctx, &storage.HeadObjectInput{
+		BaseObjectInput: objectInput(bucket, key),
+	})
 	if err != nil {
-		if isNotDir(err) {
-			err = storage.ErrKeyNotFound
+		// The backend reports a missing object to a HEAD as ErrNotFound; the
+		// S3 API treats it as a missing key whatever the method.
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil, fmt.Errorf(
+				"%s: stat %q: %w: %w", s.Name(), key, storage.ErrKeyNotFound, err)
 		}
 		return nil, fmt.Errorf("%s: stat %q: %w", s.Name(), key, err)
 	}
 
-	parts, err := splitParts(info.Metadata)
+	out, err := objectInfo(key, info)
 	if err != nil {
 		return nil, fmt.Errorf("%s: stat %q: %w", s.Name(), key, err)
 	}
+	return out, nil
+}
 
-	return &contracts.ObjectInfo{
-		Key:          key,
-		ETag:         splitETag(info.Metadata),
-		Headers:      splitHeaders(info.Metadata),
-		PartSizes:    parts,
-		Size:         info.Size,
-		ContentType:  info.ContentType,
-		LastModified: info.LastModified,
-		Metadata:     info.Metadata,
-	}, nil
+// GetObject opens an object for reading. The caller must close its Body. The
+// info and body come from the same read, so they match even when the object
+// is overwritten meanwhile.
+func (s *Service) GetObject(ctx context.Context, bucket, key string) (*contracts.Object, error) {
+	if _, err := s.HeadBucket(ctx, bucket); err != nil {
+		return nil, err
+	}
+
+	obj, err := s.dir.GetObject(ctx, &storage.GetObjectInput{
+		HeadObjectInput: storage.HeadObjectInput{BaseObjectInput: objectInput(bucket, key)},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%s: get %q: %w", s.Name(), key, err)
+	}
+
+	info, err := objectInfo(key, &obj.ObjectInfo)
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("%s: get %q: %w", s.Name(), key, err), obj.Body.Close())
+	}
+	return &contracts.Object{ObjectInfo: *info, Body: obj.Body}, nil
+}
+
+// DeleteObject removes an object. Deleting a key that holds no object
+// succeeds.
+func (s *Service) DeleteObject(ctx context.Context, bucket, key string) error {
+	if _, err := s.HeadBucket(ctx, bucket); err != nil {
+		return err
+	}
+
+	unlock := s.locks.lock(bucket, key)
+	defer unlock()
+
+	if _, err := s.dir.DeleteObject(ctx, &storage.DeleteObjectInput{
+		BaseObjectInput: objectInput(bucket, key),
+	}); err != nil {
+		return fmt.Errorf("%s: delete %q: %w", s.Name(), key, err)
+	}
+	return s.removeFromIndex(bucket, key)
 }
 
 // PutObject stores body with the content type, user metadata and system
@@ -156,46 +129,92 @@ func (s *Service) PutObject(
 	unlock := s.locks.lock(bucket, key)
 	defer unlock()
 
-	if err := s.checkWritable(bucket, key); err != nil {
-		return nil, err
-	}
 	if err := s.checkPrecondition(ctx, bucket, key, cond); err != nil {
 		return nil, err
 	}
 
-	opts := []gas.StorageOption{
-		gas.InBucket(bucket),
-		gas.WithMetadata(joinMetadata(in.Metadata, in.Headers)),
+	er := newETagReader(body, joinMetadata(in.Metadata, in.Headers))
+	return s.putObject(ctx, bucket, key, er, in.ContentType, er.meta)
+}
+
+// putObject indexes key and writes the object, with meta as its backend
+// metadata. The caller holds the key's lock.
+func (s *Service) putObject(
+	ctx context.Context,
+	bucket, key string,
+	body io.Reader,
+	contentType string,
+	meta map[string]string,
+) (*contracts.ObjectInfo, error) {
+	if err := s.checkKey(ctx, bucket, key); err != nil {
+		return nil, err
 	}
-	if in.ContentType != "" {
-		opts = append(opts, gas.WithContentType(in.ContentType))
+	if err := s.addToIndex(bucket, key); err != nil {
+		return nil, err
 	}
 
-	if err := s.Upload(ctx, key, body, opts...); err != nil {
-		return nil, err
+	in := &storage.PutObjectInput{
+		BaseObjectInput: objectInput(bucket, key),
+		Body:            body,
+		Metadata:        meta,
+	}
+	if contentType != "" {
+		in.ContentType = &contentType
+	}
+
+	if _, err := s.dir.PutObject(ctx, in); err != nil {
+		if !errors.Is(err, dir.ErrStaleData) {
+			err = fmt.Errorf("%s: put %q: %w", s.Name(), key, err)
+			return nil, errors.Join(err, s.unindexMissing(ctx, bucket, key))
+		}
+		// The object was written; only the data file it replaced is left
+		// behind.
+		s.logger.Warn("object written, but its previous data file was left on disk").
+			Err("error", err).Send()
 	}
 
 	return s.StatObject(ctx, bucket, key)
 }
 
+// unindexMissing drops key from bucket's index when it holds no object, so a
+// failed write of a new key does not leave its entry behind. The caller holds
+// the key's lock.
+func (s *Service) unindexMissing(ctx context.Context, bucket, key string) error {
+	_, err := s.dir.HeadObject(ctx, &storage.HeadObjectInput{
+		BaseObjectInput: objectInput(bucket, key),
+	})
+	if !errors.Is(err, storage.ErrNotFound) {
+		return nil
+	}
+	return s.removeFromIndex(bucket, key)
+}
+
+// checkKey returns an error wrapping storage.ErrInvalidKey when the backend
+// cannot store key. The backend validates keys before it touches the disk,
+// so asking it about the key is how this is known before the key is indexed.
+func (s *Service) checkKey(ctx context.Context, bucket, key string) error {
+	_, err := s.dir.HeadObject(ctx, &storage.HeadObjectInput{
+		BaseObjectInput: objectInput(bucket, key),
+	})
+	if errors.Is(err, storage.ErrInvalidKey) {
+		return fmt.Errorf("%s: %w", s.Name(), err)
+	}
+	return nil
+}
+
 // CopyObject copies an object within or across buckets. Copying an object
-// onto itself is safe: the backend writes the copy to a temp file and renames
-// it into place, while the source stays open for reading.
+// onto itself is safe: the backend writes the copy to a new data file, while
+// the source stays open for reading.
 func (s *Service) CopyObject(
 	ctx context.Context,
 	in contracts.CopyObjectInput,
 ) (_ *contracts.ObjectInfo, err error) {
-	src, err := s.StatObject(ctx, in.SrcBucket, in.SrcKey)
+	src, err := s.GetObject(ctx, in.SrcBucket, in.SrcKey)
 	if err != nil {
 		return nil, err
 	}
-
-	obj, err := s.dir.Download(ctx, in.SrcKey, gas.InBucket(in.SrcBucket))
-	if err != nil {
-		return nil, fmt.Errorf("%s: copy %q: %w", s.Name(), in.SrcKey, err)
-	}
 	defer func() {
-		if cErr := obj.Body.Close(); cErr != nil {
+		if cErr := src.Body.Close(); cErr != nil {
 			err = errors.Join(err, fmt.Errorf("%s: copy %q: %w", s.Name(), in.SrcKey, cErr))
 		}
 	}()
@@ -209,35 +228,5 @@ func (s *Service) CopyObject(
 		put = *in.Replace
 	}
 
-	return s.PutObject(ctx, in.DstBucket, in.DstKey, obj.Body, put, in.Precondition)
-}
-
-// PresignDownloadURL returns a download URL from the backend's presigner. The
-// S3 API does not use it: clients presign URLs themselves.
-func (s *Service) PresignDownloadURL(
-	ctx context.Context,
-	key string,
-	ttl time.Duration,
-	opts ...gas.StorageOption,
-) (string, error) {
-	u, err := s.dir.PresignDownloadURL(ctx, key, ttl, opts...)
-	if err != nil {
-		return "", fmt.Errorf("%s: presign download %q: %w", s.Name(), key, err)
-	}
-	return u, nil
-}
-
-// PresignUploadURL returns an upload URL from the backend's presigner. The
-// S3 API does not use it: clients presign URLs themselves.
-func (s *Service) PresignUploadURL(
-	ctx context.Context,
-	key string,
-	ttl time.Duration,
-	opts ...gas.StorageOption,
-) (string, error) {
-	u, err := s.dir.PresignUploadURL(ctx, key, ttl, opts...)
-	if err != nil {
-		return "", fmt.Errorf("%s: presign upload %q: %w", s.Name(), key, err)
-	}
-	return u, nil
+	return s.PutObject(ctx, in.DstBucket, in.DstKey, src.Body, put, in.Precondition)
 }
