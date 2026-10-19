@@ -18,7 +18,12 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath \
 # Alpine rather than distroless, for a shell to debug in and wget for the
 # health check.
 FROM alpine:3.24
-RUN addgroup -S nonroot && adduser -S -G nonroot -H nonroot
+# 65532 is the distroless nonroot user's UID and GID, which owned /data in
+# images up to 0.2; keeping them leaves those volumes writable.
+RUN addgroup -S -g 65532 nonroot && adduser -S -u 65532 -G nonroot nonroot
+# gas/config reads .env from the working directory and refuses to when that is
+# /, so the server must not start there.
+WORKDIR /home/nonroot
 LABEL org.opencontainers.image.source=https://github.com/tulehq/object-store \
       org.opencontainers.image.description="S3-compatible object store for local development and end-to-end tests" \
       org.opencontainers.image.licenses=MIT
