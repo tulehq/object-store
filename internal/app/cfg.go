@@ -22,8 +22,7 @@ type logSettings struct {
 // virtual-hosted-style addressing: a request to <bucket>.<Domain> addresses
 // that bucket.
 type serverSettings struct {
-	Domain         string
-	RequestTimeout time.Duration `validate:"required"`
+	Domain string
 }
 
 // hstsSettings configures the Strict-Transport-Security header. It is only
@@ -101,7 +100,7 @@ func LoadConfigFrom(provs ...providers.Provider) (*Config, error) {
 }
 
 func bindConfig(store gas.ConfigProvider, env gasenv.Environment) (*Config, error) {
-	applyDefaults(store, env)
+	applyDefaults(store)
 
 	cfg := Config{Env: env, store: store}
 	if err := store.Bind(&cfg); err != nil {
@@ -114,9 +113,16 @@ func bindConfig(store gas.ConfigProvider, env gasenv.Environment) (*Config, erro
 	return &cfg, nil
 }
 
-func applyDefaults(store gas.ConfigProvider, _ gasenv.Environment) {
+func applyDefaults(store gas.ConfigProvider) {
 	store.SetDefault("Server.Port", 9000)
-	store.SetDefault("Server.RequestTimeout", "30s")
 	store.SetDefault("Storage.RootDir", "./data")
 	store.SetDefault("Server.Domain", "localhost")
+
+	// gas binds its own server settings from this store, and defaults to a 5s
+	// read and a 10s write timeout. Object bodies stream for as long as the
+	// client needs, so a request that reads or writes one cannot be held to a
+	// fixed deadline: both are unbounded here. gas's 2m idle timeout still
+	// reaps idle keep-alive connections.
+	store.SetDefault("Server.ReadTimeout", "0s")
+	store.SetDefault("Server.WriteTimeout", "0s")
 }
