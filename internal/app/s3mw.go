@@ -19,7 +19,7 @@ import (
 func verifySignature(v *sigv4.Verifier, domain string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if isProbe(r.URL.Path) && hostBucket(r.Host, domain) == "" {
+			if isProbe(r) && hostBucket(r.Host, domain) == "" {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -71,6 +71,16 @@ func hostBucket(host, domain string) string {
 	return bucket
 }
 
-func isProbe(path string) bool {
+// isProbe reports whether r is a probe request. The probes are GET routes,
+// which the router also serves as HEAD, so no other method is a probe and
+// every other one stays signed. The path is matched against the escaped form,
+// which is what the router matches routes against: a path that only decodes
+// to a probe path, such as "/%5Fhealth", is routed elsewhere and so is not
+// exempt from verification.
+func isProbe(r *http.Request) bool {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return false
+	}
+	path := r.URL.EscapedPath()
 	return path == health.HealthPath || path == health.ReadyPath
 }
