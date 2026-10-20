@@ -136,6 +136,11 @@ any origin, and response headers such as `ETag` are exposed.
   signed are not required here either, so whoever holds a presigned `PUT` can
   still choose its `Content-Type` and the system headers stored with the
   object. There is one access key, with access to everything.
+- **Signatures are checked against the re-encoded path.** The canonical
+  request is rebuilt from the decoded request path, so a client that sends an
+  unescaped `+` in a key signs `+` where this server canonicalizes `%2B`, and
+  the request is refused with `SignatureDoesNotMatch`. The AWS SDKs escape it,
+  so this only affects hand-built requests.
 - **Not implemented** (requests return `501 NotImplemented`): enabling
   versioning, tagging, ACLs, bucket policies, CORS and lifecycle configuration,
   object lock, UploadPartCopy, and browser POST-policy uploads.
