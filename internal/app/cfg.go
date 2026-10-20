@@ -20,9 +20,11 @@ type logSettings struct {
 
 // serverSettings configures the HTTP server. Domain enables
 // virtual-hosted-style addressing: a request to <bucket>.<Domain> addresses
-// that bucket.
+// that bucket. HeaderTimeout bounds the start of a request; zero means no
+// bound.
 type serverSettings struct {
-	Domain string
+	Domain        string
+	HeaderTimeout time.Duration
 }
 
 // hstsSettings configures the Strict-Transport-Security header. It is only
@@ -121,8 +123,13 @@ func applyDefaults(store gas.ConfigProvider) {
 	// gas binds its own server settings from this store, and defaults to a 5s
 	// read and a 10s write timeout. Object bodies stream for as long as the
 	// client needs, so a request that reads or writes one cannot be held to a
-	// fixed deadline: both are unbounded here. gas's 2m idle timeout still
-	// reaps idle keep-alive connections.
+	// fixed deadline: both are unbounded here.
+	//
+	// What stays bounded is the start of a request, which carries no object
+	// data: Server.HeaderTimeout becomes the server's ReadHeaderTimeout, and
+	// with it the TLS handshake deadline. Unbounded body reads cover neither,
+	// and gas's 2m idle timeout only covers connections between requests.
 	store.SetDefault("Server.ReadTimeout", "0s")
 	store.SetDefault("Server.WriteTimeout", "0s")
+	store.SetDefault("Server.HeaderTimeout", "10s")
 }

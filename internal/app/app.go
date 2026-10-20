@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/gasmod/gas"
 	"github.com/go-chi/chi/v5/middleware"
@@ -35,6 +36,7 @@ func New(cfg *Config, extra ...gas.Option) (*gas.App, error) {
 	opts := append([]gas.Option{gas.WithCSRFInsecureBypassPattern("/")}, extra...)
 	app := gas.NewApp(opts...)
 
+	installHeaderTimeout(app, cfg.Server.HeaderTimeout)
 	registerInfraServices(app, cfg, logger)
 	registerAppServices(app, cfg)
 	registerAppModules(app, cfg)
@@ -42,6 +44,23 @@ func New(cfg *Config, extra ...gas.Option) (*gas.App, error) {
 	app.ReadyFunc(createBuckets(cfg.Storage.Buckets))
 
 	return app, nil
+}
+
+// installHeaderTimeout bounds how long a client may take to send its request
+// headers, and with them to complete a TLS handshake.
+//
+// gas's ServerSettings has no such field, and its *http.Server is built from
+// the configuration while the app starts, so the field is set from the
+// AppConfigUpdated event that ends the binding -- the last point before
+// anything serves, and the first at which Server() builds the server the
+// deployment actually uses. net/http derives both deadlines from ReadTimeout
+// when ReadHeaderTimeout is unset, and ReadTimeout is deliberately unset
+// here, so without this a connection that trickles header bytes or stalls
+// mid-handshake is held open indefinitely.
+func installHeaderTimeout(app *gas.App, d time.Duration) {
+	app.EventBus().Subscribe[gas.AppConfigUpdated](func(gas.AppConfigUpdatedPayload) {
+		app.Server().ReadHeaderTimeout = d
+	})
 }
 
 func registerInfraServices(app *gas.App, cfg *Config, logger gas.Logger) {

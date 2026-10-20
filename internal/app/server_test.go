@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/gasmod/gas"
 	"github.com/gasmod/gas/config/providers"
@@ -44,9 +45,10 @@ func startApp(t *testing.T) *gas.App {
 // TestServerTimeoutsAllowStreamingObjects covers the timeouts of the
 // *http.Server the binary serves from: an upload or download of an object
 // streams for as long as the client needs, so neither reading a request nor
-// writing a response may be cut off by a fixed deadline. The e2e suite
-// asserts what these do to a connection; this pins the values the deployment
-// runs with.
+// writing a response may be cut off by a fixed deadline, while the start of a
+// request, which carries no object data, stays bounded. The e2e suite asserts
+// what these do to a connection; this pins the values the deployment runs
+// with.
 func TestServerTimeoutsAllowStreamingObjects(t *testing.T) {
 	srv := startApp(t).Server()
 
@@ -55,6 +57,11 @@ func TestServerTimeoutsAllowStreamingObjects(t *testing.T) {
 	}
 	if srv.WriteTimeout != 0 {
 		t.Errorf("WriteTimeout = %v, want no limit", srv.WriteTimeout)
+	}
+	// Headers and the TLS handshake have no object data to wait for, and with
+	// ReadTimeout unset net/http leaves both unbounded without this one.
+	if srv.ReadHeaderTimeout != 10*time.Second {
+		t.Errorf("ReadHeaderTimeout = %v, want 10s", srv.ReadHeaderTimeout)
 	}
 	// An object store that serves no request for two minutes is idle, not
 	// slow, and gas's own default reaps those connections.

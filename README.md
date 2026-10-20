@@ -46,6 +46,7 @@ Settings come from environment variables prefixed with `TULE_`, and from a
 | `TULE_Server_Domain` | `localhost` | Enables virtual-hosted-style requests to `<bucket>.<domain>` |
 | `TULE_Server_ReadTimeout` | `0` | How long the server may take to read a whole request, `0` for no limit, so an upload streams for as long as the client needs |
 | `TULE_Server_WriteTimeout` | `0` | How long it may take to write a whole response, `0` for no limit, so a download does too |
+| `TULE_Server_HeaderTimeout` | `10s` | How long a client may take to send its request headers, and to complete a TLS handshake; `0` removes the bound, which leaves a stalled connection open indefinitely |
 | `TULE_Auth_AccessKeyID` | required | The access key clients sign requests with |
 | `TULE_Auth_SecretAccessKey` | required | Its secret |
 | `TULE_GasEnv` | | `development` logs at trace level, `testing` disables logging |
