@@ -40,7 +40,7 @@ func New(cfg *Config, extra ...gas.Option) (*gas.App, error) {
 	registerInfraServices(app, cfg, logger)
 	registerAppServices(app, cfg)
 	registerAppModules(app, cfg)
-	installMiddleware(app.Router(), cfg)
+	installMiddleware(app.Router(), cfg, logger)
 	app.ReadyFunc(createBuckets(cfg.Storage.Buckets))
 
 	return app, nil
@@ -101,7 +101,7 @@ func createBuckets(names []string) func(*gas.ServiceContainer) error {
 	}
 }
 
-func installMiddleware(r *gas.Router, cfg *Config) {
+func installMiddleware(r *gas.Router, cfg *Config, logger gas.Logger) {
 	r.UseMiddlewareFunc(cors.Handler(cors.Options{
 		// Echo any origin back, which unlike "*" also works for credentialed
 		// requests.
@@ -123,7 +123,7 @@ func installMiddleware(r *gas.Router, cfg *Config) {
 
 	r.UseMiddlewareFunc(middleware.ClientIPFromXFFTrustedProxies(1))
 
-	r.UseMiddlewareFunc(withRequestLogger)
+	r.UseMiddlewareFunc(withRequestLogger(logger))
 
 	r.UseMiddlewareFunc(gas.RequestLogger[httpx.RequestLogger]())
 
