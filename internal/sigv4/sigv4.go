@@ -324,9 +324,17 @@ func canonicalQuery(q url.Values, presigned bool) string {
 
 // canonicalHeaders lists the signed headers as "name:value\n" lines, with
 // values trimmed and inner runs of spaces collapsed.
+//
+// S3 requires the names to be lowercase, and they are lowercased here before
+// anything is looked up: "Host" has to resolve to r.Host like "host" does,
+// since net/http keeps the host out of r.Header and an empty value would bind
+// the signature to no host at all. A client that signed a name in another
+// case computed a different canonical request and fails the comparison, which
+// is what S3 does with it too.
 func canonicalHeaders(r *http.Request, names []string) string {
 	var sb strings.Builder
-	for _, name := range names {
+	for _, raw := range names {
+		name := strings.ToLower(strings.TrimSpace(raw))
 		var val string
 		switch vals := r.Header.Values(name); {
 		case name == "host":

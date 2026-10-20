@@ -206,3 +206,21 @@ func TestVerifyRequiresSignedHost(t *testing.T) {
 
 	wantCode(t, verifier().Verify(r), "AccessDenied")
 }
+
+// TestVerifyBindsTheHostHeader covers a request that lists its Host header
+// under a name that is not lowercase. The host chooses the bucket in
+// virtual-hosted-style addressing, so a signature taken over one host must
+// not verify against another, whatever case the client wrote the name in.
+func TestVerifyBindsTheHostHeader(t *testing.T) {
+	r := httptest.NewRequestWithContext(
+		context.Background(),
+		http.MethodGet,
+		"http://bucket.localhost:9000/key",
+		nil,
+	)
+	r.Header.Set("X-Amz-Content-Sha256", unsigned)
+	signWithHeaders(t, r, []string{"Host", "x-amz-content-sha256", "x-amz-date"})
+
+	r.Host = "other.localhost:9000"
+	wantCode(t, verifier().Verify(r), "SignatureDoesNotMatch")
+}
