@@ -5,26 +5,37 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/md5" //nolint:gosec // S3 ETags are MD5 digests
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
 	"errors"
 	"io"
-	"net/http/httptest"
+	"math/big"
+	"net"
+	"net/http"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	"github.com/gasmod/gas"
 	"github.com/gasmod/gas/config/providers"
 
 	"tule.dev/object-store/internal/app"
 )
 
-// newClient starts the app in-process on a fresh storage root and returns an
-// SDK client pointed at it.
+// newClient starts the app on a fresh storage root and returns an SDK client
+// pointed at it.
 func newClient(t *testing.T) *s3.Client {
 	t.Helper()
 	return startClient(t, false)
@@ -37,10 +48,49 @@ func startClient(t *testing.T, useTLS bool) *s3.Client {
 	return clientFor(startServer(t, useTLS, nil))
 }
 
-// startServer starts the app in-process on a fresh storage root, with env
-// setting extra TULE_ variables. It accepts the test/test credentials
-// clientFor signs with unless env changes them.
-func startServer(t *testing.T, useTLS bool, env map[string]string) *httptest.Server {
+// server is the application under test, served from the *http.Server gas
+// builds from the bound configuration -- the one the binary serves from -- on
+// a loopback listener. Requests cross a real socket, so the server's own
+// read, write and idle timeouts, its TLS, and its graceful shutdown are part
+// of what the tests exercise.
+type server struct {
+	app    *gas.App
+	client *http.Client
+	srvErr chan error
+	URL    string
+	Addr   string
+	stop   sync.Once
+}
+
+// Client returns an HTTP client that trusts the server's certificate.
+func (s *server) Client() *http.Client { return s.client }
+
+// Stop shuts the application down the way the binary does on a signal:
+// gas.App.Stop drains the requests in flight within ShutdownTimeout and then
+// closes the services. Calling it twice is safe, so a test can stop the
+// server itself and still leave the cleanup in place.
+func (s *server) Stop(ctx context.Context) error {
+	var err error
+	s.stop.Do(func() {
+		err = s.app.Stop(ctx)
+		s.client.CloseIdleConnections()
+		// Serve returns once Stop has closed the listener, so wait for it
+		// rather than racing it: an error it reports late is one the test
+		// should see. The bound keeps a wedged server from hanging the suite.
+		select {
+		case sErr := <-s.srvErr:
+			err = errors.Join(err, sErr)
+		case <-time.After(5 * time.Second):
+			err = errors.Join(err, errors.New("the server did not stop serving"))
+		}
+	})
+	return err
+}
+
+// startApp loads the configuration from the environment and starts the
+// application's services, with env setting extra TULE_ variables. It accepts
+// the test/test credentials clientFor signs with unless env changes them.
+func startApp(t *testing.T, env map[string]string) *gas.App {
 	t.Helper()
 
 	t.Setenv("TULE_GasEnv", "testing")
@@ -66,26 +116,103 @@ func startServer(t *testing.T, useTLS bool, env map[string]string) *httptest.Ser
 	if err = a.Start(context.Background()); err != nil {
 		t.Fatalf("start app: %v", err)
 	}
+	return a
+}
 
-	srv := httptest.NewUnstartedServer(a.Handler())
-	if useTLS {
-		srv.StartTLS()
-	} else {
-		srv.Start()
+// startServer starts the app and serves it from its own *http.Server on a
+// loopback listener.
+func startServer(t *testing.T, useTLS bool, env map[string]string) *server {
+	t.Helper()
+
+	a := startApp(t, env)
+
+	// The configured port is the deployed one; tests take whatever is free.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
 	}
+
+	srv := &server{
+		app:    a,
+		client: &http.Client{},
+		srvErr: make(chan error, 1),
+		Addr:   ln.Addr().String(),
+		URL:    "http://" + ln.Addr().String(),
+	}
+
+	httpSrv := a.Server()
+	serve := func() error { return httpSrv.Serve(ln) }
+	if useTLS {
+		cert, pool := loopbackCert(t)
+		httpSrv.TLSConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
+		srv.client.Transport = &http.Transport{TLSClientConfig: &tls.Config{
+			RootCAs:    pool,
+			MinVersion: tls.VersionTLS12,
+		}}
+		srv.URL = "https://" + ln.Addr().String()
+		serve = func() error { return httpSrv.ServeTLS(ln, "", "") }
+	}
+
+	go func() {
+		if sErr := serve(); sErr != nil && !errors.Is(sErr, http.ErrServerClosed) {
+			srv.srvErr <- sErr
+		}
+		close(srv.srvErr)
+	}()
+
 	t.Cleanup(func() {
-		srv.Close()
-		if sErr := a.Shutdown(context.Background()); sErr != nil {
-			t.Errorf("shutdown: %v", sErr)
+		if sErr := srv.Stop(context.Background()); sErr != nil {
+			t.Errorf("stop: %v", sErr)
 		}
 	})
 
 	return srv
 }
 
+// loopbackCert returns a self-signed certificate for the loopback address and
+// the localhost names the virtual-hosted-style tests use, with a pool that
+// trusts it.
+func loopbackCert(t *testing.T) (tls.Certificate, *x509.CertPool) {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "object-store e2e"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		DNSNames:              []string{"localhost", "*.localhost"},
+		IPAddresses:           []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback},
+	}
+
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+	leaf, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parse certificate: %v", err)
+	}
+
+	pool := x509.NewCertPool()
+	pool.AddCert(leaf)
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key, Leaf: leaf}, pool
+}
+
 // clientFor returns a path-style SDK client for srv, with the test/test
 // credentials unless opts change them.
-func clientFor(srv *httptest.Server, opts ...func(*s3.Options)) *s3.Client {
+func clientFor(srv *server, opts ...func(*s3.Options)) *s3.Client {
 	return s3.New(s3.Options{
 		Region:       "us-east-1",
 		BaseEndpoint: aws.String(srv.URL),

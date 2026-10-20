@@ -243,7 +243,7 @@ func TestListMultipartUploads(t *testing.T) {
 
 func TestVirtualHostedStyle(t *testing.T) {
 	srv := startServer(t, false, nil)
-	addr := srv.Listener.Addr().String()
+	addr := srv.Addr
 	_, port, _ := net.SplitHostPort(addr)
 
 	// Send every <bucket>.localhost request to the test server, whatever the

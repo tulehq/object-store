@@ -83,6 +83,10 @@ func (v *Verifier) Verify(r *http.Request) error {
 		return err
 	}
 
+	if err = checkSignedHeaders(r, s); err != nil {
+		return err
+	}
+
 	want := v.signature(r, s)
 	if !hmac.Equal([]byte(want), []byte(s.signature)) {
 		return s3api.NewError(http.StatusForbidden, "SignatureDoesNotMatch",
@@ -227,6 +231,47 @@ func (v *Verifier) parseCredential(cred string, s *signed, malformed func(string
 	return nil
 }
 
+// checkSignedHeaders rejects a request that carries an x-amz-* header its
+// signature does not cover, or that does not sign its Host at all, which is
+// what S3 requires. Anyone holding a signed request or a presigned URL can
+// change what the signature leaves out: x-amz-meta-* is the user metadata an
+// upload stores, and the Host header chooses the bucket in
+// virtual-hosted-style addressing.
+//
+// Headers S3 does not require signed are not required here either, so a
+// presigned PUT can still be sent with a Content-Type, or with the system
+// headers stored alongside the object, that its signature never covered. That
+// is S3's boundary, and the README documents it.
+//
+// x-amz-content-sha256 is exempt: it is the declared payload hash, which the
+// canonical request covers on a line of its own, so changing it changes the
+// signature whether or not it is listed. Clients that presign with
+// UNSIGNED-PAYLOAD and send the header anyway depend on that.
+func checkSignedHeaders(r *http.Request, s *signed) error {
+	if !isSigned(s, "host") {
+		return accessDenied("The Host header must be signed")
+	}
+	for name := range r.Header {
+		lower := strings.ToLower(name)
+		if !strings.HasPrefix(lower, "x-amz-") || lower == "x-amz-content-sha256" {
+			continue
+		}
+		if !isSigned(s, lower) {
+			return accessDenied("There were headers present in the request which were not signed")
+		}
+	}
+	return nil
+}
+
+// isSigned reports whether s lists name among its signed headers. S3 requires
+// the list to be lowercase; a client that sends it otherwise still means the
+// same header.
+func isSigned(s *signed, name string) bool {
+	return slices.ContainsFunc(s.signedHeaders, func(h string) bool {
+		return strings.EqualFold(strings.TrimSpace(h), name)
+	})
+}
+
 // signature computes the signature r should carry for the claims in s.
 func (v *Verifier) signature(r *http.Request, s *signed) string {
 	creq := strings.Join([]string{
@@ -279,9 +324,17 @@ func canonicalQuery(q url.Values, presigned bool) string {
 
 // canonicalHeaders lists the signed headers as "name:value\n" lines, with
 // values trimmed and inner runs of spaces collapsed.
+//
+// S3 requires the names to be lowercase, and they are lowercased here before
+// anything is looked up: "Host" has to resolve to r.Host like "host" does,
+// since net/http keeps the host out of r.Header and an empty value would bind
+// the signature to no host at all. A client that signed a name in another
+// case computed a different canonical request and fails the comparison, which
+// is what S3 does with it too.
 func canonicalHeaders(r *http.Request, names []string) string {
 	var sb strings.Builder
-	for _, name := range names {
+	for _, raw := range names {
+		name := strings.ToLower(strings.TrimSpace(raw))
 		var val string
 		switch vals := r.Header.Values(name); {
 		case name == "host":
@@ -290,10 +343,13 @@ func canonicalHeaders(r *http.Request, names []string) string {
 			// net/http may keep the length only in r.ContentLength.
 			val = strconv.FormatInt(r.ContentLength, 10)
 		default:
+			// Canonicalize into a copy: r.Header.Values returns the slice the
+			// request itself holds, and the handlers read these values after.
+			trimmed := make([]string, len(vals))
 			for i, x := range vals {
-				vals[i] = strings.Join(strings.Fields(x), " ")
+				trimmed[i] = strings.Join(strings.Fields(x), " ")
 			}
-			val = strings.Join(vals, ",")
+			val = strings.Join(trimmed, ",")
 		}
 		sb.WriteString(name)
 		sb.WriteByte(':')

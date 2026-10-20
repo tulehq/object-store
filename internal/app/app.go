@@ -7,9 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/gasmod/gas"
-	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
 
 	"tule.dev/object-store/internal/contracts"
@@ -24,7 +24,7 @@ import (
 // New builds the application from cfg. extra options are applied after the
 // app's own.
 func New(cfg *Config, extra ...gas.Option) (*gas.App, error) {
-	logger, lErr := newLogger(cfg.Log, cfg.Env)
+	logger, lErr := newLogger(cfg.Env)
 	if lErr != nil {
 		return nil, lErr
 	}
@@ -35,13 +35,31 @@ func New(cfg *Config, extra ...gas.Option) (*gas.App, error) {
 	opts := append([]gas.Option{gas.WithCSRFInsecureBypassPattern("/")}, extra...)
 	app := gas.NewApp(opts...)
 
+	installHeaderTimeout(app, cfg.Server.HeaderTimeout)
 	registerInfraServices(app, cfg, logger)
 	registerAppServices(app, cfg)
 	registerAppModules(app, cfg)
-	installMiddleware(app.Router(), cfg)
+	installMiddleware(app.Router(), cfg, logger)
 	app.ReadyFunc(createBuckets(cfg.Storage.Buckets))
 
 	return app, nil
+}
+
+// installHeaderTimeout bounds how long a client may take to send its request
+// headers, and with them to complete a TLS handshake.
+//
+// gas's ServerSettings has no such field, and its *http.Server is built from
+// the configuration while the app starts, so the field is set from the
+// AppConfigUpdated event that ends the binding -- the last point before
+// anything serves, and the first at which Server() builds the server the
+// deployment actually uses. net/http derives both deadlines from ReadTimeout
+// when ReadHeaderTimeout is unset, and ReadTimeout is deliberately unset
+// here, so without this a connection that trickles header bytes or stalls
+// mid-handshake is held open indefinitely.
+func installHeaderTimeout(app *gas.App, d time.Duration) {
+	app.EventBus().Subscribe[gas.AppConfigUpdated](func(gas.AppConfigUpdatedPayload) {
+		app.Server().ReadHeaderTimeout = d
+	})
 }
 
 func registerInfraServices(app *gas.App, cfg *Config, logger gas.Logger) {
@@ -82,7 +100,17 @@ func createBuckets(names []string) func(*gas.ServiceContainer) error {
 	}
 }
 
-func installMiddleware(r *gas.Router, cfg *Config) {
+func installMiddleware(r *gas.Router, cfg *Config, logger gas.Logger) {
+	// First in the chain, so every response carries them, including the ones
+	// the signature middleware writes without reaching the handlers.
+	var hsts string
+	if cfg.HSTS != nil && cfg.HSTS.MaxAge > 0 {
+		hsts = fmt.Sprintf("max-age=%0.f", cfg.HSTS.MaxAge.Seconds())
+	}
+	r.UseMiddlewareFunc(gas.SecurityHeaders(
+		gas.WithSecurityHeadersStrictTransportSecurity(hsts),
+	))
+
 	r.UseMiddlewareFunc(cors.Handler(cors.Options{
 		// Echo any origin back, which unlike "*" also works for credentialed
 		// requests.
@@ -102,9 +130,7 @@ func installMiddleware(r *gas.Router, cfg *Config) {
 
 	r.UseMiddlewareFunc(httpx.RequestID(cfg.Env))
 
-	r.UseMiddlewareFunc(middleware.ClientIPFromXFFTrustedProxies(1))
-
-	r.UseMiddlewareFunc(withRequestLogger)
+	r.UseMiddlewareFunc(withRequestLogger(logger))
 
 	r.UseMiddlewareFunc(gas.RequestLogger[httpx.RequestLogger]())
 
@@ -115,12 +141,4 @@ func installMiddleware(r *gas.Router, cfg *Config) {
 	if cfg.Server.Domain != "" {
 		r.UseMiddlewareFunc(virtualHost(cfg.Server.Domain))
 	}
-
-	var hsts string
-	if cfg.HSTS != nil && cfg.HSTS.MaxAge > 0 {
-		hsts = fmt.Sprintf("max-age=%0.f", cfg.HSTS.MaxAge.Seconds())
-	}
-	r.UseMiddlewareFunc(gas.SecurityHeaders(
-		gas.WithSecurityHeadersStrictTransportSecurity(hsts),
-	))
 }

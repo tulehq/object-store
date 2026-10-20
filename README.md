@@ -44,9 +44,12 @@ Settings come from environment variables prefixed with `TULE_`, and from a
 | `TULE_Storage_Buckets` | unset | Comma-separated buckets to create at startup, if missing |
 | `TULE_HSTS_MaxAge` | unset | `Strict-Transport-Security` max age; the header is only sent when set |
 | `TULE_Server_Domain` | `localhost` | Enables virtual-hosted-style requests to `<bucket>.<domain>` |
+| `TULE_Server_ReadTimeout` | `0` | How long the server may take to read a whole request, `0` for no limit, so an upload streams for as long as the client needs |
+| `TULE_Server_WriteTimeout` | `0` | How long it may take to write a whole response, `0` for no limit, so a download does too |
+| `TULE_Server_HeaderTimeout` | `10s` | How long a client may take to send its request headers, and to complete a TLS handshake; `0` removes the bound, which leaves a stalled connection open indefinitely |
 | `TULE_Auth_AccessKeyID` | required | The access key clients sign requests with |
 | `TULE_Auth_SecretAccessKey` | required | Its secret |
-| `TULE_GasEnv` | | `development` logs at trace level, `testing` disables logging |
+| `TULE_GasEnv` | | `development` logs console output at trace level, `production` logs JSON at warn level, `testing` disables logging |
 
 The server refuses to start without credentials, and every request must be
 signed with them (SigV4) or carry a presigned URL made with them. Any web page
@@ -126,8 +129,18 @@ any origin, and response headers such as `ETag` are exposed.
   are not readable by this one.
 - **Signature verification is request-level.** Header and presigned-URL
   signatures, expiry, clock skew and hex payload hashes are checked; the
-  per-chunk signatures of streaming uploads are not. There is one access key,
-  with access to everything.
+  per-chunk signatures of streaming uploads are not. A request is also refused
+  when it carries headers its signature does not cover: `Host` must be signed,
+  and so must every `x-amz-*` header except `x-amz-content-sha256`, which the
+  signature covers as the declared payload hash. Headers S3 does not require
+  signed are not required here either, so whoever holds a presigned `PUT` can
+  still choose its `Content-Type` and the system headers stored with the
+  object. There is one access key, with access to everything.
+- **Signatures are checked against the re-encoded path.** The canonical
+  request is rebuilt from the decoded request path, so a client that sends an
+  unescaped `+` in a key signs `+` where this server canonicalizes `%2B`, and
+  the request is refused with `SignatureDoesNotMatch`. The AWS SDKs escape it,
+  so this only affects hand-built requests.
 - **Not implemented** (requests return `501 NotImplemented`): enabling
   versioning, tagging, ACLs, bucket policies, CORS and lifecycle configuration,
   object lock, UploadPartCopy, and browser POST-policy uploads.
