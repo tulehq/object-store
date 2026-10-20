@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/gasmod/gas"
-	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
 
 	"tule.dev/object-store/internal/contracts"
@@ -130,8 +129,6 @@ func installMiddleware(r *gas.Router, cfg *Config, logger gas.Logger) {
 	}))
 
 	r.UseMiddlewareFunc(httpx.RequestID(cfg.Env))
-
-	r.UseMiddlewareFunc(middleware.ClientIPFromXFFTrustedProxies(1))
 
 	r.UseMiddlewareFunc(withRequestLogger(logger))
 
