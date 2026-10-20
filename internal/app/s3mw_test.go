@@ -49,3 +49,23 @@ func TestVerifySignatureExemptsOnlyTheLiteralProbePaths(t *testing.T) {
 		})
 	}
 }
+
+// TestSecurityHeadersOnRejectedRequests covers the responses the signature
+// middleware writes itself. Security headers set inside the chain never reach
+// them, so the response that any web page on the machine can provoke would be
+// the one response without them.
+func TestSecurityHeadersOnRejectedRequests(t *testing.T) {
+	h := startApp(t).Handler()
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/bucket/key", nil))
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusForbidden)
+	}
+	for _, name := range []string{"X-Content-Type-Options", "X-Frame-Options", "Referrer-Policy"} {
+		if w.Header().Get(name) == "" {
+			t.Errorf("%s is missing from the rejected request's response", name)
+		}
+	}
+}

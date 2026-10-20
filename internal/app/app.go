@@ -102,6 +102,16 @@ func createBuckets(names []string) func(*gas.ServiceContainer) error {
 }
 
 func installMiddleware(r *gas.Router, cfg *Config, logger gas.Logger) {
+	// First in the chain, so every response carries them, including the ones
+	// the signature middleware writes without reaching the handlers.
+	var hsts string
+	if cfg.HSTS != nil && cfg.HSTS.MaxAge > 0 {
+		hsts = fmt.Sprintf("max-age=%0.f", cfg.HSTS.MaxAge.Seconds())
+	}
+	r.UseMiddlewareFunc(gas.SecurityHeaders(
+		gas.WithSecurityHeadersStrictTransportSecurity(hsts),
+	))
+
 	r.UseMiddlewareFunc(cors.Handler(cors.Options{
 		// Echo any origin back, which unlike "*" also works for credentialed
 		// requests.
@@ -134,12 +144,4 @@ func installMiddleware(r *gas.Router, cfg *Config, logger gas.Logger) {
 	if cfg.Server.Domain != "" {
 		r.UseMiddlewareFunc(virtualHost(cfg.Server.Domain))
 	}
-
-	var hsts string
-	if cfg.HSTS != nil && cfg.HSTS.MaxAge > 0 {
-		hsts = fmt.Sprintf("max-age=%0.f", cfg.HSTS.MaxAge.Seconds())
-	}
-	r.UseMiddlewareFunc(gas.SecurityHeaders(
-		gas.WithSecurityHeadersStrictTransportSecurity(hsts),
-	))
 }
