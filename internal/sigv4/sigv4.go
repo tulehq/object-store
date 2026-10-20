@@ -83,6 +83,10 @@ func (v *Verifier) Verify(r *http.Request) error {
 		return err
 	}
 
+	if err = checkSignedHeaders(r, s); err != nil {
+		return err
+	}
+
 	want := v.signature(r, s)
 	if !hmac.Equal([]byte(want), []byte(s.signature)) {
 		return s3api.NewError(http.StatusForbidden, "SignatureDoesNotMatch",
@@ -225,6 +229,47 @@ func (v *Verifier) parseCredential(cred string, s *signed, malformed func(string
 	s.region, s.service = parts[2], parts[3]
 	s.scope = strings.Join(parts[1:], "/")
 	return nil
+}
+
+// checkSignedHeaders rejects a request that carries an x-amz-* header its
+// signature does not cover, or that does not sign its Host at all, which is
+// what S3 requires. Anyone holding a signed request or a presigned URL can
+// change what the signature leaves out: x-amz-meta-* is the user metadata an
+// upload stores, and the Host header chooses the bucket in
+// virtual-hosted-style addressing.
+//
+// Headers S3 does not require signed are not required here either, so a
+// presigned PUT can still be sent with a Content-Type, or with the system
+// headers stored alongside the object, that its signature never covered. That
+// is S3's boundary, and the README documents it.
+//
+// x-amz-content-sha256 is exempt: it is the declared payload hash, which the
+// canonical request covers on a line of its own, so changing it changes the
+// signature whether or not it is listed. Clients that presign with
+// UNSIGNED-PAYLOAD and send the header anyway depend on that.
+func checkSignedHeaders(r *http.Request, s *signed) error {
+	if !isSigned(s, "host") {
+		return accessDenied("The Host header must be signed")
+	}
+	for name := range r.Header {
+		lower := strings.ToLower(name)
+		if !strings.HasPrefix(lower, "x-amz-") || lower == "x-amz-content-sha256" {
+			continue
+		}
+		if !isSigned(s, lower) {
+			return accessDenied("There were headers present in the request which were not signed")
+		}
+	}
+	return nil
+}
+
+// isSigned reports whether s lists name among its signed headers. S3 requires
+// the list to be lowercase; a client that sends it otherwise still means the
+// same header.
+func isSigned(s *signed, name string) bool {
+	return slices.ContainsFunc(s.signedHeaders, func(h string) bool {
+		return strings.EqualFold(strings.TrimSpace(h), name)
+	})
 }
 
 // signature computes the signature r should carry for the claims in s.

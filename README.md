@@ -129,8 +129,13 @@ any origin, and response headers such as `ETag` are exposed.
   are not readable by this one.
 - **Signature verification is request-level.** Header and presigned-URL
   signatures, expiry, clock skew and hex payload hashes are checked; the
-  per-chunk signatures of streaming uploads are not. There is one access key,
-  with access to everything.
+  per-chunk signatures of streaming uploads are not. A request is also refused
+  when it carries headers its signature does not cover: `Host` must be signed,
+  and so must every `x-amz-*` header except `x-amz-content-sha256`, which the
+  signature covers as the declared payload hash. Headers S3 does not require
+  signed are not required here either, so whoever holds a presigned `PUT` can
+  still choose its `Content-Type` and the system headers stored with the
+  object. There is one access key, with access to everything.
 - **Not implemented** (requests return `501 NotImplemented`): enabling
   versioning, tagging, ACLs, bucket policies, CORS and lifecycle configuration,
   object lock, UploadPartCopy, and browser POST-policy uploads.

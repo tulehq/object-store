@@ -153,3 +153,56 @@ func TestVerifyPresigned(t *testing.T) {
 	r.Method = http.MethodPut
 	wantCode(t, verifier().Verify(r), "SignatureDoesNotMatch")
 }
+
+// TestVerifyRejectsUnsignedAmzHeaders covers x-amz-* headers added to a
+// request after it was signed. They are not covered by the signature, so a
+// holder of a signed request or a presigned URL could otherwise change what an
+// upload stores.
+func TestVerifyRejectsUnsignedAmzHeaders(t *testing.T) {
+	const target = "http://localhost:9000/bucket/key"
+
+	r := signedRequest(t, target, creds)
+	r.Header.Set("X-Amz-Meta-Injected", "yes")
+	wantCode(t, verifier().Verify(r), "AccessDenied")
+
+	r = presignedRequest(t, http.MethodPut, target, time.Hour)
+	r.Header.Set("X-Amz-Meta-Injected", "yes")
+	wantCode(t, verifier().Verify(r), "AccessDenied")
+}
+
+// signWithHeaders signs r over exactly names, the way a client that leaves a
+// header the SDK would sign out of its SignedHeaders list does.
+func signWithHeaders(t *testing.T, r *http.Request, names []string) {
+	t.Helper()
+
+	scope := signTime.Format("20060102") + "/eu-west-1/s3/" + scopeSuffix
+	r.Header.Set("X-Amz-Date", signTime.Format(amzDateFmt))
+	sig := verifier().signature(r, &signed{
+		date:          signTime,
+		scope:         scope,
+		region:        "eu-west-1",
+		service:       "s3",
+		payloadHash:   r.Header.Get("X-Amz-Content-Sha256"),
+		signedHeaders: names,
+	})
+
+	r.Header.Set("Authorization", algorithm+" Credential="+creds.AccessKeyID+"/"+scope+
+		",SignedHeaders="+strings.Join(names, ";")+",Signature="+sig)
+}
+
+// TestVerifyRequiresSignedHost covers a request validly signed without its
+// Host header. The host chooses the bucket in virtual-hosted-style addressing,
+// so the same signed request would otherwise address whatever bucket its
+// sender points it at.
+func TestVerifyRequiresSignedHost(t *testing.T) {
+	r := httptest.NewRequestWithContext(
+		context.Background(),
+		http.MethodGet,
+		"http://localhost:9000/bucket/key",
+		nil,
+	)
+	r.Header.Set("X-Amz-Content-Sha256", unsigned)
+	signWithHeaders(t, r, []string{"x-amz-content-sha256", "x-amz-date"})
+
+	wantCode(t, verifier().Verify(r), "AccessDenied")
+}
