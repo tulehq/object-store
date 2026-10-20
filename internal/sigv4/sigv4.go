@@ -343,10 +343,13 @@ func canonicalHeaders(r *http.Request, names []string) string {
 			// net/http may keep the length only in r.ContentLength.
 			val = strconv.FormatInt(r.ContentLength, 10)
 		default:
+			// Canonicalize into a copy: r.Header.Values returns the slice the
+			// request itself holds, and the handlers read these values after.
+			trimmed := make([]string, len(vals))
 			for i, x := range vals {
-				vals[i] = strings.Join(strings.Fields(x), " ")
+				trimmed[i] = strings.Join(strings.Fields(x), " ")
 			}
-			val = strings.Join(vals, ",")
+			val = strings.Join(trimmed, ",")
 		}
 		sb.WriteString(name)
 		sb.WriteByte(':')

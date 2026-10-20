@@ -154,6 +154,43 @@ func TestVerifyPresigned(t *testing.T) {
 	wantCode(t, verifier().Verify(r), "SignatureDoesNotMatch")
 }
 
+// TestVerifyKeepsHeaderValues covers a signed header whose value carries runs
+// of spaces: collapsing them is part of computing the canonical request, and
+// must not reach the request the handlers go on to read.
+func TestVerifyKeepsHeaderValues(t *testing.T) {
+	const (
+		target = "http://localhost:9000/bucket/key"
+		note   = "  two  spaces  inside  "
+	)
+
+	r := httptest.NewRequestWithContext(
+		context.Background(),
+		http.MethodPut,
+		target,
+		strings.NewReader(body),
+	)
+	hash := sha256Hex(body)
+	r.Header.Set("X-Amz-Content-Sha256", hash)
+	r.Header.Set("X-Amz-Meta-Note", note)
+
+	signer := v4.NewSigner(func(o *v4.SignerOptions) { o.DisableURIPathEscaping = true })
+	if err := signer.SignHTTP(context.Background(), aws.Credentials{
+		AccessKeyID: creds.AccessKeyID, SecretAccessKey: creds.SecretAccessKey,
+	}, r, hash, "s3", "eu-west-1", signTime); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	if got := r.Header.Get("X-Amz-Meta-Note"); got != note {
+		t.Skipf("the signer itself rewrote the header to %q", got)
+	}
+
+	if err := verifier().Verify(r); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if got := r.Header.Get("X-Amz-Meta-Note"); got != note {
+		t.Fatalf("header value = %q, want %q", got, note)
+	}
+}
+
 // TestVerifyRejectsUnsignedAmzHeaders covers x-amz-* headers added to a
 // request after it was signed. They are not covered by the signature, so a
 // holder of a signed request or a presigned URL could otherwise change what an
