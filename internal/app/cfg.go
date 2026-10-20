@@ -57,10 +57,9 @@ const (
 	envVarPrefix    = "TULE_"
 )
 
-// LoadConfig loads configuration from a .env file and then the process
-// environment, and in production-like environments layers AWS Secrets Manager
-// on top. It fails if a production-like environment is missing its Secrets
-// Manager settings.
+// LoadConfig loads configuration from a .env file in the working directory,
+// which need not exist, and then from the TULE_-prefixed process environment,
+// whose values win.
 func LoadConfig() (*Config, error) {
 	return LoadConfigFrom(
 		providers.NewDotEnvProvider(
@@ -74,8 +73,10 @@ func LoadConfig() (*Config, error) {
 	)
 }
 
-// LoadConfigFrom loads configuration from the given providers in order, then
-// applies the same Secrets Manager layering and binding as LoadConfig.
+// LoadConfigFrom loads configuration from the given providers in order, later
+// providers overriding earlier ones, and then applies the defaults and binds
+// it the way LoadConfig does. The e2e tests use it to load from an
+// environment they set up themselves.
 func LoadConfigFrom(provs ...providers.Provider) (*Config, error) {
 	env := gasenv.NewExtension()
 
