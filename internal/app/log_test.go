@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -50,5 +51,30 @@ func TestWithRequestLoggerServesWithoutALogger(t *testing.T) {
 	}
 	if !strings.Contains(logged.String(), "failed to resolve the request logger") {
 		t.Fatalf("the resolve failure was not logged: %q", logged.String())
+	}
+}
+
+// TestProdLoggerWritesJSON covers the production-like logger: its output is
+// collected by machines, so each line is a JSON object, and it logs at warn
+// level.
+func TestProdLoggerWritesJSON(t *testing.T) {
+	var out bytes.Buffer
+	logger, err := newProdLogger(&out)
+	if err != nil {
+		t.Fatalf("new logger: %v", err)
+	}
+
+	logger.Info("quiet").Send()
+	if out.Len() != 0 {
+		t.Fatalf("logged below warn level: %q", out.String())
+	}
+
+	logger.Warn("loud").Send()
+	var line map[string]any
+	if jErr := json.Unmarshal(out.Bytes(), &line); jErr != nil {
+		t.Fatalf("output is not JSON: %q: %v", out.String(), jErr)
+	}
+	if line["message"] != "loud" {
+		t.Fatalf("message = %v, want loud", line["message"])
 	}
 }

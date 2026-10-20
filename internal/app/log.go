@@ -1,6 +1,7 @@
 package app
 
 import (
+	"io"
 	"net/http"
 	"os"
 
@@ -18,22 +19,25 @@ func newLogger(s *logSettings, env gasenv.Environment) (gas.Logger, error) {
 		return &gas.NopLogger{}, nil
 	}
 	if env.IsProductionLike() {
-		return newProdLogger(s)
+		return newProdLogger(os.Stderr)
 	}
-	return newDevLogger(s)
+	return newDevLogger(os.Stderr)
 }
 
-func newProdLogger(_ *logSettings) (gas.Logger, error) {
-	out := zerolog.ConsoleWriter{Out: os.Stderr}
-
-	zl := zerolog.New(out).Level(zerolog.WarnLevel).With().Timestamp().
+// newProdLogger logs to w at warn level. Production-like output is read by
+// whatever collects it rather than by a person at a terminal, so it is
+// structured JSON, unlike the console format newDevLogger writes.
+func newProdLogger(w io.Writer) (gas.Logger, error) {
+	zl := zerolog.New(w).Level(zerolog.WarnLevel).With().Timestamp().
 		Str("app_ver", buildinfo.Version).Logger()
 
 	return log.NewZeroLogLogger(log.WithZeroLogInstance(&zl))()
 }
 
-func newDevLogger(_ *logSettings) (gas.Logger, error) {
-	out := zerolog.ConsoleWriter{Out: os.Stderr}
+// newDevLogger logs to w at trace level, in zerolog's console format: a
+// person reads it as it is written.
+func newDevLogger(w io.Writer) (gas.Logger, error) {
+	out := zerolog.ConsoleWriter{Out: w}
 
 	zl := zerolog.New(out).Level(zerolog.TraceLevel).With().Timestamp().
 		Str("app_ver", buildinfo.Version).Logger()

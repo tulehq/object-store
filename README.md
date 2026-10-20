@@ -49,7 +49,7 @@ Settings come from environment variables prefixed with `TULE_`, and from a
 | `TULE_Server_HeaderTimeout` | `10s` | How long a client may take to send its request headers, and to complete a TLS handshake; `0` removes the bound, which leaves a stalled connection open indefinitely |
 | `TULE_Auth_AccessKeyID` | required | The access key clients sign requests with |
 | `TULE_Auth_SecretAccessKey` | required | Its secret |
-| `TULE_GasEnv` | | `development` logs at trace level, `testing` disables logging |
+| `TULE_GasEnv` | | `development` logs console output at trace level, `production` logs JSON at warn level, `testing` disables logging |
 
 The server refuses to start without credentials, and every request must be
 signed with them (SigV4) or carry a presigned URL made with them. Any web page
