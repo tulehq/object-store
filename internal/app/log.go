@@ -14,7 +14,7 @@ import (
 	"tule.dev/object-store/internal/util/buildinfo"
 )
 
-func newLogger(s *logSettings, env gasenv.Environment) (gas.Logger, error) {
+func newLogger(env gasenv.Environment) (gas.Logger, error) {
 	if env.IsTesting() {
 		return &gas.NopLogger{}, nil
 	}

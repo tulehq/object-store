@@ -25,7 +25,7 @@ import (
 // New builds the application from cfg. extra options are applied after the
 // app's own.
 func New(cfg *Config, extra ...gas.Option) (*gas.App, error) {
-	logger, lErr := newLogger(cfg.Log, cfg.Env)
+	logger, lErr := newLogger(cfg.Env)
 	if lErr != nil {
 		return nil, lErr
 	}

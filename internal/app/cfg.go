@@ -13,11 +13,6 @@ import (
 	"tule.dev/object-store/internal/services/storage/dirimpl"
 )
 
-type logSettings struct {
-	ShippingEndpoint string `validate:"omitempty,https_url"`
-	ShippingAPIKey   string
-}
-
 // serverSettings configures the HTTP server. Domain enables
 // virtual-hosted-style addressing: a request to <bucket>.<Domain> addresses
 // that bucket. HeaderTimeout bounds the start of a request; zero means no
@@ -48,7 +43,6 @@ var errNoCredentials = errors.New("config: TULE_Auth_AccessKeyID and " +
 // bound from, which the app registers as the gas.ConfigProvider so services
 // can read settings Config itself does not model.
 type Config struct {
-	Log     *logSettings
 	Server  *serverSettings `validate:"required"`
 	HSTS    *hstsSettings
 	Auth    *authSettings
