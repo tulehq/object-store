@@ -2,17 +2,23 @@ package dirimpl
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/gasmod/gas"
 	"github.com/gasmod/gas/config"
+	"github.com/gasmod/gas/config/configtest"
+	"github.com/gasmod/gas/storage"
 
 	"tule.dev/object-store/internal/contracts"
 )
 
-// TestPutRecordsETag guards the assumption etagReader relies on: the dir
-// backend reads the body to EOF before it stores the metadata map.
+// TestPutRecordsETag guards the assumption etagReader relies on: the trailer
+// holding the metadata map is encoded once the body is read to EOF.
 func TestPutRecordsETag(t *testing.T) {
 	s := newTestService(t)
 	ctx := context.Background()
@@ -62,12 +68,41 @@ func TestStaleIndexEntries(t *testing.T) {
 	}
 }
 
+// TestManyPartSizes checks that the part sizes of an upload of the most
+// parts S3 allows are stored, which the backend's 2 KB metadata could not
+// hold.
+func TestManyPartSizes(t *testing.T) {
+	s := newTestService(t)
+	ctx := context.Background()
+
+	sizes := make([]int64, contracts.MaxPartNumber)
+	for i := range sizes {
+		sizes[i] = contracts.MinPartSize + int64(i)
+	}
+	meta := map[string]string{etagMetaKey: "0123456789abcdef0123456789abcdef-10000"}
+	joinParts(meta, sizes)
+
+	if _, err := s.putObject(ctx, "bucket", "k", strings.NewReader("x"), "", meta); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	info, err := s.StatObject(ctx, "bucket", "k")
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if len(info.PartSizes) != len(sizes) || info.PartSizes[len(sizes)-1] != sizes[len(sizes)-1] {
+		t.Fatalf("part sizes: got %d, want %d", len(info.PartSizes), len(sizes))
+	}
+	if info.ETag != meta[etagMetaKey] || info.Size != 1 {
+		t.Fatalf("info: got etag %q size %d", info.ETag, info.Size)
+	}
+}
+
 // newTestService returns an initialized Service on a fresh root, with a
 // bucket named "bucket".
 func newTestService(t *testing.T) *Service {
 	t.Helper()
 
-	cfg := config.New()
+	cfg := config.New(config.WithProvider(configtest.NewStaticProvider(nil)))
 	if err := cfg.Load(); err != nil {
 		t.Fatalf("load config: %v", err)
 	}
@@ -82,4 +117,67 @@ func newTestService(t *testing.T) *Service {
 		t.Fatalf("create bucket: %v", err)
 	}
 	return s
+}
+
+// TestDamagedDataFile checks that an object whose data file was truncated or
+// overwritten is an error, never a missing key or different contents.
+func TestDamagedDataFile(t *testing.T) {
+	for name, damage := range map[string]func(*os.File, int64) error{
+		"truncated": func(f *os.File, size int64) error { return f.Truncate(size - 1) },
+		"magic overwritten": func(f *os.File, size int64) error {
+			if _, err := f.WriteAt([]byte{0}, size-1); err != nil {
+				return fmt.Errorf("overwrite: %w", err)
+			}
+			return nil
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := newTestService(t)
+			ctx := context.Background()
+			if _, err := s.PutObject(ctx, "bucket", "k", strings.NewReader("hello"),
+				contracts.PutObjectInput{}, contracts.Precondition{}); err != nil {
+				t.Fatalf("put: %v", err)
+			}
+
+			damageDataFile(t, s.root, damage)
+
+			_, err := s.StatObject(ctx, "bucket", "k")
+			if err == nil || errors.Is(err, storage.ErrObjectNotFound) {
+				t.Fatalf("stat: got %v, want an error other than not found", err)
+			}
+			_, err = s.GetObject(ctx, "bucket", "k")
+			if err == nil || errors.Is(err, storage.ErrObjectNotFound) {
+				t.Fatalf("get: got %v, want an error other than not found", err)
+			}
+		})
+	}
+}
+
+// damageDataFile applies damage to the one backend data file in root.
+func damageDataFile(t *testing.T, root *os.Root, damage func(*os.File, int64) error) {
+	t.Helper()
+
+	var files []string
+	err := fs.WalkDir(root.FS(), ".gas/objects", func(p string, d fs.DirEntry, err error) error {
+		if err == nil && d.Type().IsRegular() {
+			files = append(files, p)
+		}
+		return err
+	})
+	if err != nil || len(files) != 1 {
+		t.Fatalf("data files: found %d, err %v; want 1", len(files), err)
+	}
+
+	f, err := root.OpenFile(files[0], os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open data file: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		t.Fatalf("stat data file: %v", err)
+	}
+	if err = damage(f, info.Size()); err != nil {
+		t.Fatalf("damage data file: %v", err)
+	}
 }

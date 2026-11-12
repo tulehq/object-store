@@ -58,7 +58,7 @@ func (s *Service) CreateMultipartUpload(
 	if _, err := s.HeadBucket(ctx, bucket); err != nil {
 		return "", err
 	}
-	if err := s.checkKey(ctx, bucket, key); err != nil {
+	if err := s.checkKey(key); err != nil {
 		return "", err
 	}
 

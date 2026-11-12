@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/gasmod/gas/config/providers"
+	"github.com/gasmod/gas/config"
 )
 
 func loadEnvConfig(t *testing.T, id, secret string) error {
@@ -13,9 +13,9 @@ func loadEnvConfig(t *testing.T, id, secret string) error {
 	t.Setenv("TULE_Auth_AccessKeyID", id)
 	t.Setenv("TULE_Auth_SecretAccessKey", secret)
 
-	_, err := LoadConfigFrom(providers.NewEnvProvider(
-		providers.WithEnvSeparator(envVarSeparator),
-		providers.WithEnvPrefix(envVarPrefix),
+	_, err := LoadConfigFrom(config.NewEnvProvider(
+		config.WithEnvSeparator(envVarSeparator),
+		config.WithEnvPrefix(envVarPrefix),
 	))
 	return err
 }

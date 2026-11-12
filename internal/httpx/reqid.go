@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"sync/atomic"
 
-	"github.com/gasmod/gas/config/extensions/gasenv"
+	"github.com/gasmod/gas/config"
 	"github.com/go-chi/chi/v5/middleware"
 )
 
@@ -16,7 +16,7 @@ import (
 // Production-like environments get chi's random IDs; everywhere else the IDs
 // are short and sequential ("dev-1", "dev-2", ...), which is easier to follow
 // when reading logs by hand.
-func RequestID(env gasenv.Environment) func(http.Handler) http.Handler {
+func RequestID(env config.Environment) func(http.Handler) http.Handler {
 	if env.IsProductionLike() {
 		return middleware.RequestID
 	}

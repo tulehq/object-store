@@ -5,22 +5,35 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path"
+	"unicode/utf8"
 
 	"github.com/gasmod/gas/storage"
-	"github.com/gasmod/gas/storage/dir"
 
 	"tule.dev/object-store/internal/contracts"
 )
 
-// objectInput addresses key in bucket in the backend.
-func objectInput(bucket, key string) storage.BaseObjectInput {
-	return storage.BaseObjectInput{Bucket: &bucket, Key: key}
+// objectInput addresses key in bucket in the backend. It returns an error
+// wrapping storage.ErrInvalidKey when key breaks the key rules.
+//
+// The backend refuses keys that S3 and this service accept, such as one
+// holding a tab, so it is given the key's hash rather than the key, and the
+// key is checked against this service's own rules: 1 to 1024 bytes of
+// UTF-8 whose last "/"-separated element is not "." and that does not
+// clean to ".". The key index maps the hashes back to the keys.
+func objectInput(bucket, key string) (storage.BaseObjectInput, error) {
+	if len(key) < 1 || len(key) > 1024 || !utf8.ValidString(key) ||
+		path.Base(key) == "." || path.Clean(key) == "." {
+		return storage.BaseObjectInput{}, storage.ErrInvalidKey
+	}
+	return storage.BaseObjectInput{Bucket: &bucket, Key: keyHash(key)}, nil
 }
 
 // objectInfo returns the stored object info, with the ETag, system headers
-// and part sizes split out of the backend metadata.
-func objectInfo(key string, info *storage.ObjectInfo) (*contracts.ObjectInfo, error) {
-	meta := info.Metadata
+// and part sizes split out of the trailer's metadata. size is the length of
+// the object bytes.
+func objectInfo(key string, tr *trailer, size int64) (*contracts.ObjectInfo, error) {
+	meta := tr.Meta
 	if meta == nil {
 		meta = make(map[string]string)
 	}
@@ -35,63 +48,82 @@ func objectInfo(key string, info *storage.ObjectInfo) (*contracts.ObjectInfo, er
 		ETag:         splitETag(meta),
 		Headers:      splitHeaders(meta),
 		PartSizes:    parts,
-		Size:         info.Size,
-		ContentType:  info.ContentType,
-		LastModified: info.LastModified,
+		Size:         size,
+		ContentType:  tr.ContentType,
+		LastModified: tr.LastModified,
 		Metadata:     meta,
 	}, nil
 }
 
 // StatObject returns an object's metadata, with its ETag split out of the
-// user metadata.
+// user metadata. The metadata is in the object's trailer, so this opens the
+// object to read it.
 func (s *Service) StatObject(
 	ctx context.Context,
 	bucket, key string,
 ) (*contracts.ObjectInfo, error) {
-	if _, err := s.HeadBucket(ctx, bucket); err != nil {
+	obj, err := s.openObject(ctx, "stat", bucket, key)
+	if err != nil {
 		return nil, err
 	}
-
-	info, err := s.dir.HeadObject(ctx, &storage.HeadObjectInput{
-		BaseObjectInput: objectInput(bucket, key),
-	})
-	if err != nil {
-		// The backend reports a missing object to a HEAD as ErrNotFound; the
-		// S3 API treats it as a missing key whatever the method.
-		if errors.Is(err, storage.ErrNotFound) {
-			return nil, fmt.Errorf(
-				"%s: stat %q: %w: %w", s.Name(), key, storage.ErrKeyNotFound, err)
-		}
+	if err = obj.Body.Close(); err != nil {
 		return nil, fmt.Errorf("%s: stat %q: %w", s.Name(), key, err)
 	}
-
-	out, err := objectInfo(key, info)
-	if err != nil {
-		return nil, fmt.Errorf("%s: stat %q: %w", s.Name(), key, err)
-	}
-	return out, nil
+	return &obj.ObjectInfo, nil
 }
 
 // GetObject opens an object for reading. The caller must close its Body. The
 // info and body come from the same read, so they match even when the object
 // is overwritten meanwhile.
 func (s *Service) GetObject(ctx context.Context, bucket, key string) (*contracts.Object, error) {
+	return s.openObject(ctx, "get", bucket, key)
+}
+
+// openObject opens an object and reads its trailer. A missing object is an
+// error wrapping storage.ErrObjectNotFound. op names the operation in
+// errors.
+func (s *Service) openObject(
+	ctx context.Context,
+	op, bucket, key string,
+) (*contracts.Object, error) {
 	if _, err := s.HeadBucket(ctx, bucket); err != nil {
 		return nil, err
 	}
 
-	obj, err := s.dir.GetObject(ctx, &storage.GetObjectInput{
-		HeadObjectInput: storage.HeadObjectInput{BaseObjectInput: objectInput(bucket, key)},
-	})
+	base, err := objectInput(bucket, key)
 	if err != nil {
-		return nil, fmt.Errorf("%s: get %q: %w", s.Name(), key, err)
+		return nil, fmt.Errorf("%s: %s %q: %w", s.Name(), op, key, err)
 	}
 
-	info, err := objectInfo(key, &obj.ObjectInfo)
+	obj, err := s.dir.GetObject(ctx, &storage.GetObjectInput{
+		HeadObjectInput: storage.HeadObjectInput{BaseObjectInput: base},
+	})
 	if err != nil {
-		return nil, errors.Join(fmt.Errorf("%s: get %q: %w", s.Name(), key, err), obj.Body.Close())
+		return nil, fmt.Errorf("%s: %s %q: %w", s.Name(), op, key, err)
 	}
-	return &contracts.Object{ObjectInfo: *info, Body: obj.Body}, nil
+
+	// The dir backend's body is an io.ReadSeeker, which the trailer is
+	// read through.
+	rs, ok := obj.Body.(io.ReadSeekCloser)
+	if !ok {
+		err = fmt.Errorf("%s: %s %q: backend body %T is not seekable",
+			s.Name(), op, key, obj.Body)
+		return nil, errors.Join(err, obj.Body.Close())
+	}
+
+	tr, size, err := readTrailer(rs, obj.Size)
+	if err != nil {
+		err = fmt.Errorf("%s: %s %q: %w", s.Name(), op, key, err)
+		return nil, errors.Join(err, obj.Body.Close())
+	}
+
+	info, err := objectInfo(key, tr, size)
+	if err != nil {
+		err = fmt.Errorf("%s: %s %q: %w", s.Name(), op, key, err)
+		return nil, errors.Join(err, obj.Body.Close())
+	}
+
+	return &contracts.Object{ObjectInfo: *info, Body: &objectBody{rs: rs, size: size}}, nil
 }
 
 // DeleteObject removes an object. Deleting a key that holds no object
@@ -101,12 +133,18 @@ func (s *Service) DeleteObject(ctx context.Context, bucket, key string) error {
 		return err
 	}
 
+	base, err := objectInput(bucket, key)
+	if err != nil {
+		return fmt.Errorf("%s: delete %q: %w", s.Name(), key, err)
+	}
+
 	unlock := s.locks.lock(bucket, key)
 	defer unlock()
 
-	if _, err := s.dir.DeleteObject(ctx, &storage.DeleteObjectInput{
-		BaseObjectInput: objectInput(bucket, key),
-	}); err != nil {
+	if err = s.dir.DeleteObject(
+		ctx,
+		&storage.DeleteObjectInput{BaseObjectInput: base},
+	); err != nil {
 		return fmt.Errorf("%s: delete %q: %w", s.Name(), key, err)
 	}
 	return s.removeFromIndex(bucket, key)
@@ -137,8 +175,9 @@ func (s *Service) PutObject(
 	return s.putObject(ctx, bucket, key, er, in.ContentType, er.meta)
 }
 
-// putObject indexes key and writes the object, with meta as its backend
-// metadata. The caller holds the key's lock.
+// putObject indexes key and writes the object, with meta as the metadata
+// of its trailer. An empty contentType is detected from the body. The
+// caller holds the key's lock.
 func (s *Service) putObject(
 	ctx context.Context,
 	bucket, key string,
@@ -146,57 +185,44 @@ func (s *Service) putObject(
 	contentType string,
 	meta map[string]string,
 ) (*contracts.ObjectInfo, error) {
-	if err := s.checkKey(ctx, bucket, key); err != nil {
-		return nil, err
+	base, err := objectInput(bucket, key)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", s.Name(), err)
 	}
-	if err := s.addToIndex(bucket, key); err != nil {
+	if err = s.addToIndex(bucket, key); err != nil {
 		return nil, err
 	}
 
-	in := &storage.PutObjectInput{
-		BaseObjectInput: objectInput(bucket, key),
-		Body:            body,
-		Metadata:        meta,
-	}
-	if contentType != "" {
-		in.ContentType = &contentType
-	}
-
-	if _, err := s.dir.PutObject(ctx, in); err != nil {
-		if !errors.Is(err, dir.ErrStaleData) {
-			err = fmt.Errorf("%s: put %q: %w", s.Name(), key, err)
-			return nil, errors.Join(err, s.unindexMissing(ctx, bucket, key))
-		}
-		// The object was written; only the data file it replaced is left
-		// behind.
-		s.logger.Warn("object written, but its previous data file was left on disk").
-			Err("error", err).Send()
+	if _, err = s.dir.PutObject(ctx, &storage.PutObjectInput{
+		BaseObjectInput: base,
+		Body:            withTrailer(body, &trailer{Meta: meta, ContentType: contentType}),
+	}); err != nil {
+		err = fmt.Errorf("%s: put %q: %w", s.Name(), key, err)
+		return nil, errors.Join(err, s.unindexMissing(ctx, base, bucket, key))
 	}
 
 	return s.StatObject(ctx, bucket, key)
 }
 
 // unindexMissing drops key from bucket's index when it holds no object, so a
-// failed write of a new key does not leave its entry behind. The caller holds
-// the key's lock.
-func (s *Service) unindexMissing(ctx context.Context, bucket, key string) error {
-	_, err := s.dir.HeadObject(ctx, &storage.HeadObjectInput{
-		BaseObjectInput: objectInput(bucket, key),
-	})
-	if !errors.Is(err, storage.ErrNotFound) {
+// failed write of a new key does not leave its entry behind. base addresses
+// key in the backend. The caller holds the key's lock.
+func (s *Service) unindexMissing(
+	ctx context.Context,
+	base storage.BaseObjectInput,
+	bucket, key string,
+) error {
+	_, err := s.dir.HeadObject(ctx, &storage.HeadObjectInput{BaseObjectInput: base})
+	if !errors.Is(err, storage.ErrObjectNotFound) {
 		return nil
 	}
 	return s.removeFromIndex(bucket, key)
 }
 
-// checkKey returns an error wrapping storage.ErrInvalidKey when the backend
-// cannot store key. The backend validates keys before it touches the disk,
-// so asking it about the key is how this is known before the key is indexed.
-func (s *Service) checkKey(ctx context.Context, bucket, key string) error {
-	_, err := s.dir.HeadObject(ctx, &storage.HeadObjectInput{
-		BaseObjectInput: objectInput(bucket, key),
-	})
-	if errors.Is(err, storage.ErrInvalidKey) {
+// checkKey returns an error wrapping storage.ErrInvalidKey when key breaks
+// the key rules, so a key is known to be storable before it is indexed.
+func (s *Service) checkKey(key string) error {
+	if _, err := objectInput("", key); err != nil {
 		return fmt.Errorf("%s: %w", s.Name(), err)
 	}
 	return nil

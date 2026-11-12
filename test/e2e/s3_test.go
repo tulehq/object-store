@@ -18,7 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
-	"github.com/gasmod/gas/config/providers"
+	"github.com/gasmod/gas/config"
 
 	"tule.dev/object-store/internal/app"
 )
@@ -51,9 +51,9 @@ func startServer(t *testing.T, useTLS bool, env map[string]string) *httptest.Ser
 		t.Setenv(k, v)
 	}
 
-	cfg, err := app.LoadConfigFrom(providers.NewEnvProvider(
-		providers.WithEnvSeparator("_"),
-		providers.WithEnvPrefix("TULE_"),
+	cfg, err := app.LoadConfigFrom(config.NewEnvProvider(
+		config.WithEnvSeparator("_"),
+		config.WithEnvPrefix("TULE_"),
 	))
 	if err != nil {
 		t.Fatalf("load config: %v", err)

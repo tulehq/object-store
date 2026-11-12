@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/gasmod/gas/storage"
@@ -18,6 +19,25 @@ import (
 // 3-63 characters of lowercase letters, digits, dots and hyphens, starting and
 // ending with a letter or digit.
 var bucketNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$`)
+
+// The prefixes and suffixes the S3 bucket naming rules reserve. The backend
+// accepts them, so CreateBucket refuses them itself.
+var (
+	reservedBucketPrefixes = []string{"xn--", "sthree-", "amzn-s3-demo-"}
+	reservedBucketSuffixes = []string{
+		"-s3alias", "--ol-s3", ".mrap", "--x-s3", "--table-s3", "-an",
+	}
+)
+
+// isReservedBucketName reports whether bucket has a reserved prefix or
+// suffix.
+func isReservedBucketName(bucket string) bool {
+	return slices.ContainsFunc(reservedBucketPrefixes, func(p string) bool {
+		return strings.HasPrefix(bucket, p)
+	}) || slices.ContainsFunc(reservedBucketSuffixes, func(sfx string) bool {
+		return strings.HasSuffix(bucket, sfx)
+	})
+}
 
 // ListBuckets returns every bucket in the bucket registry.
 func (s *Service) ListBuckets(_ context.Context) ([]contracts.BucketInfo, error) {
@@ -110,7 +130,7 @@ func (s *Service) listObject(
 	out *contracts.ListObjectsOutput,
 ) error {
 	info, err := s.StatObject(ctx, bucket, key)
-	if errors.Is(err, storage.ErrKeyNotFound) {
+	if errors.Is(err, storage.ErrObjectNotFound) {
 		return nil
 	}
 	if err != nil {
@@ -176,7 +196,7 @@ func (s *Service) HeadBucket(_ context.Context, bucket string) (*contracts.Bucke
 // it is added to the registry, which is what makes it exist, so an
 // interrupted create is completed by the next one.
 func (s *Service) CreateBucket(ctx context.Context, bucket string) (*contracts.BucketInfo, error) {
-	if !bucketNameRe.MatchString(bucket) {
+	if !bucketNameRe.MatchString(bucket) || isReservedBucketName(bucket) {
 		return nil, contracts.ErrInvalidBucketName
 	}
 	if _, err := s.HeadBucket(ctx, bucket); err == nil {
@@ -185,7 +205,7 @@ func (s *Service) CreateBucket(ctx context.Context, bucket string) (*contracts.B
 		return nil, err
 	}
 
-	if _, err := s.dir.CreateBucket(ctx, &storage.CreateBucketInput{Bucket: bucket}); err != nil {
+	if err := s.dir.CreateBucket(ctx, &storage.CreateBucketInput{Bucket: bucket}); err != nil {
 		return nil, fmt.Errorf("%s: failed to create bucket: %s: %w", s.Name(), bucket, err)
 	}
 	if err := s.root.MkdirAll(filepath.Join(indexDir, bucket), 0o750); err != nil {
@@ -204,8 +224,8 @@ func (s *Service) CreateBucket(ctx context.Context, bucket string) (*contracts.B
 // DeleteBucket removes an empty bucket. It returns contracts.ErrBucketNotEmpty
 // while the bucket holds objects.
 //
-// The backend cannot delete buckets, so its directories for the bucket stay
-// behind, empty. Creating the bucket again reuses them.
+// The bucket is left in the backend, empty. Creating the bucket again reuses
+// it.
 func (s *Service) DeleteBucket(ctx context.Context, bucket string) error {
 	keys, err := s.bucketKeys(ctx, bucket)
 	if err != nil {
@@ -216,7 +236,7 @@ func (s *Service) DeleteBucket(ctx context.Context, bucket string) error {
 		if sErr == nil {
 			return contracts.ErrBucketNotEmpty
 		}
-		if !errors.Is(sErr, storage.ErrKeyNotFound) {
+		if !errors.Is(sErr, storage.ErrObjectNotFound) {
 			return sErr
 		}
 	}

@@ -56,7 +56,8 @@ func (m *Module) getObject(ctx gas.Context) error {
 		return s3api.WriteError(ctx, t, err)
 	}
 
-	// The dir backend hands back the *os.File itself.
+	// The storage service's body seeks within the object bytes, which
+	// http.ServeContent needs for ranges.
 	rs, ok := obj.Body.(io.ReadSeeker)
 	if !ok {
 		return s3api.WriteError(ctx, t, fmt.Errorf("object body %T is not seekable", obj.Body))
