@@ -51,7 +51,7 @@ func (l *keyLocks) lock(bucket, key string) func() {
 }
 
 // checkPrecondition returns contracts.ErrPreconditionFailed when cond does not
-// hold for the object at bucket/key, and storage.ErrKeyNotFound when cond
+// hold for the object at bucket/key, and storage.ErrObjectNotFound when cond
 // requires an object that does not exist.
 func (s *Service) checkPrecondition(
 	ctx context.Context,
@@ -63,7 +63,7 @@ func (s *Service) checkPrecondition(
 	}
 
 	info, err := s.StatObject(ctx, bucket, key)
-	if err != nil && !errors.Is(err, storage.ErrKeyNotFound) {
+	if err != nil && !errors.Is(err, storage.ErrObjectNotFound) {
 		return err
 	}
 	exists := err == nil
@@ -73,7 +73,7 @@ func (s *Service) checkPrecondition(
 	}
 	if cond.IfMatch != "" {
 		if !exists {
-			return storage.ErrKeyNotFound
+			return storage.ErrObjectNotFound
 		}
 		if cond.IfMatch != "*" && cond.IfMatch != info.ETag {
 			return contracts.ErrPreconditionFailed

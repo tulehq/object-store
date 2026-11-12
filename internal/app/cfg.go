@@ -7,8 +7,6 @@ import (
 
 	"github.com/gasmod/gas"
 	"github.com/gasmod/gas/config"
-	"github.com/gasmod/gas/config/extensions/gasenv"
-	"github.com/gasmod/gas/config/providers"
 
 	"tule.dev/object-store/internal/services/storage/dirimpl"
 )
@@ -54,7 +52,7 @@ type Config struct {
 	Storage *dirimpl.Settings `validate:"required"`
 
 	store gas.ConfigProvider
-	Env   gasenv.Environment
+	Env   config.Environment
 }
 
 const (
@@ -68,21 +66,21 @@ const (
 // Manager settings.
 func LoadConfig() (*Config, error) {
 	return LoadConfigFrom(
-		providers.NewDotEnvProvider(
-			providers.WithDotEnvSeparator(envVarSeparator),
-			providers.WithDotEnvFileNotFoundPanic(false),
+		config.NewDotEnvProvider(
+			config.WithDotEnvSeparator(envVarSeparator),
+			config.WithDotEnvFileNotFoundPanic(false),
 		),
-		providers.NewEnvProvider(
-			providers.WithEnvSeparator(envVarSeparator),
-			providers.WithEnvPrefix(envVarPrefix),
+		config.NewEnvProvider(
+			config.WithEnvSeparator(envVarSeparator),
+			config.WithEnvPrefix(envVarPrefix),
 		),
 	)
 }
 
 // LoadConfigFrom loads configuration from the given providers in order, then
 // applies the same Secrets Manager layering and binding as LoadConfig.
-func LoadConfigFrom(provs ...providers.Provider) (*Config, error) {
-	env := gasenv.NewExtension()
+func LoadConfigFrom(provs ...config.Provider) (*Config, error) {
+	env := config.NewEnvExtension()
 
 	opts := make([]config.Option, 0, len(provs)+1)
 	opts = append(opts, config.WithExtension(env))
@@ -100,8 +98,10 @@ func LoadConfigFrom(provs ...providers.Provider) (*Config, error) {
 	return bindConfig(store, env.Current())
 }
 
-func bindConfig(store gas.ConfigProvider, env gasenv.Environment) (*Config, error) {
-	applyDefaults(store, env)
+func bindConfig(store gas.ConfigProvider, env config.Environment) (*Config, error) {
+	if err := applyDefaults(store, env); err != nil {
+		return nil, err
+	}
 
 	cfg := Config{Env: env, store: store}
 	if err := store.Bind(&cfg); err != nil {
@@ -114,9 +114,20 @@ func bindConfig(store gas.ConfigProvider, env gasenv.Environment) (*Config, erro
 	return &cfg, nil
 }
 
-func applyDefaults(store gas.ConfigProvider, _ gasenv.Environment) {
-	store.SetDefault("Server.Port", 9000)
-	store.SetDefault("Server.RequestTimeout", "30s")
-	store.SetDefault("Storage.RootDir", "./data")
-	store.SetDefault("Server.Domain", "localhost")
+func applyDefaults(store gas.ConfigProvider, _ config.Environment) error {
+	defaults := []struct {
+		value any
+		key   string
+	}{
+		{9000, "Server.Port"},
+		{"30s", "Server.RequestTimeout"},
+		{"./data", "Storage.RootDir"},
+		{"localhost", "Server.Domain"},
+	}
+	for _, d := range defaults {
+		if err := store.SetDefault(d.key, d.value); err != nil {
+			return fmt.Errorf("config: default %s: %w", d.key, err)
+		}
+	}
+	return nil
 }

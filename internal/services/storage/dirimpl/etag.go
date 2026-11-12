@@ -13,15 +13,15 @@ import (
 )
 
 // etagMetaKey is the metadata key the object's ETag is stored under, next to
-// the user metadata in the backend's metadata file.
+// the user metadata in the object's trailer.
 const etagMetaKey = "__TULE_ETAG__"
 
 // etagReader hashes everything read through it and records the hex digest in
 // meta once the underlying reader reports EOF.
 //
-// The dir backend reads the body to EOF before it stores the metadata map it
-// was given, which is what lets the digest land in the metadata written for
-// this same upload. TestPutRecordsETag guards that ordering.
+// The trailer is encoded only once the body has been read to EOF, which is
+// what lets the digest land in the metadata written for this same upload.
+// TestPutRecordsETag guards that ordering.
 type etagReader struct {
 	r    io.Reader
 	h    hash.Hash
@@ -50,11 +50,11 @@ func splitETag(meta map[string]string) string {
 	return etag
 }
 
-// headerMetaPrefix marks stored system headers in the backend metadata map.
+// headerMetaPrefix marks stored system headers in the trailer's metadata map.
 // User metadata keys are lowercase, so they cannot collide with it.
 const headerMetaPrefix = "__TULE_HEADER__"
 
-// joinMetadata flattens user metadata and system headers into one backend
+// joinMetadata flattens user metadata and system headers into one trailer
 // metadata map.
 func joinMetadata(meta, headers map[string]string) map[string]string {
 	out := make(map[string]string, len(meta)+len(headers))

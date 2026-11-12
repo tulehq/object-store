@@ -32,7 +32,15 @@ func New(cfg *Config, extra ...gas.Option) (*gas.App, error) {
 	// S3 requests are authenticated by signature, not cookies, so the
 	// cross-origin protection meant for browser sessions only gets in the way
 	// of browser uploads to presigned URLs.
-	opts := append([]gas.Option{gas.WithCSRFInsecureBypassPattern("/")}, extra...)
+	//
+	// A request the protection still rejects, one whose path is not in the
+	// canonical form the bypass pattern matches, such as a key holding "//",
+	// gets net/http's own plain-text 403, which a nil deny handler restores
+	// in place of gas's problem details.
+	opts := append([]gas.Option{
+		gas.WithCSRFInsecureBypassPattern("/"),
+		gas.WithCSRFDenyHandler(nil),
+	}, extra...)
 	app := gas.NewApp(opts...)
 
 	registerInfraServices(app, cfg, logger)
@@ -83,7 +91,7 @@ func createBuckets(names []string) func(*gas.ServiceContainer) error {
 }
 
 func installMiddleware(r *gas.Router, cfg *Config) {
-	r.UseMiddlewareFunc(cors.Handler(cors.Options{
+	r.UseMiddlewareFunc(nil, cors.Handler(cors.Options{
 		// Echo any origin back, which unlike "*" also works for credentialed
 		// requests.
 		AllowOriginFunc: func(*http.Request, string) bool { return true },
@@ -100,27 +108,31 @@ func installMiddleware(r *gas.Router, cfg *Config) {
 		MaxAge:           300,
 	}))
 
-	r.UseMiddlewareFunc(httpx.RequestID(cfg.Env))
+	r.UseMiddlewareFunc(nil, httpx.RequestID(cfg.Env))
 
-	r.UseMiddlewareFunc(middleware.ClientIPFromXFFTrustedProxies(1))
+	r.UseMiddlewareFunc(nil, middleware.ClientIPFromXFFTrustedProxies(1))
 
-	r.UseMiddlewareFunc(withRequestLogger)
+	r.UseMiddlewareFunc(nil, withRequestLogger)
 
-	r.UseMiddlewareFunc(gas.RequestLogger[httpx.RequestLogger]())
+	r.UseMiddlewareFunc(nil, gas.RequestLogger[httpx.RequestLogger]())
 
-	r.UseMiddlewareFunc(verifySignature(sigv4.NewVerifier(sigv4.Credentials{
+	r.UseMiddlewareFunc(nil, verifySignature(sigv4.NewVerifier(sigv4.Credentials{
 		AccessKeyID:     cfg.Auth.AccessKeyID,
 		SecretAccessKey: cfg.Auth.SecretAccessKey,
 	}), cfg.Server.Domain))
 	if cfg.Server.Domain != "" {
-		r.UseMiddlewareFunc(virtualHost(cfg.Server.Domain))
+		r.UseMiddlewareFunc(nil, virtualHost(cfg.Server.Domain))
 	}
 
 	var hsts string
 	if cfg.HSTS != nil && cfg.HSTS.MaxAge > 0 {
 		hsts = fmt.Sprintf("max-age=%0.f", cfg.HSTS.MaxAge.Seconds())
 	}
-	r.UseMiddlewareFunc(gas.SecurityHeaders(
+	r.UseMiddlewareFunc(nil, gas.SecurityHeaders(
 		gas.WithSecurityHeadersStrictTransportSecurity(hsts),
 	))
+
+	// Last, so it sees the path virtualHost rewrote and answers with the
+	// security headers set.
+	r.UseMiddlewareFunc(nil, methodNotAllowed)
 }

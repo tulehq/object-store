@@ -140,7 +140,7 @@ var sentinelErrors = []struct {
 	err   error
 	s3Err *Error
 }{
-	{storage.ErrKeyNotFound, NewError(http.StatusNotFound, "NoSuchKey",
+	{storage.ErrObjectNotFound, NewError(http.StatusNotFound, "NoSuchKey",
 		"The specified key does not exist.")},
 	{storage.ErrBucketNotFound, NewError(http.StatusNotFound, "NoSuchBucket",
 		"The specified bucket does not exist.")},

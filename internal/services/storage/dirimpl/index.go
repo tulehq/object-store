@@ -12,12 +12,13 @@ import (
 	"slices"
 )
 
-// The key index lists the keys of each bucket, which the backend cannot. An
-// entry is added before an object is written and removed after it is
-// deleted or when its write fails, so the index lists every object. A crash
-// between those steps can leave an entry for a key that holds no object, so
-// readers check each key against the backend and skip those. Such an entry
-// can still show up as a common prefix in a delimited listing.
+// The key index lists the keys of each bucket, which the backend, holding
+// only their hashes, cannot. An entry is added before an object is written
+// and removed after it is deleted or when its write fails, so the index
+// lists every object. A crash between those steps can leave an entry for a
+// key that holds no object, so readers check each key against the backend
+// and skip those. Such an entry can still show up as a common prefix in a
+// delimited listing.
 
 // indexEntryRe matches index entry names. Anything else in an index directory
 // is a temp file of an entry being written.
@@ -26,8 +27,14 @@ var indexEntryRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 // indexEntry returns the index entry of key in bucket: the hex SHA-256 of the
 // key, which is a valid file name whatever the key holds.
 func indexEntry(bucket, key string) string {
+	return filepath.Join(indexDir, bucket, keyHash(key))
+}
+
+// keyHash returns the hex SHA-256 of key, which names its index entry and
+// is the key the backend stores its object under.
+func keyHash(key string) string {
 	sum := sha256.Sum256([]byte(key))
-	return filepath.Join(indexDir, bucket, hex.EncodeToString(sum[:]))
+	return hex.EncodeToString(sum[:])
 }
 
 // addToIndex records key in bucket's index. The entry is written to a temp

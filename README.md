@@ -122,8 +122,30 @@ any origin, and response headers such as `ETag` are exposed.
   other keys are rejected with `400 InvalidArgument`.
 - **Storage layout.** Objects are stored by the gas `storage/dir` backend
   under hashed names, so the storage root is not browsable as files.
-  Directories written by earlier versions, which stored keys as file paths,
-  are not readable by this one.
+  Directories written by earlier versions are not readable by this one, and
+  the server refuses to start on one. To keep their objects, serve the old
+  volume with the previous image and a fresh one with this image, then copy
+  each bucket through a local directory (`aws s3 sync` takes one endpoint per
+  run):
+
+  ```sh
+  docker run -d --name old -p 9000:9000 -v s3data:/data \
+    -e TULE_Auth_AccessKeyID=test -e TULE_Auth_SecretAccessKey=test \
+    ghcr.io/tulehq/object-store:0.3.1
+  docker run -d --name new -p 9001:9000 -v s3data-new:/data \
+    -e TULE_Auth_AccessKeyID=test -e TULE_Auth_SecretAccessKey=test \
+    ghcr.io/tulehq/object-store:latest
+  export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1
+  for b in $(aws s3 ls --endpoint-url http://localhost:9000 | awk '{print $3}'); do
+    aws s3 sync "s3://$b" "copy/$b" --endpoint-url http://localhost:9000
+    aws s3 mb "s3://$b" --endpoint-url http://localhost:9001
+    aws s3 sync "copy/$b" "s3://$b" --endpoint-url http://localhost:9001
+  done
+  ```
+
+  The copies keep their keys and contents. User metadata, system headers and
+  modification times are not copied, and content types are guessed again from
+  the file names.
 - **Signature verification is request-level.** Header and presigned-URL
   signatures, expiry, clock skew and hex payload hashes are checked; the
   per-chunk signatures of streaming uploads are not. There is one access key,

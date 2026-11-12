@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 
@@ -26,7 +27,7 @@ func run() (err error) {
 		return fmt.Errorf("failed to create application: %w", appErr)
 	}
 
-	if runErr := a.Run(); runErr != nil {
+	if runErr := a.Run(context.Background()); runErr != nil {
 		return fmt.Errorf("app exited with error: %w", runErr)
 	}
 

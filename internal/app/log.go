@@ -1,19 +1,20 @@
 package app
 
 import (
+	"fmt"
 	"net/http"
 	"os"
 
 	"github.com/gasmod/gas"
-	"github.com/gasmod/gas/config/extensions/gasenv"
-	"github.com/gasmod/gas/log"
+	"github.com/gasmod/gas/config"
+	gaszerolog "github.com/gasmod/gas/log/zerolog"
 	"github.com/rs/zerolog"
 
 	"tule.dev/object-store/internal/httpx"
 	"tule.dev/object-store/internal/util/buildinfo"
 )
 
-func newLogger(s *logSettings, env gasenv.Environment) (gas.Logger, error) {
+func newLogger(s *logSettings, env config.Environment) (gas.Logger, error) {
 	if env.IsTesting() {
 		return &gas.NopLogger{}, nil
 	}
@@ -29,7 +30,7 @@ func newProdLogger(_ *logSettings) (gas.Logger, error) {
 	zl := zerolog.New(out).Level(zerolog.WarnLevel).With().Timestamp().
 		Str("app_ver", buildinfo.Version).Logger()
 
-	return log.NewZeroLogLogger(log.WithZeroLogInstance(&zl))()
+	return newZeroLogLogger(&zl)
 }
 
 func newDevLogger(_ *logSettings) (gas.Logger, error) {
@@ -38,7 +39,17 @@ func newDevLogger(_ *logSettings) (gas.Logger, error) {
 	zl := zerolog.New(out).Level(zerolog.TraceLevel).With().Timestamp().
 		Str("app_ver", buildinfo.Version).Logger()
 
-	return log.NewZeroLogLogger(log.WithZeroLogInstance(&zl))()
+	return newZeroLogLogger(&zl)
+}
+
+// newZeroLogLogger wraps zl as a gas.Logger. It returns a nil interface, not
+// a nil *gaszerolog.Logger, when the backend fails.
+func newZeroLogLogger(zl *zerolog.Logger) (gas.Logger, error) {
+	l, err := gaszerolog.New(gaszerolog.WithLogger(zl))()
+	if err != nil {
+		return nil, fmt.Errorf("app: failed to create logger: %w", err)
+	}
+	return l, nil
 }
 
 func resolveRequestLogger(l gas.Logger) httpx.RequestLogger {
