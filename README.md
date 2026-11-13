@@ -155,7 +155,8 @@ any origin, and response headers such as `ETag` are exposed.
   a service other than `s3`, when its `x-amz-content-sha256` is not a hex
   SHA-256, `UNSIGNED-PAYLOAD` or `STREAMING-*` (`400 InvalidArgument`), and
   when a presigned URL is dated more than 15 minutes ahead (`403
-  AccessDenied`, "Request is not yet valid"). Unlike S3:
+  AccessDenied`, "Request is not yet valid"). The signature must cover
+  `Host`. Unlike S3:
   - the credential's region is not checked, so clients may sign for any
     region;
   - any session token is refused with `400 InvalidToken`, since there are no
