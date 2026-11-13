@@ -199,9 +199,14 @@ func precondition(r *http.Request) (contracts.Precondition, error) {
 }
 
 // requestBody returns the object bytes of an upload, decoding aws-chunked
-// bodies.
+// bodies. Either way the reader reaches EOF only once the whole body is read,
+// so the body is checked against its payload hash before the upload ends.
 func requestBody(r *http.Request) (io.Reader, error) {
-	if !s3api.IsAWSChunked(r) {
+	chunked, err := s3api.IsAWSChunked(r)
+	if err != nil {
+		return nil, err //nolint:wrapcheck // an S3 error, answered as is
+	}
+	if !chunked {
 		return r.Body, nil
 	}
 

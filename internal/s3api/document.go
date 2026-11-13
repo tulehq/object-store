@@ -29,6 +29,10 @@ func ReadDocument(
 	maxBytes int64,
 	readVerified func(*http.Request, int64) ([]byte, error),
 ) ([]byte, error) {
+	chunked, err := IsAWSChunked(r)
+	if err != nil {
+		return nil, err
+	}
 	switch hash := r.Header.Get("X-Amz-Content-Sha256"); {
 	case isHexSHA256(hash):
 		return readVerified(r, maxBytes)
@@ -39,16 +43,10 @@ func ReadDocument(
 	}
 
 	body := io.Reader(r.Body)
-	if IsAWSChunked(r) {
-		decodedLen := int64(-1)
-		if v := r.Header.Get("X-Amz-Decoded-Content-Length"); v != "" {
-			n, err := strconv.ParseInt(v, 10, 64)
-			if err != nil || n < 0 {
-				return nil, ErrInvalidArgument("invalid x-amz-decoded-content-length")
-			}
-			decodedLen = n
+	if chunked {
+		if body, err = decodeChunked(r); err != nil {
+			return nil, err
 		}
-		body = NewChunkedReader(r.Body, decodedLen)
 	}
 
 	doc, err := io.ReadAll(io.LimitReader(body, maxBytes+1))
@@ -67,4 +65,18 @@ func isHexSHA256(s string) bool {
 	}
 	_, err := hex.DecodeString(s)
 	return err == nil
+}
+
+// decodeChunked returns r's aws-chunked body decoded, checked against
+// X-Amz-Decoded-Content-Length when the request declares it.
+func decodeChunked(r *http.Request) (io.Reader, error) {
+	decodedLen := int64(-1)
+	if v := r.Header.Get("X-Amz-Decoded-Content-Length"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n < 0 {
+			return nil, ErrInvalidArgument("invalid x-amz-decoded-content-length")
+		}
+		decodedLen = n
+	}
+	return NewChunkedReader(r.Body, decodedLen), nil
 }
