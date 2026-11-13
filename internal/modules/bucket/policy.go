@@ -22,7 +22,8 @@ func (m *Module) putBucketPolicy(ctx gas.Context) error {
 	target := s3api.Target{Bucket: bucket}
 	r := ctx.Request()
 
-	if err := m.authz.Authorize(r, authz.PutBucketPolicy, target); err != nil {
+	caller, err := m.authz.Authorize(r, authz.PutBucketPolicy, target)
+	if err != nil {
 		return s3api.WriteError(ctx, target, err)
 	}
 	doc, err := s3api.ReadDocument(r, authz.MaxBucketPolicySize, m.verifier.ReadBody)
@@ -41,7 +42,15 @@ func (m *Module) putBucketPolicy(ctx gas.Context) error {
 	if err = authz.ValidateBucketPolicy(bucket, doc); err != nil {
 		return s3api.WriteError(ctx, target, err)
 	}
-	if err = m.storage.PutBucketPolicy(ctx, bucket, doc); err != nil {
+	// Pinned after the body is read, so a slow body holds no lock, and to
+	// the generation evaluated, so a bucket deleted and created again while
+	// the body was read is NoSuchBucket, not given this policy.
+	pinned, release, err := caller.Pin(ctx, bucket)
+	if err != nil {
+		return s3api.WriteError(ctx, target, err)
+	}
+	defer release()
+	if err = m.storage.PutBucketPolicy(pinned, bucket, doc); err != nil {
 		return s3api.WriteError(ctx, target, err)
 	}
 	return ctx.NoContent()
@@ -53,10 +62,12 @@ func (m *Module) getBucketPolicy(ctx gas.Context) error {
 	bucket := ctx.Param("bucket")
 	target := s3api.Target{Bucket: bucket}
 
-	if err := m.authz.Authorize(ctx.Request(), authz.GetBucketPolicy, target); err != nil {
+	g, err := m.authz.AuthorizeAndPin(ctx, ctx.Request(), authz.GetBucketPolicy, target)
+	if err != nil {
 		return s3api.WriteError(ctx, target, err)
 	}
-	doc, err := m.storage.GetBucketPolicy(ctx, bucket)
+	defer g.Release()
+	_, doc, err := m.storage.GetBucketPolicy(g.Context(), bucket)
 	if err != nil {
 		return s3api.WriteError(ctx, target, err)
 	}
@@ -76,10 +87,12 @@ func (m *Module) deleteBucketPolicy(ctx gas.Context) error {
 	bucket := ctx.Param("bucket")
 	target := s3api.Target{Bucket: bucket}
 
-	if err := m.authz.Authorize(ctx.Request(), authz.DeleteBucketPolicy, target); err != nil {
+	g, err := m.authz.AuthorizeAndPin(ctx, ctx.Request(), authz.DeleteBucketPolicy, target)
+	if err != nil {
 		return s3api.WriteError(ctx, target, err)
 	}
-	if err := m.storage.DeleteBucketPolicy(ctx, bucket); err != nil {
+	defer g.Release()
+	if err = m.storage.DeleteBucketPolicy(g.Context(), bucket); err != nil {
 		return s3api.WriteError(ctx, target, err)
 	}
 	return ctx.NoContent()

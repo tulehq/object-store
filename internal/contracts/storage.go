@@ -53,12 +53,17 @@ const MaxPartNumber = 10000
 
 // StorageProvider is the object store the S3 API is served from: the bucket,
 // object, listing, conditional write and multipart operations S3 needs.
+//
+// The operations on a bucket's objects, uploads, listing and policy
+// (everything but ListBuckets, HeadBucket, CreateBucket, DeleteBucket and
+// GetBucketPolicy) require a context Pin returned for that bucket, and
+// fail without one.
 type StorageProvider interface {
 	ListBuckets(ctx context.Context) ([]BucketInfo, error)
 	ListObjects(ctx context.Context, bucket string, in ListObjectsInput) (*ListObjectsOutput, error)
 	HeadBucket(ctx context.Context, bucket string) (*BucketInfo, error)
 	CreateBucket(ctx context.Context, bucket string) (*BucketInfo, error)
-	DeleteBucket(ctx context.Context, bucket string) error
+	DeleteBucket(ctx context.Context, ref BucketRef) error
 	StatObject(ctx context.Context, bucket, key string) (*ObjectInfo, error)
 	GetObject(ctx context.Context, bucket, key string) (*Object, error)
 	DeleteObject(ctx context.Context, bucket, key string) error
@@ -92,17 +97,32 @@ type StorageProvider interface {
 	ListParts(ctx context.Context, bucket, key, uploadID string) ([]PartInfo, error)
 	ListMultipartUploads(ctx context.Context, bucket string) ([]UploadInfo, error)
 
-	// GetBucketPolicy returns bucket's policy document as it was stored:
-	// storage.ErrBucketNotFound when there is no such bucket, and
-	// ErrNoSuchBucketPolicy when it has no policy. The bucket's existence
-	// and its policy are read together, so a policy is never returned for a
-	// bucket deleted, or deleted and created again, in between.
-	GetBucketPolicy(ctx context.Context, bucket string) ([]byte, error)
+	// Pin locks each bucket refs names against deletion and creation and
+	// checks that it is still of the generation named, failing with
+	// storage.ErrBucketNotFound when it is not. It returns a context
+	// pinned to the buckets, which every operation on a bucket's objects,
+	// uploads and policy requires, and the function that releases them.
+	Pin(ctx context.Context, refs ...BucketRef) (context.Context, func(), error)
+
+	// GetBucketPolicy returns bucket's generation and its policy document
+	// as it was stored: storage.ErrBucketNotFound when there is no such
+	// bucket, and ErrNoSuchBucketPolicy, with the generation, when it has
+	// no policy. Both are read together, so the policy is the one stored
+	// for that generation.
+	GetBucketPolicy(ctx context.Context, bucket string) (string, []byte, error)
 	// PutBucketPolicy stores doc as bucket's policy, replacing any it had.
 	PutBucketPolicy(ctx context.Context, bucket string, doc []byte) error
 	// DeleteBucketPolicy removes bucket's policy. A bucket without one is
 	// not an error.
 	DeleteBucketPolicy(ctx context.Context, bucket string) error
+}
+
+// BucketRef names a bucket of one generation. A bucket deleted and created
+// again under the same name has a new Generation, so a BucketRef read from
+// the old one does not name it. An empty Generation names no bucket.
+type BucketRef struct {
+	Name       string
+	Generation string
 }
 
 // BucketInfo describes a bucket.
