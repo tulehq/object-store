@@ -149,7 +149,22 @@ any origin, and response headers such as `ETag` are exposed.
 - **Signature verification is request-level.** Header and presigned-URL
   signatures, expiry, clock skew and hex payload hashes are checked; the
   per-chunk signatures of streaming uploads are not. There is one access key,
-  with access to everything.
+  with access to everything. As on S3, a request is refused when it carries
+  an `x-amz-*` header it did not sign (`403 AccessDenied`), when its
+  `SignedHeaders` are not lowercase, sorted and unique, when it is signed for
+  a service other than `s3`, when its `x-amz-content-sha256` is not a hex
+  SHA-256, `UNSIGNED-PAYLOAD` or `STREAMING-*` (`400 InvalidArgument`), and
+  when a presigned URL is dated more than 15 minutes ahead (`403
+  AccessDenied`, "Request is not yet valid"). Unlike S3:
+  - the credential's region is not checked, so clients may sign for any
+    region;
+  - any session token is refused with `400 InvalidToken`, since there are no
+    temporary credentials;
+  - a DeleteObjects or CompleteMultipartUpload document must be covered by a
+    hex `x-amz-content-sha256`, as the SDKs send it, and is verified before it
+    is read; one sent as `UNSIGNED-PAYLOAD` or `STREAMING-*` is refused with
+    `400 InvalidRequest`, and one over 2 MiB with `400
+    MaxMessageLengthExceeded`.
 - **Not implemented** (requests return `501 NotImplemented`): enabling
   versioning, tagging, ACLs, bucket policies, CORS and lifecycle configuration,
   object lock, UploadPartCopy, and browser POST-policy uploads.
