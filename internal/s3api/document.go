@@ -14,17 +14,28 @@ import (
 // A document sent under a hex X-Amz-Content-Sha256 is read with
 // readVerified, which returns it only once it matches that hash, since a
 // decoder stops at the end of its value and would act on a forged body
-// padded to the signed one's length. A document sent as UNSIGNED-PAYLOAD or
-// STREAMING-*, which the client chose not to sign, is read as sent, decoding
-// aws-chunked, as S3 reads it. A presigned URL that declares no hash sends
-// UNSIGNED-PAYLOAD.
+// padded to the signed one's length. A document the client chose not to
+// sign is read as sent, decoding aws-chunked, as S3 reads it: one sent as
+// UNSIGNED-PAYLOAD or STREAMING-UNSIGNED-PAYLOAD-TRAILER, or by a presigned
+// URL that declares no hash and so sends UNSIGNED-PAYLOAD. (The verifier
+// refuses an Authorization header request that declares none.)
+//
+// Any other hash, such as STREAMING-AWS4-HMAC-SHA256-PAYLOAD, is refused
+// with InvalidRequest before the body is read: the client signed each
+// chunk, and chunk signatures are not verified, so the document would be
+// acted on while the client believes it covered.
 func ReadDocument(
 	r *http.Request,
 	maxBytes int64,
 	readVerified func(*http.Request, int64) ([]byte, error),
 ) ([]byte, error) {
-	if isHexSHA256(r.Header.Get("X-Amz-Content-Sha256")) {
+	switch hash := r.Header.Get("X-Amz-Content-Sha256"); {
+	case isHexSHA256(hash):
 		return readVerified(r, maxBytes)
+	case hash == "", hash == "UNSIGNED-PAYLOAD", hash == "STREAMING-UNSIGNED-PAYLOAD-TRAILER":
+	default:
+		return nil, ErrInvalidRequest("The signed streaming chunks of a request document " +
+			"are not verified; send it with a hex x-amz-content-sha256 or UNSIGNED-PAYLOAD.")
 	}
 
 	body := io.Reader(r.Body)

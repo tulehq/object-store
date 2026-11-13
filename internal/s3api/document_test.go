@@ -55,3 +55,25 @@ func TestReadDocumentBoundsAnUnsignedDocument(t *testing.T) {
 		t.Fatalf("err = %v, want MaxMessageLengthExceeded", err)
 	}
 }
+
+func TestReadDocumentRefusesSignedChunks(t *testing.T) {
+	notCalled := func(*http.Request, int64) ([]byte, error) {
+		t.Fatal("a signed-chunk document was read as a verified one")
+		return nil, nil
+	}
+	for _, hash := range []string{
+		"STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+		"STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+		"STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD",
+		"STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER",
+	} {
+		r := documentRequest("9;chunk-signature="+strings.Repeat("a", 64)+
+			"\r\n<Delete/>\r\n0\r\n\r\n", hash)
+		_, err := ReadDocument(r, 100, notCalled)
+		var s3Err *Error
+		if !errors.As(err, &s3Err) || s3Err.Code != "InvalidRequest" ||
+			s3Err.Status != http.StatusBadRequest {
+			t.Errorf("%s: err = %v, want 400 InvalidRequest", hash, err)
+		}
+	}
+}
