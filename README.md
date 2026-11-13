@@ -131,10 +131,17 @@ moment it acts until it is done, and a bucket deleted, or deleted and
 created again, since it was evaluated is answered with `404 NoSuchBucket`.
 A grant in a deleted bucket's policy therefore never reaches the bucket
 created again under its name, and an upload started in the old bucket does
-not complete into, or list in, the new one. DeleteBucket waits for the
-operations that hold the bucket, such as an upload in progress. A
-PutBucketPolicy or CompleteMultipartUpload document is read before the
-bucket is held, so a slow body holds nothing. A bucket policy that changes
+not complete into, or list in, the new one; DeleteBucket removes the
+bucket's uploads. DeleteBucket answers a bucket that is not empty at once,
+and otherwise waits up to 2 seconds for the operations that hold the
+bucket, such as an upload in progress, without blocking the bucket's other
+requests, then gives up with `409 OperationAborted` ("A conflicting
+conditional action is currently in progress against this resource. Try
+again.", the S3 error code list). A PutBucketPolicy or
+CompleteMultipartUpload document is read before the bucket is held, and a
+GetObject stops holding it once the object is open, so neither a slow body
+nor a slow reader holds it. CreateBucket of a bucket that exists does not
+wait for anything. A bucket policy that changes
 while a request is in flight may be evaluated in its previous version, as a
 tag value may on AWS. A stored policy that cannot be read or no longer
 parses fails every evaluated request on its bucket with `500
@@ -374,9 +381,9 @@ refused with `400 InvalidArgument`, which bounds the cost of evaluating it.
   server's own account too.
 - **Behavior:** buckets have generations. A request whose bucket was
   deleted, or deleted and created again, after it was authorized gets `404
-  NoSuchBucket`; DeleteBucket waits for operations in progress on the
-  bucket; a multipart upload does not survive its bucket being deleted and
-  created again. Buckets created by earlier versions keep working, under
+  NoSuchBucket`; DeleteBucket waits up to 2 seconds for operations in
+  progress on the bucket, then answers `409 OperationAborted`; a bucket's
+  multipart uploads are removed with it. Buckets created by earlier versions keep working, under
   one fixed generation.
 
 ## Health checks
