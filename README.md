@@ -150,9 +150,12 @@ any origin, and response headers such as `ETag` are exposed.
   signatures, expiry, clock skew and hex payload hashes are checked; the
   per-chunk signatures of streaming uploads are not, so a DeleteObjects or
   CompleteMultipartUpload document sent with signed chunks
-  (`STREAMING-AWS4-*`) is refused with `400 InvalidRequest`. There is one
-  access key, with access to everything. As on S3, a request is refused when
-  it carries an `x-amz-*` header it did not sign (`403 AccessDenied`), when its
+  (`STREAMING-AWS4-*`) is refused with `400 InvalidRequest`. A body is
+  decoded as aws-chunked only under a `STREAMING-*` `x-amz-content-sha256`;
+  `Content-Encoding: aws-chunked` with any other value is refused with `400
+  InvalidRequest`. There is one access key, with access to everything. As
+  on S3, a request is refused when it carries an `x-amz-*` header it did not
+  sign (`403 AccessDenied`), when its
   `SignedHeaders` are not lowercase, sorted and unique, when it is signed for
   a service other than `s3`, when its `x-amz-content-sha256` is not a hex
   SHA-256, `UNSIGNED-PAYLOAD` or `STREAMING-*` (`400 InvalidArgument`), and

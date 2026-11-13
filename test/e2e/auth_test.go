@@ -644,3 +644,41 @@ func TestPresignedDeleteObjects(t *testing.T) {
 	requireEqual(t, status, http.StatusOK, "presigned delete objects")
 	requireAbsent(t, c, "docs", "presigned")
 }
+
+// chunkedForgery is a body of n bytes that decodes, as aws-chunked, to
+// FORGED, padded after its final chunk to n.
+func chunkedForgery(n int) string {
+	forged := "6\r\nFORGED\r\n0\r\n\r\n"
+	return forged + strings.Repeat("s", n-len(forged))
+}
+
+// TestUnsignedAWSChunkedEncoding checks that an unsigned Content-Encoding of
+// aws-chunked cannot make an upload signed with a hex hash decode to a
+// forged body that ends before the hash is checked.
+func TestUnsignedAWSChunkedEncoding(t *testing.T) {
+	srv := startServer(t, false, nil)
+	c := clientFor(srv)
+	createBucket(t, c, "chunk")
+	up := startUpload(t, c, "chunk", "mp")
+
+	signed := strings.Repeat("s", 20000)
+	forge := func(path string) {
+		t.Helper()
+		req := signedRequest(t, srv, http.MethodPut, path, []byte(signed), hexSHA256(signed),
+			"s3", "us-east-1", time.Now())
+		req.Body = io.NopCloser(strings.NewReader(chunkedForgery(len(signed))))
+		req.Header.Set("Content-Encoding", "aws-chunked")
+		status, e := send(t, srv.Client(), req)
+		requireS3Error(t, status, e, http.StatusBadRequest, "InvalidRequest", "")
+	}
+
+	forge("/chunk/obj")
+	requireAbsent(t, c, "chunk", "obj")
+
+	forge("/chunk/mp?partNumber=1&uploadId=" + aws.ToString(up.id))
+	out, err := c.ListParts(context.Background(), &s3.ListPartsInput{
+		Bucket: up.bucket, Key: up.key, UploadId: up.id,
+	})
+	requireNoErr(t, err, "list parts")
+	requireEqual(t, len(out.Parts), 0, "parts")
+}

@@ -13,18 +13,29 @@ import (
 // ";chunk-signature=<64 hex>" extension.
 const maxChunkHeader = 4096
 
+// maxTrailer bounds what may follow the final chunk of an aws-chunked body:
+// its trailing headers, such as a checksum and its signature.
+const maxTrailer = 64 << 10
+
 // IsAWSChunked reports whether the request body uses the aws-chunked encoding
-// that SDKs use for streaming SigV4 uploads and trailing checksums.
-func IsAWSChunked(r *http.Request) bool {
+// that SDKs use for streaming SigV4 uploads and trailing checksums. The
+// signed X-Amz-Content-Sha256 decides: a STREAMING-* value declares it.
+//
+// Content-Encoding is not signed, so it cannot make a body aws-chunked. One
+// naming aws-chunked under any other hash fails with InvalidRequest: decoded,
+// the body would end at its final chunk, before the hash that covers the
+// whole body is checked.
+func IsAWSChunked(r *http.Request) (bool, error) {
 	if strings.HasPrefix(r.Header.Get("X-Amz-Content-Sha256"), "STREAMING-") {
-		return true
+		return true, nil
 	}
 	for _, enc := range strings.Split(r.Header.Get("Content-Encoding"), ",") {
 		if strings.TrimSpace(enc) == "aws-chunked" {
-			return true
+			return false, ErrInvalidRequest("aws-chunked encoding is only accepted with a " +
+				"STREAMING-* x-amz-content-sha256.")
 		}
 	}
-	return false
+	return false, nil
 }
 
 // NewChunkedReader decodes an aws-chunked body into the object's bytes. Chunk
@@ -72,8 +83,10 @@ func (c *chunkedReader) Read(p []byte) (int, error) {
 }
 
 // nextChunk consumes the CRLF ending the previous chunk and the next chunk
-// header. On the final zero-length chunk it checks the decoded length and
-// returns io.EOF, leaving any trailers unread.
+// header. On the final zero-length chunk it checks the decoded length, reads
+// the rest of the body, its trailers, so the whole body is read before the
+// upload ends, and returns io.EOF. A body that runs on past maxTrailer after
+// its final chunk fails with IncompleteBody.
 func (c *chunkedReader) nextChunk() error {
 	if c.started {
 		if err := c.expectCRLF(); err != nil {
@@ -98,7 +111,7 @@ func (c *chunkedReader) nextChunk() error {
 			return ErrIncompleteBody(fmt.Sprintf(
 				"decoded %d bytes, x-amz-decoded-content-length is %d", c.total, c.want))
 		}
-		return io.EOF
+		return c.drainTrailer()
 	}
 
 	c.remain = size
@@ -131,4 +144,18 @@ func (c *chunkedReader) expectCRLF() error {
 		return ErrIncompleteBody("aws-chunked chunk data longer than its declared size")
 	}
 	return nil
+}
+
+// drainTrailer reads what follows the final chunk, at most maxTrailer bytes,
+// and returns io.EOF once the body has ended. A read error of the body,
+// such as its payload hash failing, is returned as is.
+func (c *chunkedReader) drainTrailer() error {
+	n, err := io.Copy(io.Discard, io.LimitReader(c.r, maxTrailer+1))
+	if err != nil {
+		return err //nolint:wrapcheck // the body's own error, such as a hash mismatch
+	}
+	if n > maxTrailer {
+		return ErrIncompleteBody("aws-chunked body continues past its final chunk")
+	}
+	return io.EOF
 }
