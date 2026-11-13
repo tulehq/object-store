@@ -116,9 +116,10 @@ func slowPut(
 	return asked, send, out
 }
 
-// A write in flight holds its bucket: DeleteBucket waits for it, so the
-// object lands in the bucket that was authorized and the delete then finds
-// it not empty, rather than the object landing in a bucket created again.
+// A write in flight holds its bucket: DeleteBucket waits for it, without
+// blocking the bucket's other requests meanwhile, so the object lands in
+// the bucket that was authorized and the delete then finds it not empty,
+// rather than the object landing in a bucket created again.
 func TestDeleteBucketWaitsForAWriteInFlight(t *testing.T) {
 	f := &fakeIdentity{}
 	root, _, url := startAuthzServer(t, f)
@@ -141,6 +142,20 @@ func TestDeleteBucketWaitsForAWriteInFlight(t *testing.T) {
 	case err := <-deleted:
 		t.Fatalf("DeleteBucket did not wait for the write: %v", err)
 	case <-time.After(200 * time.Millisecond):
+	}
+	// The waiting delete registers no writer, so the bucket still answers.
+	headed := make(chan error, 1)
+	go func() {
+		_, err := root.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: race})
+		headed <- err
+	}()
+	select {
+	case err := <-headed:
+		if err != nil {
+			t.Fatalf("HeadBucket while the delete waits: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("HeadBucket blocked behind the waiting delete")
 	}
 	send()
 	if r := <-result; r.err != nil || r.status != http.StatusOK {

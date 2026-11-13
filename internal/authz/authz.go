@@ -570,14 +570,16 @@ type Grant struct {
 	caller  *Caller
 	ctx     context.Context
 	release func()
+	once    sync.Once
 }
 
 // Context is the context pinned to the operation's buckets, which the
 // storage operations on them require.
 func (g *Grant) Context() context.Context { return g.ctx }
 
-// Release releases the operation's buckets.
-func (g *Grant) Release() { g.release() }
+// Release releases the operation's buckets. Calls after the first do
+// nothing.
+func (g *Grant) Release() { g.once.Do(g.release) }
 
 // NotFound is the caller's NotFound.
 func (g *Grant) NotFound(bucket string, err error) error { return g.caller.NotFound(bucket, err) }

@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/gasmod/gas"
 	"github.com/gasmod/gas/storage/dir"
@@ -33,7 +34,13 @@ type Service struct {
 	// generation, against the operations pinned to it and the reads of its
 	// policy.
 	bucketLocks bucketLocks
+	// deleteWait bounds how long DeleteBucket waits for the operations
+	// pinned to its bucket.
+	deleteWait time.Duration
 }
+
+// defaultDeleteWait is deleteWait's value.
+const defaultDeleteWait = 2 * time.Second
 
 var (
 	_ contracts.StorageProvider = (*Service)(nil)
@@ -45,7 +52,9 @@ var (
 // settings.
 func NewService(settings *Settings) func(config gas.ConfigProvider, logger gas.Logger) *Service {
 	return func(config gas.ConfigProvider, logger gas.Logger) *Service {
-		return &Service{settings: settings, config: config, logger: logger}
+		return &Service{
+			settings: settings, config: config, logger: logger, deleteWait: defaultDeleteWait,
+		}
 	}
 }
 

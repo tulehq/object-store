@@ -39,6 +39,10 @@ var (
 	// hold.
 	ErrPreconditionFailed = errors.New("storage: precondition failed")
 
+	// ErrOperationAborted is returned by DeleteBucket when operations in
+	// progress on the bucket did not end in time.
+	ErrOperationAborted = errors.New("storage: a conflicting operation is in progress")
+
 	// ErrNoSuchBucketPolicy is returned by GetBucketPolicy for a bucket that
 	// has no policy.
 	ErrNoSuchBucketPolicy = errors.New("storage: the bucket has no policy")

@@ -49,6 +49,12 @@ func (m *Module) getObject(ctx gas.Context) error {
 	defer g.Release()
 
 	obj, err := m.storage.GetObject(g.Context(), t.Bucket, t.Key)
+	// The object is open, and its body is the backend's open data file,
+	// which "keeps reading the contents it opened when the object is
+	// replaced or deleted" (gas storage/dir), so streaming it needs no pin
+	// and a slow reader does not hold DeleteBucket. Nothing below writes,
+	// and NotFound uses the policy already read.
+	g.Release()
 	if err != nil {
 		return s3api.WriteError(ctx, t, g.NotFound(t.Bucket, err))
 	}
