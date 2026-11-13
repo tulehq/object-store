@@ -11,6 +11,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -135,12 +136,23 @@ func signedRequest(
 }
 
 // signListBuckets signs a ListBuckets request by hand, with SignedHeaders
-// exactly as listed, so a test can send a list the SDK never writes. host is
-// the request's Host; every other name is read from its headers.
+// exactly as listed, so a test can send a list the SDK never writes.
 func signListBuckets(t *testing.T, srv *httptest.Server, signedHeaders []string) *http.Request {
 	t.Helper()
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/", nil)
+	return signGet(t, srv, "", "/", signedHeaders)
+}
+
+// signGet signs a GET of path by hand, with SignedHeaders exactly as
+// listed, sent with host as its Host, or the server's when empty. host is
+// read from the request's Host; every other name from its headers.
+func signGet(t *testing.T, srv *httptest.Server, host, path string, signedHeaders []string,
+) *http.Request {
+	t.Helper()
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+path, nil)
 	requireNoErr(t, err, "build request")
+	if host != "" {
+		req.Host = host
+	}
 	now := time.Now().UTC()
 	req.Header.Set("X-Amz-Date", now.Format(amzDate))
 	req.Header.Set("X-Amz-Content-Sha256", emptyHash)
@@ -149,13 +161,13 @@ func signListBuckets(t *testing.T, srv *httptest.Server, signedHeaders []string)
 	for _, name := range signedHeaders {
 		val := strings.Join(req.Header.Values(name), ",")
 		if name == "host" {
-			val = req.URL.Host
+			val = req.Host
 		}
 		headers.WriteString(name + ":" + val + "\n")
 	}
 	list := strings.Join(signedHeaders, ";")
 	creq := strings.Join([]string{
-		http.MethodGet, "/", "", headers.String(), list, emptyHash,
+		http.MethodGet, path, "", headers.String(), list, emptyHash,
 	}, "\n")
 	scope := now.Format("20060102") + "/us-east-1/s3/aws4_request"
 	sum := sha256.Sum256([]byte(creq))
@@ -469,4 +481,56 @@ func TestSessionTokenRefused(t *testing.T) {
 	requireNoErr(t, xml.Unmarshal(body, &e), "decode error")
 	requireS3Error(t, status, e, http.StatusBadRequest, "InvalidToken",
 		"The provided token is malformed or otherwise invalid.")
+}
+
+// TestHostMustBeSigned checks that a signature must cover Host, which picks
+// the bucket of a virtual-hosted request, so a relayed request cannot be
+// pointed at another bucket.
+func TestHostMustBeSigned(t *testing.T) {
+	srv := startServer(t, false, nil)
+	c := clientFor(srv)
+	createBucket(t, c, "public")
+	createBucket(t, c, "private")
+	put(t, c, "public", "k", []byte("public"))
+	put(t, c, "private", "k", []byte("private"))
+	_, port, err := net.SplitHostPort(srv.Listener.Addr().String())
+	requireNoErr(t, err, "split server address")
+	public, private := "public.localhost:"+port, "private.localhost:"+port
+
+	status, _ := send(t, srv.Client(), signGet(t, srv, public, "/k",
+		[]string{"host", "x-amz-content-sha256", "x-amz-date"}))
+	requireEqual(t, status, http.StatusOK, "virtual-hosted get with host signed")
+
+	req := signGet(t, srv, public, "/k", []string{"x-amz-content-sha256", "x-amz-date"})
+	req.Host = private
+	status, e := send(t, srv.Client(), req)
+	requireS3Error(t, status, e, http.StatusForbidden, "AccessDenied", "")
+
+	presigned, err := s3.NewPresignClient(c).PresignGetObject(context.Background(),
+		&s3.GetObjectInput{Bucket: aws.String("public"), Key: aws.String("k")})
+	requireNoErr(t, err, "presign get")
+	status, body := getWith(t, srv.Client(), presigned.URL)
+	requireEqual(t, status, http.StatusOK, "presigned get")
+	requireEqual(t, string(body), "public", "presigned get body")
+
+	// SDK-signed and presigned virtual-hosted requests sign their Host.
+	addr := srv.Listener.Addr().String()
+	vhost := &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, addr)
+		},
+	}}
+	vc := clientFor(srv, func(o *s3.Options) {
+		o.BaseEndpoint = aws.String("http://localhost:" + port)
+		o.UsePathStyle = false
+		o.HTTPClient = vhost
+	})
+	requireBody(t, vc, "public", "k", "public")
+	presigned, err = s3.NewPresignClient(vc).PresignGetObject(context.Background(),
+		&s3.GetObjectInput{Bucket: aws.String("public"), Key: aws.String("k")})
+	requireNoErr(t, err, "presign virtual-hosted get")
+	status, body = getWith(t, vhost, presigned.URL)
+	requireEqual(t, status, http.StatusOK, "presigned virtual-hosted get")
+	requireEqual(t, string(body), "public", "presigned virtual-hosted get body")
 }
