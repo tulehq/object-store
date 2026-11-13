@@ -29,7 +29,7 @@ func (m *Module) postBucket(ctx gas.Context) error {
 		return s3api.WriteError(ctx, target, err)
 	}
 
-	req, err := readDeleteRequest(ctx.ResponseWriter(), r)
+	req, err := m.readDeleteRequest(r)
 	if err != nil {
 		return s3api.WriteError(ctx, target, err)
 	}
@@ -68,11 +68,17 @@ func (m *Module) deleteOne(ctx gas.Context, bucket string, obj s3api.ObjectIdent
 	return nil
 }
 
-func readDeleteRequest(w http.ResponseWriter, r *http.Request) (*s3api.Delete, error) {
+// readDeleteRequest reads and decodes a DeleteObjects document. The whole
+// body is read and verified against the signature first, since the decoder
+// stops at the end of its value and would act on a forged body padded to
+// the signed one's length.
+func (m *Module) readDeleteRequest(r *http.Request) (*s3api.Delete, error) {
+	body, err := m.verifier.ReadBody(r, maxDeleteBody)
+	if err != nil {
+		return nil, fmt.Errorf("read delete request: %w", err)
+	}
 	var req s3api.Delete
-	dec := xml.NewDecoder(http.MaxBytesReader(w, r.Body, maxDeleteBody))
-	// An oversized body surfaces as a decode error too.
-	if err := dec.Decode(&req); err != nil {
+	if err = xml.Unmarshal(body, &req); err != nil {
 		return nil, s3api.ErrMalformedXML()
 	}
 	if len(req.Objects) == 0 || len(req.Objects) > s3api.MaxDeleteObjects {
