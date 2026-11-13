@@ -13,6 +13,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -294,6 +296,41 @@ func TestNonHexPayloadHash(t *testing.T) {
 func hexSHA256(s string) string {
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])
+}
+
+// TestSignedForAnotherService checks that a request signed for another
+// service is refused, while any region is accepted.
+func TestSignedForAnotherService(t *testing.T) {
+	srv := startServer(t, false, nil)
+
+	req := signedRequest(t, srv, http.MethodGet, "/", nil, emptyHash, "s3", "local-1",
+		time.Now())
+	status, _ := send(t, srv.Client(), req)
+	requireEqual(t, status, http.StatusOK, "any region")
+
+	req = signedRequest(t, srv, http.MethodGet, "/", nil, emptyHash, "secretsmanager",
+		"us-east-1", time.Now())
+	status, e := send(t, srv.Client(), req)
+	requireS3Error(t, status, e, http.StatusBadRequest, "AuthorizationHeaderMalformed", "")
+
+	// A presigned URL scoped to another service.
+	pre, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
+		srv.URL+"/?X-Amz-Expires="+strconv.Itoa(900), nil)
+	requireNoErr(t, err, "build request")
+	u, _, err := v4.NewSigner().PresignHTTP(context.Background(), testCreds, pre,
+		"UNSIGNED-PAYLOAD", "secretsmanager", "us-east-1", time.Now())
+	requireNoErr(t, err, "presign")
+	parsed, err := url.Parse(u)
+	requireNoErr(t, err, "parse presigned url")
+	pre, err = http.NewRequestWithContext(
+		context.Background(),
+		http.MethodGet,
+		parsed.String(),
+		nil,
+	)
+	requireNoErr(t, err, "build presigned request")
+	status, e = send(t, srv.Client(), pre)
+	requireS3Error(t, status, e, http.StatusBadRequest, "AuthorizationQueryParametersError", "")
 }
 
 // TestSessionTokenRefused checks that the static key refuses any session
