@@ -6,28 +6,51 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
+	"tule.dev/identity/keysource"
 	"tule.dev/sigv4"
 
 	"tule.dev/object-store/internal/modules/health"
 	"tule.dev/object-store/internal/s3api"
 )
 
-// newVerifier returns the verifier for the one access key the server
-// accepts, configured for S3: presigned URLs, a streamed payload checked
+// identityTimeout bounds one call to identity's signing-key endpoint, so a
+// hung identity fails the request it was verifying with 500 InternalError
+// rather than holding it open. It is a variable so tests can shorten it.
+var identityTimeout = 10 * time.Second
+
+// newVerifier returns the verifier for the keys the server accepts: the
+// root key, and, when auth names an identity endpoint, every key identity
+// issued, looked up there with the root key. A lookup that fails, such as
+// identity being unreachable, is KindKeyLookupFailed, never an unknown key.
+// It is configured for S3: presigned URLs, a streamed payload checked
 // against a hex hash as it is read, UNSIGNED-PAYLOAD and STREAMING-*
 // payloads, the path encoded once, Host and X-Amz-Date signed (a presigned
 // URL signs its date in the query), credentials scoped to s3, and failures
 // answered with S3's errors. The credential's region is not checked, so a
 // client may sign for any region.
-func newVerifier(accessKeyID, secretAccessKey string) (*sigv4.Verifier, error) {
-	keys, err := sigv4.NewStaticKey(sigv4.StaticKeyConfig{
-		AccessKeyID:     accessKeyID,
-		SecretAccessKey: secretAccessKey,
+func newVerifier(auth *authSettings) (*sigv4.Verifier, error) {
+	root, err := sigv4.NewStaticKey(sigv4.StaticKeyConfig{
+		AccessKeyID:     auth.AccessKeyID,
+		SecretAccessKey: auth.SecretAccessKey,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("app: failed to create the signing key: %w", err)
+	}
+	var keys sigv4.KeySource = root
+	if auth.IdentityEndpoint != "" {
+		identity, kErr := keysource.New(keysource.Config{
+			HTTPClient:      &http.Client{Timeout: identityTimeout},
+			Endpoint:        auth.IdentityEndpoint,
+			AccessKeyID:     auth.AccessKeyID,
+			SecretAccessKey: auth.SecretAccessKey,
+		})
+		if kErr != nil {
+			return nil, fmt.Errorf("app: failed to create the identity key source: %w", kErr)
+		}
+		keys = sigv4.Chain(root, identity)
 	}
 	v, err := sigv4.New(
 		keys,
@@ -105,8 +128,9 @@ var (
 )
 
 // s3AuthError maps a verification failure to its S3 error. A failure with
-// none, such as the key lookup failing, is returned as is, which
-// s3api.WriteHTTPError answers and logs as an InternalError.
+// none, such as the key lookup failing (KindKeyLookupFailed, identity
+// unreachable or failing), is returned as is, which s3api.WriteHTTPError
+// answers with 500 and logs as an InternalError.
 func s3AuthError(e *sigv4.Error) error {
 	errs, ok := s3AuthErrors[e.Kind]
 	if !ok {
