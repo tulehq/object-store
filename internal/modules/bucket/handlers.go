@@ -18,14 +18,23 @@ const (
 	storageClass   = "STANDARD"
 )
 
+// listBuckets serves ListBuckets, which lists the buckets of the caller's
+// own account, as on S3: every bucket for a principal of the server's
+// account, which owns them all, and none for a principal of another.
 func (m *Module) listBuckets(ctx gas.Context) error {
-	if err := m.authz.Authorize(ctx.Request(), authz.ListBuckets, s3api.Target{}); err != nil {
+	caller, err := m.authz.Caller(ctx.Request())
+	if err != nil {
+		return s3api.WriteError(ctx, s3api.Target{}, err)
+	}
+	if err = caller.Authorize(authz.ListBuckets, s3api.Target{}); err != nil {
 		return s3api.WriteError(ctx, s3api.Target{}, err)
 	}
 
-	buckets, err := m.storage.ListBuckets(ctx)
-	if err != nil {
-		return s3api.WriteError(ctx, s3api.Target{}, err)
+	var buckets []contracts.BucketInfo
+	if caller.InAccount() {
+		if buckets, err = m.storage.ListBuckets(ctx); err != nil {
+			return s3api.WriteError(ctx, s3api.Target{}, err)
+		}
 	}
 
 	out := make([]s3api.Bucket, 0, len(buckets))
@@ -40,8 +49,8 @@ func (m *Module) listBuckets(ctx gas.Context) error {
 }
 
 // getBucket serves the GET bucket operations: ListObjects, ListObjectsV2
-// (list-type=2), GetBucketLocation, GetBucketVersioning and
-// ListMultipartUploads.
+// (list-type=2), GetBucketLocation, GetBucketVersioning,
+// ListMultipartUploads and GetBucketPolicy.
 func (m *Module) getBucket(ctx gas.Context) error {
 	bucket := ctx.Param("bucket")
 	target := s3api.Target{Bucket: bucket}
@@ -52,6 +61,8 @@ func (m *Module) getBucket(ctx gas.Context) error {
 		return m.getBucketConfig(ctx, sub)
 	case "uploads":
 		return m.listMultipartUploads(ctx)
+	case "policy":
+		return m.getBucketPolicy(ctx)
 	case "":
 	default:
 		return s3api.WriteError(ctx, target, s3api.CheckSubresource(r))
@@ -287,9 +298,13 @@ func (m *Module) headBucket(ctx gas.Context) error {
 	return nil
 }
 
+// putBucket serves CreateBucket and PutBucketPolicy (?policy).
 func (m *Module) putBucket(ctx gas.Context) error {
 	bucket := ctx.Param("bucket")
 
+	if s3api.Subresource(ctx.Request()) == "policy" {
+		return m.putBucketPolicy(ctx)
+	}
 	if err := s3api.CheckSubresource(ctx.Request()); err != nil {
 		return s3api.WriteError(ctx, s3api.Target{Bucket: bucket}, err)
 	}
@@ -307,9 +322,13 @@ func (m *Module) putBucket(ctx gas.Context) error {
 	return nil
 }
 
+// deleteBucket serves DeleteBucket and DeleteBucketPolicy (?policy).
 func (m *Module) deleteBucket(ctx gas.Context) error {
 	bucket := ctx.Param("bucket")
 
+	if s3api.Subresource(ctx.Request()) == "policy" {
+		return m.deleteBucketPolicy(ctx)
+	}
 	if err := s3api.CheckSubresource(ctx.Request()); err != nil {
 		return s3api.WriteError(ctx, s3api.Target{Bucket: bucket}, err)
 	}

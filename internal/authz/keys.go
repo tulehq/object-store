@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"slices"
 	"strconv"
-	"strings"
 	"time"
 
 	"tule.dev/sigv4"
@@ -104,64 +103,33 @@ func (k serviceKey) appliesTo(action string) bool {
 }
 
 // globalKeys are the global condition keys (IAM User Guide, "AWS global
-// condition context keys") the server can supply for p's request, which
-// also fill policy variables such as ${aws:username}.
+// condition context keys") the server supplies for p's request, besides the
+// principal's own (aws:PrincipalArn, aws:userid, aws:username,
+// aws:PrincipalType and aws:PrincipalAccount), which policy.Authorize
+// supplies from the Caller. They also fill policy variables such as
+// ${aws:username}.
 //
 // aws:RequestedRegion is the server's region, us-east-1, which every bucket
 // reports, not the region the request was signed for: the server does not
-// check that, so a caller could pick it. aws:SourceIp is the TCP peer's address, never X-Forwarded-For, which any
-// client can set. aws:userid is not supplied: the principal identity hands
-// over carries no unique ID. aws:PrincipalArn for a role session is the
-// role's ARN without its path, which the session's ARN does not carry.
+// check that, so a caller could pick it. aws:SourceIp is the TCP peer's
+// address, never X-Forwarded-For, which any client can set.
+// aws:PrincipalTag/<key> is each of the principal's tags, as identity
+// reports them: an IAM user's, or a session's role's.
 func globalKeys(r *http.Request, p sigv4.Principal, now time.Time) map[string][]string {
 	keys := map[string][]string{
-		"aws:PrincipalAccount": {p.AccountID},
-		"aws:CurrentTime":      {now.UTC().Format(time.RFC3339)},
-		"aws:EpochTime":        {strconv.FormatInt(now.Unix(), 10)},
-		"aws:SecureTransport":  {strconv.FormatBool(r.TLS != nil)},
+		"aws:CurrentTime":     {now.UTC().Format(time.RFC3339)},
+		"aws:EpochTime":       {strconv.FormatInt(now.Unix(), 10)},
+		"aws:SecureTransport": {strconv.FormatBool(r.TLS != nil)},
+		"aws:RequestedRegion": {region},
 	}
 	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
 		keys["aws:SourceIp"] = []string{host}
 	}
-	keys["aws:RequestedRegion"] = []string{region}
-	if arn, ok := roleARN(p.ARN); ok {
-		keys["aws:PrincipalArn"] = []string{arn}
-		keys["aws:PrincipalType"] = []string{"AssumedRole"}
-	} else if name, ok := userName(p.ARN); ok {
-		keys["aws:PrincipalArn"] = []string{p.ARN}
-		keys["aws:PrincipalType"] = []string{"User"}
-		keys["aws:username"] = []string{name}
+	for k, v := range p.Tags {
+		keys[principalTagPrefix+k] = []string{v}
 	}
 	return keys
 }
 
-// roleARN returns the role ARN of a role session's ARN,
-// arn:<partition>:sts::<account>:assumed-role/<role>/<session>, as
-// arn:<partition>:iam::<account>:role/<role>.
-func roleARN(sessionARN string) (string, bool) {
-	fields := strings.SplitN(sessionARN, ":", 6)
-	if len(fields) != 6 || fields[0] != "arn" || fields[2] != "sts" {
-		return "", false
-	}
-	rest, ok := strings.CutPrefix(fields[5], "assumed-role/")
-	if !ok {
-		return "", false
-	}
-	role, _, ok := strings.Cut(rest, "/")
-	if !ok || role == "" {
-		return "", false
-	}
-	return "arn:" + fields[1] + ":iam::" + fields[4] + ":role/" + role, true
-}
-
-// userName returns the name of an IAM user's ARN,
-// arn:<partition>:iam::<account>:user<path><name>.
-func userName(userARN string) (string, bool) {
-	fields := strings.SplitN(userARN, ":", 6)
-	if len(fields) != 6 || fields[0] != "arn" || fields[2] != "iam" ||
-		!strings.HasPrefix(fields[5], "user/") {
-		return "", false
-	}
-	name := fields[5][strings.LastIndex(fields[5], "/")+1:]
-	return name, name != ""
-}
+// principalTagPrefix is the prefix of the aws:PrincipalTag/<key> keys.
+const principalTagPrefix = "aws:PrincipalTag/"

@@ -69,7 +69,8 @@ func (f *fakeIdentity) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(keysource.Response{
 		SigningKey: sigv4.DeriveSigningKey(testUserSecret, req.Date, req.Region, req.Service),
 		Principal: keysource.Principal{
-			AccountID: "000000000000", ARN: testUserARN, AccessKeyID: testUserID,
+			AccountID: "000000000000", ARN: testUserARN, PrincipalARN: testUserARN,
+			UserID: "AIDAUSEREXAMPLE00001", PrincipalType: "User", AccessKeyID: testUserID,
 			Policies: policies,
 		},
 		Version: keysource.Version,
@@ -235,6 +236,28 @@ var calls = map[authz.Operation]call{
 			Bucket: b, Key: key, UploadId: aws.String("none"),
 		}))
 	},
+	// The policy operations act on pol-bkt, so the policy they store
+	// applies to no other operation's request.
+	authz.PutBucketPolicy: func(ctx context.Context, c *s3.Client) error {
+		return sdkErr(c.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{
+			Bucket: aws.String("pol-bkt"),
+			Policy: aws.String(`{"Version":"2012-10-17","Statement":{"Effect":"Allow",` +
+				`"Principal":{"AWS":"111111111111"},"Action":"s3:GetObject",` +
+				`"Resource":"arn:aws:s3:::pol-bkt/*"}}`),
+		}))
+	},
+	authz.GetBucketPolicy: func(ctx context.Context, c *s3.Client) error {
+		_, err := c.GetBucketPolicy(ctx, &s3.GetBucketPolicyInput{Bucket: aws.String("pol-bkt")})
+		var apiErr smithy.APIError
+		if errors.As(err, &apiErr) && apiErr.ErrorCode() == "NoSuchBucketPolicy" {
+			return nil
+		}
+		return sdkErr(nil, err)
+	},
+	authz.DeleteBucketPolicy: func(ctx context.Context, c *s3.Client) error {
+		return sdkErr(c.DeleteBucketPolicy(ctx,
+			&s3.DeleteBucketPolicyInput{Bucket: aws.String("pol-bkt")}))
+	},
 }
 
 // sdkErr returns an SDK call's error, wrapped; errors.As still finds its
@@ -249,7 +272,7 @@ func sdkErr(_ any, err error) error {
 func setup(t *testing.T, root *s3.Client) {
 	t.Helper()
 	ctx := t.Context()
-	for _, name := range []string{"bkt", "gone-bkt"} {
+	for _, name := range []string{"bkt", "gone-bkt", "pol-bkt"} {
 		if _, err := root.CreateBucket(
 			ctx,
 			&s3.CreateBucketInput{Bucket: aws.String(name)},
