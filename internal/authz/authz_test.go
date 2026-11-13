@@ -529,3 +529,69 @@ func TestAnEmptyAlgorithmIsHeaderAuth(t *testing.T) {
 		t.Fatalf("authType = %q", v)
 	}
 }
+
+// aws:PrincipalOrgID and aws:PrincipalOrgPaths are the organization
+// identity reports, absent for an account in no organization, and unknown
+// when identity could not tell: then a negated condition on them neither
+// grants nor lets a Deny lapse, and a positive one does not grant.
+func TestOrganizationKeys(t *testing.T) {
+	const (
+		org  = "o-a1b2c3d4e5"
+		path = "o-a1b2c3d4e5/r-ab12/ou-ab12-11111111/"
+	)
+	member := func(p sigv4.Principal) sigv4.Principal {
+		p.OrgID, p.OrgPaths = org, []string{path}
+		return p
+	}
+	unknown := func(p sigv4.Principal) sigv4.Principal {
+		p.OrgUnknown = true
+		return p
+	}
+	inOrg := grant(`"*"`, "s3:GetObject", "arn:aws:s3:::b/*")
+	inOrg = strings.Replace(inOrg, `"Resource"`,
+		`"Condition":{"StringEquals":{"aws:PrincipalOrgID":"`+org+`"},`+
+			`"ForAnyValue:StringLike":{"aws:PrincipalOrgPaths":"`+org+`/r-ab12/*"}},"Resource"`, 1)
+	outside := `{"Version":"2012-10-17","Statement":[` +
+		`{"Effect":"Allow","Principal":"*","Action":"s3:*","Resource":"arn:aws:s3:::src/*"},` +
+		`{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::src/*",` +
+		`"Condition":{"StringNotEquals":{"aws:PrincipalOrgID":"` + org + `"}}}]}`
+	notIn := `{"Version":"2012-10-17","Statement":{"Effect":"Allow","Principal":"*",` +
+		`"Action":"s3:GetObject","Resource":"arn:aws:s3:::dst/*",` +
+		`"Condition":{"StringNotEquals":{"aws:PrincipalOrgID":"o-zzzzzzzzzz"}}}}`
+	a := newAuthorizer(buckets{"b": inOrg, "src": outside, "dst": notIn})
+	src := s3api.Target{Bucket: "src", Key: obj.Key}
+	dst := s3api.Target{Bucket: "dst", Key: obj.Key}
+
+	for _, tc := range []struct {
+		target s3api.Target
+		name   string
+		p      sigv4.Principal
+		allow  bool
+	}{
+		{name: "a member, positive", p: member(user()), target: obj, allow: true},
+		{name: "no organization, positive", p: user(), target: obj},
+		{name: "unknown, positive", p: unknown(user()), target: obj},
+		{name: "a member, negated deny", p: member(user()), target: src, allow: true},
+		{name: "no organization, negated deny", p: user(), target: src},
+		{name: "unknown, negated deny", p: unknown(user()), target: src},
+		{name: "a member, negated allow", p: member(user()), target: dst, allow: true},
+		{name: "no organization, negated allow", p: user(), target: dst, allow: true},
+		{name: "unknown, negated allow", p: unknown(user()), target: dst},
+	} {
+		err := a.check(request(tc.p, "/"+tc.target.Bucket+"/"+tc.target.Key), GetObject, tc.target)
+		if tc.allow != (err == nil) {
+			t.Errorf("%s: got %v, want allowed %t", tc.name, err, tc.allow)
+		}
+	}
+
+	c, err := a.Caller(request(unknown(user()), "/"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(c.unknown, []string{orgIDKey, orgPathsKey}) {
+		t.Fatalf("unknown = %v", c.unknown)
+	}
+	if _, ok := c.keys[orgIDKey]; ok {
+		t.Fatal("an unknown organization ID is in the context")
+	}
+}
