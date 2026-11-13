@@ -268,6 +268,34 @@ func TestRepeatedSignedHeaders(t *testing.T) {
 	}
 }
 
+// TestNonHexPayloadHash checks that an X-Amz-Content-Sha256 that is neither
+// a hex SHA-256, UNSIGNED-PAYLOAD nor STREAMING-* is refused, as S3 does.
+func TestNonHexPayloadHash(t *testing.T) {
+	srv := startServer(t, false, nil)
+	c := clientFor(srv)
+	createBucket(t, c, "hash")
+
+	for _, hash := range []string{"UNSIGNED-PAYLOAD", hexSHA256("body")} {
+		req := signedRequest(t, srv, http.MethodPut, "/hash/ok", []byte("body"), hash, "s3",
+			"us-east-1", time.Now())
+		status, _ := send(t, srv.Client(), req)
+		requireEqual(t, status, http.StatusOK, hash)
+	}
+
+	req := signedRequest(t, srv, http.MethodPut, "/hash/bad", []byte("body"), "true", "s3",
+		"us-east-1", time.Now())
+	status, e := send(t, srv.Client(), req)
+	requireS3Error(t, status, e, http.StatusBadRequest, "InvalidArgument",
+		"x-amz-content-sha256 must be UNSIGNED-PAYLOAD, STREAMING-AWS4-HMAC-SHA256-PAYLOAD, "+
+			"or a valid sha256 value.")
+	requireAbsent(t, c, "hash", "bad")
+}
+
+func hexSHA256(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
+
 // TestSessionTokenRefused checks that the static key refuses any session
 // token, as S3 refuses an invalid one.
 func TestSessionTokenRefused(t *testing.T) {
