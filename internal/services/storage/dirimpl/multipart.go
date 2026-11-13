@@ -379,6 +379,32 @@ func (s *Service) ListParts(
 	return parts, nil
 }
 
+// removeUploads removes the uploads into bucket of generation gen, which
+// cannot complete or be listed once the bucket is deleted. The caller holds
+// the bucket's write lock, so none of them is in use.
+func (s *Service) removeUploads(bucket, gen string) error {
+	entries, err := fs.ReadDir(s.root.FS(), multipartDir)
+	if err != nil {
+		return fmt.Errorf("%s: list uploads: %w", s.Name(), err)
+	}
+	for _, e := range entries {
+		if !e.IsDir() || !uploadIDRe.MatchString(e.Name()) {
+			continue
+		}
+		_, ok, uErr := s.uploadOf(e.Name(), bucket, gen)
+		if uErr != nil {
+			return uErr
+		}
+		if !ok {
+			continue
+		}
+		if rErr := s.root.RemoveAll(uploadDir(e.Name())); rErr != nil {
+			return fmt.Errorf("%s: remove upload %s: %w", s.Name(), e.Name(), rErr)
+		}
+	}
+	return nil
+}
+
 // uploadOf returns upload id when it is an upload into bucket of
 // generation gen. An upload completed or aborted meanwhile is none.
 func (s *Service) uploadOf(id, bucket, gen string) (contracts.UploadInfo, bool, error) {

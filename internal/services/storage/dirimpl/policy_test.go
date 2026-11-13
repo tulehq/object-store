@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -201,5 +202,36 @@ func TestDeleteBucketNotEmptyIsAnsweredAtOnce(t *testing.T) {
 		contracts.ErrBucketNotEmpty)
 	if d := time.Since(start); d > s.deleteWait/2 {
 		t.Fatalf("took %v", d)
+	}
+}
+
+// Deleting a bucket removes the uploads into it.
+func TestDeleteBucketRemovesItsUploads(t *testing.T) {
+	s := newTestService(t)
+	ctx, release := pin(t, s)
+	id, err := s.CreateMultipartUpload(ctx, "bucket", "k", contracts.PutObjectInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+	if err = s.DeleteBucket(context.Background(), ref(t, s, "bucket")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.root.Stat(uploadDir(id)); err == nil {
+		t.Fatal("the upload outlived its bucket")
+	}
+}
+
+// An empty generation file is damage, not a generation.
+func TestAnEmptyGenerationIsAnError(t *testing.T) {
+	s := newTestService(t)
+	if err := s.root.WriteFile(filepath.Join(bucketsDir, "bucket", generationFile), nil,
+		0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := s.GetBucketPolicy(context.Background(), "bucket")
+	if err == nil || errors.Is(err, storage.ErrBucketNotFound) ||
+		errors.Is(err, contracts.ErrNoSuchBucketPolicy) {
+		t.Fatalf("got %v, want an error", err)
 	}
 }
