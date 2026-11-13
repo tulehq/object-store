@@ -135,6 +135,18 @@ func TestBucketPolicyCrossAccount(t *testing.T) {
 	requireCode(t, err, "MethodNotAllowed")
 	requireResponse(t, err, http.StatusMethodNotAllowed)
 
+	// Creating a bucket another account owns is BucketAlreadyExists, even
+	// with both policies allowing it.
+	member := `{"AWS":"` + account + `"}`
+	e.putBucketPolicy(t,
+		statement("Allow", member, "s3:GetObject", "arn:aws:s3:::bkt/public/*", ""),
+		statement("Allow", member, "s3:CreateBucket", "arn:aws:s3:::bkt", ""))
+	_, err = e.partner.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String("bkt")})
+	requireCode(t, err, "BucketAlreadyExists")
+	requireResponse(t, err, http.StatusConflict)
+	_, err = e.root.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String("bkt")})
+	requireCode(t, err, "BucketAlreadyOwnedByYou")
+
 	// Without the identity Allow, the bucket policy's grant is not enough.
 	_, err = e.memberIAM.DeleteUserPolicy(ctx, &iam.DeleteUserPolicyInput{
 		UserName: aws.String("partner"), PolicyName: aws.String("s3"),

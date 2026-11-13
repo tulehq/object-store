@@ -2,6 +2,7 @@ package bucket
 
 import (
 	"encoding/base64"
+	"errors"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -12,6 +13,12 @@ import (
 	"tule.dev/object-store/internal/contracts"
 	"tule.dev/object-store/internal/s3api"
 )
+
+// errBucketAlreadyExists is S3's 409 BucketAlreadyExists (the S3 API
+// Reference, Error codes).
+var errBucketAlreadyExists = s3api.NewError(http.StatusConflict, "BucketAlreadyExists",
+	"The requested bucket name is not available. The bucket namespace is shared by all "+
+		"users of the system. Please select a different name and try again.")
 
 const (
 	defaultMaxKeys = 1000
@@ -300,6 +307,10 @@ func (m *Module) headBucket(ctx gas.Context) error {
 }
 
 // putBucket serves CreateBucket and PutBucketPolicy (?policy).
+//
+// CreateBucket of an existing bucket answers a principal of the owner's
+// account with BucketAlreadyOwnedByYou, and any other with
+// BucketAlreadyExists, as S3 answers a name another account owns.
 func (m *Module) putBucket(ctx gas.Context) error {
 	bucket := ctx.Param("bucket")
 
@@ -309,12 +320,16 @@ func (m *Module) putBucket(ctx gas.Context) error {
 	if err := s3api.CheckSubresource(ctx.Request()); err != nil {
 		return s3api.WriteError(ctx, s3api.Target{Bucket: bucket}, err)
 	}
-	if _, err := m.authz.Authorize(ctx.Request(), authz.CreateBucket,
-		s3api.Target{Bucket: bucket}); err != nil {
+	caller, err := m.authz.Authorize(ctx.Request(), authz.CreateBucket,
+		s3api.Target{Bucket: bucket})
+	if err != nil {
 		return s3api.WriteError(ctx, s3api.Target{Bucket: bucket}, err)
 	}
 
-	if _, err := m.storage.CreateBucket(ctx, bucket); err != nil {
+	if _, err = m.storage.CreateBucket(ctx, bucket); err != nil {
+		if errors.Is(err, contracts.ErrBucketExists) && !caller.InAccount() {
+			err = errBucketAlreadyExists
+		}
 		return s3api.WriteError(ctx, s3api.Target{Bucket: bucket}, err)
 	}
 
