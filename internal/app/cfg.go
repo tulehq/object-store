@@ -7,6 +7,7 @@ import (
 
 	"github.com/gasmod/gas"
 	"github.com/gasmod/gas/config"
+	"tule.dev/sigv4"
 
 	"tule.dev/object-store/internal/services/storage/dirimpl"
 )
@@ -34,11 +35,15 @@ type hstsSettings struct {
 // must be SigV4-signed with it, so both fields are required, or, when
 // IdentityEndpoint is set, with a key the identity service at that base URL
 // issued. The server authenticates to identity with the root key, which must
-// then be identity's root key too.
+// then be identity's root key too. AccountID is the account the root key and
+// the buckets belong to, identity's management account: a principal of any
+// other account is refused, since only a resource-based policy could grant
+// it access and none is evaluated.
 type authSettings struct {
 	AccessKeyID      string
 	SecretAccessKey  string
 	IdentityEndpoint string `validate:"omitempty,http_url"`
+	AccountID        string `validate:"len=12,numeric"`
 }
 
 // errNoCredentials is returned when the access key is not configured.
@@ -127,6 +132,7 @@ func applyDefaults(store gas.ConfigProvider, _ config.Environment) error {
 		{"30s", "Server.RequestTimeout"},
 		{"./data", "Storage.RootDir"},
 		{"localhost", "Server.Domain"},
+		{sigv4.DefaultAccountID, "Auth.AccountID"},
 	}
 	for _, d := range defaults {
 		if err := store.SetDefault(d.key, d.value); err != nil {

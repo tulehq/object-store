@@ -44,6 +44,28 @@ func TestLoadConfigRequiresCredentials(t *testing.T) {
 	}
 }
 
+func TestLoadConfigValidatesTheAccountID(t *testing.T) {
+	for name, tt := range map[string]struct {
+		id      string
+		wantErr bool
+	}{
+		"default":    {},
+		"12 digits":  {id: "123456789012"},
+		"too short":  {id: "12345", wantErr: true},
+		"not digits": {id: "12345678901a", wantErr: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if tt.id != "" {
+				t.Setenv("TULE_Auth_AccountID", tt.id)
+			}
+			err := loadEnvConfig(t, "AKID", "secret")
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("got %v, want an error: %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestLoadConfigValidatesTheIdentityEndpoint(t *testing.T) {
 	tests := []struct {
 		name, endpoint string

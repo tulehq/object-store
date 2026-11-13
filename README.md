@@ -46,7 +46,8 @@ Settings come from environment variables prefixed with `TULE_`, and from a
 | `TULE_Server_Domain` | `localhost` | Enables virtual-hosted-style requests to `<bucket>.<domain>` |
 | `TULE_Auth_AccessKeyID` | required | The access key clients sign requests with |
 | `TULE_Auth_SecretAccessKey` | required | Its secret |
-| `TULE_Auth_IdentityEndpoint` | unset | The [identity](https://github.com/tulehq/identity) service's base URL, such as `http://localhost:9030`, to also accept the keys it issues. Must be an absolute `http` or `https` URL |
+| `TULE_Auth_AccountID` | `000000000000` | The account the configured key and the buckets belong to: identity's management account (`TULE_Identity_AccountID`), 12 digits. Principals of other accounts are refused ([below](#cross-account-access)) |
+| `TULE_Auth_IdentityEndpoint` | unset | The [identity](https://github.com/tulehq/identity) service's base URL, such as `http://localhost:9030`, to also accept the keys it issues and enforce their IAM policies ([below](#permissions)). Must be an absolute `http` or `https` URL; needs identity v0.2.0 or later |
 | `TULE_GasEnv` | | `development` logs at trace level, `testing` disables logging |
 
 The server refuses to start without credentials, and every request must be
@@ -56,8 +57,8 @@ it from using this one.
 
 Those two settings are all it needs: it runs on its own, with no IAM,
 organizations or permissions. To also accept the access keys and STS
-session credentials of the identity service, set
-`TULE_Auth_IdentityEndpoint`. The configured key must then be identity's root
+session credentials of the identity service, and enforce their IAM
+policies, set `TULE_Auth_IdentityEndpoint`. The configured key must then be identity's root
 key, since the server authenticates to identity's signing-key endpoint with
 it. The root key is still checked locally first. Any other key is looked up
 in identity on every request, so a key made inactive or deleted there is
@@ -65,6 +66,170 @@ refused on the next one with `403 InvalidAccessKeyId`. A lookup that fails,
 such as identity being unreachable or not answering within 10 seconds, fails
 the request with `500 InternalError`; it is never treated as an unknown key
 or as a valid one.
+
+## Permissions
+
+Without `TULE_Auth_IdentityEndpoint` nothing is evaluated: the configured key
+is the account's root and may do everything.
+
+With it, every request signed with a key identity issued, an IAM user's
+access key or a role session's credentials, is evaluated against that
+principal's identity-based policies, as S3 evaluates a request within one
+account: its inline policies and the default versions of its attached
+managed policies, or a session's role's, as identity reports them on each
+request. An explicit `Deny` wins; otherwise the request needs an `Allow`.
+The configured key, which is identity's root key too, is never evaluated,
+and neither is identity's root principal of `TULE_Auth_AccountID`; a root
+principal of any other account is refused like that account's other
+principals. A presigned URL is evaluated as
+the principal that signed it.
+
+**Breaking change:** up to v0.5.0, any key identity issued could do
+everything. Now an IAM user or role with no policy that allows S3 actions is
+denied every request. Give such users and roles a policy, such as one
+allowing `s3:*` on `*`, or `arn:aws:iam::aws:policy/AdministratorAccess`.
+
+A request no policy allows is answered with `403 AccessDenied` and the
+message S3 returns for a same-account request ("Troubleshoot access denied
+(403 Forbidden) errors in Amazon S3", S3 User Guide):
+
+```
+User: arn:aws:iam::000000000000:user/dev is not authorized to perform: s3:GetObject on resource: "arn:aws:s3:::bkt/key" because no identity-based policy allows the s3:GetObject action
+User: arn:aws:iam::000000000000:user/dev is not authorized to perform: s3:GetObject on resource: "arn:aws:s3:::bkt/key" with an explicit deny in an identity-based policy
+```
+
+`s3:ListAllMyBuckets`, which has no resource type, names no resource; S3's
+message for that case is not documented. A HEAD request's 403 has no body,
+as on S3. A key DeleteObjects may not delete gets its own entry, `AccessDenied`
+with the message `Access Denied`, as the DeleteObjects API reference's
+example shows it.
+
+A GetObject, HeadObject or CopyObject whose object does not exist answers
+`404 NoSuchKey` only to a caller allowed `s3:ListBucket` on the bucket, and
+`403 AccessDenied` to any other, naming `s3:ListBucket`, so a key's
+existence is not revealed to a caller who could not list it (the GetObject
+and HeadObject API references, Permissions). The request's own `?prefix`
+plays no part in that check.
+
+A bucket name longer than 63 characters is refused with `400
+InvalidBucketName`, and a key longer than 1024 bytes, in the path, a
+DeleteObjects entry or `x-amz-copy-source`, with `400 KeyTooLongError`
+("Your key is too long."), for every caller and before any evaluation: the
+cost of evaluating a resource grows with its length.
+
+### Cross-account access
+
+A principal of an account other than `TULE_Auth_AccountID`, such as a
+session of `OrganizationAccountAccessRole` in a member account, is refused
+every request, even one its identity policies allow:
+
+```
+User: arn:aws:sts::111111111111:assumed-role/OrganizationAccountAccessRole/s is not authorized to perform: s3:GetObject on resource: "arn:aws:s3:::bkt/key" because no resource-based policy allows the s3:GetObject action
+```
+
+On AWS a cross-account request needs a resource-based policy, such as a
+bucket policy, granting it as well as an identity policy ("Cross-account
+policy evaluation logic", IAM User Guide). This server evaluates no
+resource-based policy, so nothing can grant it, and since buckets are not
+isolated by account, allowing it would let any member account's
+administrator reach every bucket. An explicit deny or a missing allow in the
+principal's own policies is still reported as such. The refusal lifts when
+resource-based policies are evaluated.
+
+### Actions and resources
+
+Each operation is evaluated as the actions and resource types AWS's
+[Service Authorization Reference for S3](https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazons3.html)
+lists for it, on `arn:aws:s3:::<bucket>` or `arn:aws:s3:::<bucket>/<key>`.
+The table is `internal/authz/operations.go`; a test checks every entry
+against the reference's JSON, and another drives every routed operation
+through its handler.
+
+| Operation | Action | Resource |
+|---|---|---|
+| ListBuckets | `s3:ListAllMyBuckets` | `*` |
+| CreateBucket | `s3:CreateBucket` | bucket |
+| HeadBucket | `s3:ListBucket` | bucket |
+| DeleteBucket | `s3:DeleteBucket` | bucket |
+| GetBucketLocation | `s3:GetBucketLocation` | bucket |
+| GetBucketVersioning | `s3:GetBucketVersioning` | bucket |
+| ListObjects, ListObjectsV2 | `s3:ListBucket` | bucket |
+| ListMultipartUploads | `s3:ListBucketMultipartUploads` | bucket |
+| GetObject, HeadObject | `s3:GetObject` | object |
+| PutObject | `s3:PutObject` | object |
+| CopyObject | `s3:PutObject`, then `s3:GetObject` | destination, then source object |
+| DeleteObject | `s3:DeleteObject` | object |
+| DeleteObjects | `s3:DeleteObject` | each key; a denied key gets its own `AccessDenied` entry in the result |
+| CreateMultipartUpload, UploadPart, CompleteMultipartUpload | `s3:PutObject` | object |
+| AbortMultipartUpload | `s3:AbortMultipartUpload` | object |
+| ListParts | `s3:ListMultipartUploadParts` | object |
+
+A request for something the server does not implement (`501
+NotImplemented`) is refused before it is evaluated.
+
+### Condition keys
+
+Global keys: `aws:SourceIp` (the TCP peer's address; `X-Forwarded-For` is
+not trusted for it), `aws:CurrentTime`, `aws:EpochTime`,
+`aws:SecureTransport`, `aws:RequestedRegion` (always `us-east-1`, the
+region every bucket is in; the region a request is signed for is not
+checked, so it is not trusted for this), `aws:PrincipalAccount`, `aws:PrincipalType`, `aws:PrincipalArn`
+and, for IAM users, `aws:username`. They also fill policy variables such as
+`${aws:username}`.
+
+S3 keys, each for the actions the reference lists it for and only when the
+request carries a value: `s3:prefix`, `s3:delimiter` and `s3:max-keys`
+(`s3:ListBucket`); `s3:x-amz-acl` (`s3:CreateBucket`, `s3:PutObject`);
+`s3:x-amz-server-side-encryption`, `s3:x-amz-storage-class`,
+`s3:x-amz-copy-source`, `s3:x-amz-metadata-directive`, `s3:if-match` and
+`s3:if-none-match` (`s3:PutObject`); `s3:ObjectCreationOperation`
+(`s3:PutObject`): `true` for PutObject, CopyObject and
+CompleteMultipartUpload, `false` for CreateMultipartUpload and UploadPart,
+as "Enforce conditional writes" (S3 User Guide) uses it; and
+`s3:x-amz-content-sha256`, `s3:authType` (`REST-QUERY-STRING` for a
+presigned URL, by the same test the signature check makes, else
+`REST-HEADER`) and `s3:signatureversion` (every action).
+
+`s3:x-amz-copy-source` is the source CopyObject reads, `<bucket>/<key>`
+decoded, not the header as sent, so a percent-encoded or slash-led header
+cannot step around a condition on it. Resources are likewise the bucket and
+key the operation acts on, decoded.
+
+Every key has one value, read from the same parse of the request the
+operation acts on: a repeated query parameter is its first value for both,
+and DeleteObjects' keys are evaluated and deleted from one decoded
+document. A request whose value for a key is longer than 4096 bytes is
+refused with `400 InvalidArgument`, which bounds the cost of evaluating it.
+
+### Gaps
+
+- `aws:PrincipalArn` for a role session is the role's ARN without its path
+  (`arn:aws:iam::<account>:role/<name>`): the session's ARN carries no path,
+  and identity does not report it yet. A policy condition on a role ARN that
+  includes a path does not match a session, so a Deny written that way
+  (such as one on `arn:aws:iam::*:role/restricted/*`) does not apply to
+  sessions yet.
+- `aws:userid`, `aws:PrincipalTag/*`, `aws:ResourceTag/*`,
+  `s3:ResourceAccount`, `s3:signatureAge`, `s3:TlsVersion` and the other S3
+  keys not listed above are not supplied.
+- An explicit deny's message leaves out S3's ", with policy ARN: <arn>",
+  since identity reports policy documents without their ARNs.
+- The actions the reference also lists for features this server does not
+  implement are not checked. ACL, tagging and object lock headers on a write
+  (`x-amz-acl`, `x-amz-grant-*`, `x-amz-tagging`, `x-amz-object-lock-*`)
+  are accepted and ignored, so such a write needs only `s3:PutObject`, where
+  S3 also needs `s3:PutObjectAcl`, `s3:PutObjectTagging` and the like.
+- Resource-based policies (bucket policies, access point policies, ACLs),
+  permissions boundaries, session policies and SCPs are not evaluated.
+  Bucket policies and ACLs cannot be set (`501 NotImplemented`), so none is
+  stored.
+- There is no per-account ownership of buckets: every bucket belongs to
+  `TULE_Auth_AccountID`, and other accounts are refused.
+- CopyObject checks the destination before the source; the order S3 checks
+  them in, which decides the action a doubly denied copy names, is not
+  documented. DeleteObjects checks that the bucket exists before it
+  evaluates any key, so a caller with no permission learns whether a bucket
+  exists; S3's order is not documented either.
 
 ## Health checks
 
@@ -131,8 +296,9 @@ any origin, and response headers such as `ETag` are exposed.
 
 - **Keys.** Keys are opaque strings, as on S3: `a` and `a/b` coexist, and
   folder markers and `.` or `..` segments are ordinary keys. A key must be 1
-  to 1024 bytes of valid UTF-8 and must not end in a `.` segment (`a/.`);
-  other keys are rejected with `400 InvalidArgument`.
+  to 1024 bytes of valid UTF-8 and must not end in a `.` segment (`a/.`).
+  A longer key is rejected with `400 KeyTooLongError`, as on S3; other
+  invalid keys with `400 InvalidArgument`.
 - **Storage layout.** Objects are stored by the gas `storage/dir` backend
   under hashed names, so the storage root is not browsable as files.
   Directories written by earlier versions are not readable by this one, and
@@ -188,10 +354,11 @@ any origin, and response headers such as `ETag` are exposed.
     `x-amz-content-sha256` is verified before it is acted on; one sent as
     `UNSIGNED-PAYLOAD` or `STREAMING-UNSIGNED-PAYLOAD-TRAILER` is read as
     sent, as on S3.
-- **Every key shares all the data.** The root key and every key from
-  identity, whichever account it belongs to, see and change the same buckets
-  and objects. There is no per-account isolation, and no permissions or
-  policies: an accepted key may do everything.
+- **Every key shares all the data.** The root key and every key identity
+  issued in `TULE_Auth_AccountID` see and change the same buckets and
+  objects, as far as their identity policies allow. Keys of other accounts
+  are refused. There is no per-account isolation, and no resource-based
+  policies ([Permissions](#permissions)).
 - **Presigned DeleteObjects and CompleteMultipartUpload URLs sign no body**,
   as on S3. Whoever holds such a URL chooses the document it sends, so the
   URL is a bearer grant over every key in the bucket for that operation:

@@ -271,6 +271,22 @@ func createUserKey(t *testing.T, ic *iam.Client, name string) aws.Credentials {
 	}
 }
 
+// s3FullAccess is an identity policy allowing every S3 action, which the
+// identity tests that exercise keys rather than permissions give their
+// IAM users, since an identity-issued key with no policy is denied.
+const s3FullAccess = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow",` +
+	`"Action":"s3:*","Resource":"*"}]}`
+
+// putUserPolicy sets the inline policy name, doc, on the IAM user, with the
+// root key.
+func putUserPolicy(t *testing.T, ic *iam.Client, user, name, doc string) {
+	t.Helper()
+	_, err := ic.PutUserPolicy(t.Context(), &iam.PutUserPolicyInput{
+		UserName: aws.String(user), PolicyName: aws.String(name), PolicyDocument: aws.String(doc),
+	})
+	requireNoErr(t, err, "put policy "+name+" on "+user)
+}
+
 // requireWorks checks that c can write, read and presign a read of an
 // object in bucket, which it creates.
 func requireWorks(t *testing.T, srv *httptest.Server, c *s3.Client, bucket string) {
@@ -306,6 +322,7 @@ func TestIdentityUserKeys(t *testing.T) {
 	ctx := t.Context()
 
 	key := createUserKey(t, ic, "dev")
+	putUserPolicy(t, ic, "dev", "s3", s3FullAccess)
 	user := s3As(srv, key)
 	requireWorks(t, srv, user, "user-bucket")
 	requireRootWorks(t, srv)
@@ -338,10 +355,11 @@ func TestIdentityUserKeys(t *testing.T) {
 	requireRootWorks(t, srv)
 }
 
-// TestIdentitySessionKeys checks that the credentials of an AssumeRole
-// session work against S3 with their token, and are refused without it or
-// with another.
-func TestIdentitySessionKeys(t *testing.T) {
+// startMemberAccount starts accounts with an organization and one member
+// account, and identity using it, and returns the member account's ID and
+// identity's URL.
+func startMemberAccount(t *testing.T) (string, string) {
+	t.Helper()
 	accounts := startSibling(t, "accounts", accountsDirEnv)
 	oc := awsorg.New(awsorg.Options{
 		Region:           "us-east-1",
@@ -365,11 +383,23 @@ func TestIdentitySessionKeys(t *testing.T) {
 
 	identity := startSibling(t, "identity", identityDirEnv,
 		"TULE_Identity_AccountsEndpoint="+accounts.URL)
-	srv := startWithIdentity(t, identity.URL)
+	return account, identity.URL
+}
+
+// TestIdentitySessionKeys checks that the credentials of an AssumeRole
+// session into a member account are verified with their token, and refused
+// without it or with another. Verified, the session is still refused every
+// request: it is another account's principal, which only a resource-based
+// policy could grant access, and none is evaluated. TestPolicyRoleSession
+// covers a same-account session that succeeds.
+func TestIdentitySessionKeys(t *testing.T) {
+	account, identityURL := startMemberAccount(t)
+	srv := startWithIdentity(t, identityURL)
+	ctx := t.Context()
 
 	sc := sts.New(sts.Options{
 		Region:           "us-east-1",
-		BaseEndpoint:     aws.String(identity.URL),
+		BaseEndpoint:     aws.String(identityURL),
 		Credentials:      credentials.StaticCredentialsProvider{Value: rootCreds()},
 		HTTPClient:       &http.Client{Timeout: serviceTimeout},
 		RetryMaxAttempts: 1,
@@ -386,7 +416,12 @@ func TestIdentitySessionKeys(t *testing.T) {
 		SessionToken:    aws.ToString(assumed.Credentials.SessionToken),
 	}
 
-	requireWorks(t, srv, s3As(srv, session), "session-bucket")
+	_, err = s3As(srv, session).ListBuckets(ctx, &s3.ListBucketsInput{})
+	requireAPIError(t, err, "AccessDenied", "User: arn:aws:sts::"+account+
+		":assumed-role/OrganizationAccountAccessRole/e2e is not authorized to perform: "+
+		"s3:ListAllMyBuckets because no resource-based policy allows the "+
+		"s3:ListAllMyBuckets action")
+	requireResponse(t, err, http.StatusForbidden)
 	requireRootWorks(t, srv)
 
 	tampered := session
@@ -420,7 +455,9 @@ func flipLast(s string) string {
 func TestIdentityDown(t *testing.T) {
 	identity := startSibling(t, "identity", identityDirEnv)
 	srv := startWithIdentity(t, identity.URL)
-	key := createUserKey(t, iamClient(identity.URL), "dev")
+	ic := iamClient(identity.URL)
+	key := createUserKey(t, ic, "dev")
+	putUserPolicy(t, ic, "dev", "s3", s3FullAccess)
 	user := s3As(srv, key)
 	createBucket(t, user, "before")
 

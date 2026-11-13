@@ -13,6 +13,7 @@ import (
 	"github.com/go-chi/cors"
 	"tule.dev/sigv4"
 
+	"tule.dev/object-store/internal/authz"
 	"tule.dev/object-store/internal/contracts"
 	"tule.dev/object-store/internal/httpx"
 	"tule.dev/object-store/internal/modules/bucket"
@@ -62,10 +63,12 @@ func registerInfraServices(app *gas.App, cfg *Config, logger gas.Logger) {
 	app.RegisterScopedService[httpx.RequestLogger](resolveRequestLogger)
 }
 
-// registerAppServices registers the storage and the signature verifier,
-// whose ReadBody the modules read small request documents with.
+// registerAppServices registers the storage, the signature verifier, whose
+// ReadBody the modules read small request documents with, and the
+// authorizer the modules evaluate each operation with.
 func registerAppServices(app *gas.App, cfg *Config, verifier *sigv4.Verifier) {
 	app.RegisterServiceInstance[*sigv4.Verifier](verifier)
+	app.RegisterServiceInstance[*authz.Authorizer](authz.New(cfg.Auth.AccountID))
 	app.RegisterSingletonService[contracts.StorageProvider](dirimpl.NewService(cfg.Storage))
 }
 

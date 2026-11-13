@@ -10,6 +10,7 @@ import (
 	"github.com/gasmod/gas"
 	"tule.dev/sigv4"
 
+	"tule.dev/object-store/internal/authz"
 	"tule.dev/object-store/internal/contracts"
 )
 
@@ -24,22 +25,27 @@ type Module struct {
 	// their bytes are verified against the signature before they are
 	// decoded.
 	verifier *sigv4.Verifier
+	// authz evaluates each operation against the signer's policies.
+	authz *authz.Authorizer
 }
 
 // NewModule returns a Module serving from storage, reading request
-// documents through verifier. It registers its routes when the app
+// documents through verifier and authorizing operations with az. It
+// registers its routes when the app
 // initializes it.
 func NewModule(
 	router *gas.Router,
 	logger gas.Logger,
 	storage contracts.StorageProvider,
 	verifier *sigv4.Verifier,
+	az *authz.Authorizer,
 ) *Module {
 	return &Module{
 		router:   router,
 		logger:   logger.With().Str("module", moduleName).Logger(),
 		storage:  storage,
 		verifier: verifier,
+		authz:    az,
 	}
 }
 

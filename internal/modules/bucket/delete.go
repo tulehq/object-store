@@ -2,11 +2,13 @@ package bucket
 
 import (
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"net/http"
 
 	"github.com/gasmod/gas"
 
+	"tule.dev/object-store/internal/authz"
 	"tule.dev/object-store/internal/s3api"
 )
 
@@ -33,6 +35,10 @@ func (m *Module) postBucket(ctx gas.Context) error {
 	if err != nil {
 		return s3api.WriteError(ctx, target, err)
 	}
+	caller, err := m.authz.Caller(r)
+	if err != nil {
+		return s3api.WriteError(ctx, target, err)
+	}
 
 	if _, err = m.storage.HeadBucket(ctx, bucket); err != nil {
 		return s3api.WriteError(ctx, target, err)
@@ -40,7 +46,7 @@ func (m *Module) postBucket(ctx gas.Context) error {
 
 	res := s3api.NewDeleteResult()
 	for _, obj := range req.Objects {
-		dErr := m.deleteOne(ctx, bucket, obj)
+		dErr := m.deleteOne(ctx, caller, bucket, obj)
 		if dErr == nil {
 			if !req.Quiet {
 				res.Deleted = append(res.Deleted, s3api.DeletedObject{Key: obj.Key})
@@ -58,9 +64,26 @@ func (m *Module) postBucket(ctx gas.Context) error {
 	return ctx.XML(http.StatusOK, res)
 }
 
-func (m *Module) deleteOne(ctx gas.Context, bucket string, obj s3api.ObjectIdentifier) error {
+// deleteOne deletes one key of a DeleteObjects request, which is evaluated
+// as s3:DeleteObject on that key alone: a key the caller may not delete is
+// answered with its own entry, AccessDenied with the message "Access
+// Denied", as the DeleteObjects API reference's example shows it.
+func (m *Module) deleteOne(
+	ctx gas.Context,
+	caller *authz.Caller,
+	bucket string,
+	obj s3api.ObjectIdentifier,
+) error {
 	if obj.VersionID != "" {
 		return s3api.ErrNotImplemented("Deleting a specific object version is not supported.")
+	}
+	if err := caller.Authorize(authz.DeleteObjects,
+		s3api.Target{Bucket: bucket, Key: obj.Key}); err != nil {
+		var s3Err *s3api.Error
+		if errors.As(err, &s3Err) && s3Err.Code == "AccessDenied" {
+			return s3api.NewError(http.StatusForbidden, "AccessDenied", "Access Denied")
+		}
+		return err
 	}
 	if err := m.storage.DeleteObject(ctx, bucket, obj.Key); err != nil {
 		return fmt.Errorf("delete %q: %w", obj.Key, err)
