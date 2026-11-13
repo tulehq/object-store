@@ -27,25 +27,30 @@ type Module struct {
 	verifier *sigv4.Verifier
 	// authz evaluates each operation against the signer's policies.
 	authz *authz.Authorizer
+	// principals binds a bucket policy's principals before it is stored
+	// and shows a stored one as S3 shows it.
+	principals contracts.PolicyPrincipals
 }
 
 // NewModule returns a Module serving from storage, reading request
-// documents through verifier and authorizing operations with az. It
-// registers its routes when the app
-// initializes it.
+// documents through verifier, authorizing operations with az and binding
+// bucket policies' principals with bound. It registers its routes when the
+// app initializes it.
 func NewModule(
 	router *gas.Router,
 	logger gas.Logger,
 	storage contracts.StorageProvider,
 	verifier *sigv4.Verifier,
 	az *authz.Authorizer,
+	bound contracts.PolicyPrincipals,
 ) *Module {
 	return &Module{
-		router:   router,
-		logger:   logger.With().Str("module", moduleName).Logger(),
-		storage:  storage,
-		verifier: verifier,
-		authz:    az,
+		router:     router,
+		logger:     logger.With().Str("module", moduleName).Logger(),
+		storage:    storage,
+		verifier:   verifier,
+		authz:      az,
+		principals: bound,
 	}
 }
 

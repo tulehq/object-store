@@ -71,7 +71,9 @@ or as a valid one.
 
 Without `TULE_Auth_IdentityEndpoint` nothing is evaluated: the configured key
 is the account's root and may do everything. Bucket policies can still be
-set and read, but no request is evaluated against them.
+set and read, but no request is evaluated against them, and they are stored
+and returned as sent, their principals unbound (see
+[Bucket policies](#bucket-policies)).
 
 With it, every request signed with a key identity issued, an IAM user's
 access key or a role session's credentials, is evaluated against that
@@ -224,14 +226,19 @@ S3's request and response shapes:
   - an `Action` or `NotAction` that is not `"*"` or an `s3:` action:
     `MalformedPolicy`, "Policy has invalid action" (a choice; S3 does not
     document it).
+  - naming, as an `AWS` principal, an IAM user or role ARN that no user or
+    role has: `MalformedPolicy`, "Invalid principal in policy" (see
+    [Unique-ID principals](#unique-id-principals)).
 
   A `Sid` may be any string unique in the policy: S3 documents no rule of
-  its own for it. The policy is validated before the bucket is looked up,
-  so a bad policy for a missing bucket is `400`, a good one `404
-  NoSuchBucket`. `Content-MD5`, the checksum headers and
-  `x-amz-confirm-remove-self-bucket-access` are accepted and ignored.
-- **GetBucketPolicy** answers `200` with the document exactly as stored, as
-  `application/json`, or `404 NoSuchBucketPolicy`.
+  its own for it. The policy is validated, and its principals bound,
+  before the bucket is looked up, so a bad policy for a missing bucket is
+  `400`, a good one `404 NoSuchBucket`. `Content-MD5`, the checksum
+  headers and `x-amz-confirm-remove-self-bucket-access` are accepted and
+  ignored.
+- **GetBucketPolicy** answers `200` with the document as stored, its
+  principals shown as S3 shows them (below), as `application/json`, or
+  `404 NoSuchBucketPolicy`.
 - **DeleteBucketPolicy** answers `204 No Content`, also when the bucket had
   no policy (S3 does not document that case).
 
@@ -240,6 +247,45 @@ Each takes `x-amz-expected-bucket-owner`. They are evaluated as
 the bucket, and the bucket's own policy can grant them within the account.
 The configured root key is never evaluated, so it can always change a
 policy that denies everyone else. Deleting a bucket deletes its policy.
+
+#### Unique-ID principals
+
+With `TULE_Auth_IdentityEndpoint` set, a bucket policy's principals are
+bound to unique IDs, as AWS binds them: "If your `Principal` element ...
+contains an ARN that points to a specific IAM role, then that ARN
+transforms to the role's unique principal ID when you save the policy",
+and likewise for IAM users ("AWS JSON policy elements: Principal", IAM
+User Guide). PutBucketPolicy asks identity's principal-ID endpoint
+(identity v0.5.0, `tule.dev/identity/principals`) for the unique ID
+(`AIDA...` or `AROA...`) of each user and role ARN in the `AWS` values of
+`Principal` and `NotPrincipal`, and stores the policy with the IDs in
+their place. Accounts, root ARNs, `*`, assumed-role and federated-user
+session ARNs, service principals and ARNs in conditions, such as
+`aws:PrincipalArn`, are kept as written, as AWS keeps them. The document is
+otherwise kept as sent, its statements, Sids and conditions in their order;
+the white space of an object an ID was put in is not kept.
+
+- Requests are evaluated against the stored, bound policy, which matches a
+  user or a role session by its unique ID (`aws:userid`). A user or role
+  deleted and created again under the same name has a new ID, so it is not
+  granted, or denied, what the policy names the old one for. Evaluation
+  never asks identity's principal-ID endpoint.
+- GetBucketPolicy shows each ID that a user or role still has as its
+  current ARN, and an ID no user or role has any more as the ID, as AWS
+  shows it once it "can no longer map it back to a valid ARN".
+- An ARN no user or role has is refused, `400 MalformedPolicy`, "Invalid
+  principal in policy", and nothing is stored.
+- A unique ID can be longer than the ARN it replaces: a policy that is over
+  20 KB once bound is refused as one sent over 20 KB is, `400
+  MalformedPolicy`, "Policy exceeds the maximum allowed document size."
+- PutBucketPolicy is evaluated before its body is read, so identity is
+  asked only for a caller allowed `s3:PutBucketPolicy`.
+- When identity cannot be asked, PutBucketPolicy fails with `500
+  InternalError` and stores nothing, and GetBucketPolicy fails with `500
+  InternalError`; both are logged.
+
+Standalone, without an identity endpoint, there are no users or roles to
+bind: policies are stored and returned as sent, and matched by ARN.
 
 ### Actions and resources
 
@@ -334,11 +380,12 @@ refused with `400 InvalidArgument`, which bounds the cost of evaluating it.
 
 ### Gaps
 
-- AWS converts a user or role ARN in a stored bucket policy to the
-  principal's unique ID, so a principal deleted and created again under the
-  same name does not inherit the grant. Here policies match by ARN, so a
-  recreated principal does inherit it, until identity can resolve unique IDs
-  for the services. A session whose role was deleted is refused.
+- Bucket policies stored by v0.7.0 and earlier are unbound: they keep
+  matching their principals by ARN, so a user or role deleted and created
+  again under the same name inherits their grants, until each policy is
+  saved again with PutBucketPolicy, which binds it. They are not bound
+  silently on upgrade. A standalone server never binds.
+- A session whose role was deleted is refused.
 - Service principals (`{"Service": ...}`), `CanonicalUser` and
   federated-user principals are accepted in a bucket policy but match no
   caller.
@@ -349,10 +396,9 @@ refused with `400 InvalidArgument`, which bounds the cost of evaluating it.
 - On S3 a bucket policy `Deny` also applies to the bucket owner's root user,
   except for the bucket policy operations; here that root is never
   evaluated.
-- PutBucketPolicy does not check that a named user or role exists (S3
-  refuses a principal it cannot resolve with `Invalid principal in
-  policy`), nor that each action applies to the resources its statement
-  names.
+- PutBucketPolicy does not check that each action applies to the
+  resources its statement names. Standalone, it does not check that a
+  named user or role exists.
 - `aws:ResourceTag/*`, `s3:signatureAge`, `s3:TlsVersion` and the other S3
   keys not listed above are not supplied.
 - An explicit deny's message leaves out S3's ", with policy ARN: <arn>",
@@ -375,11 +421,20 @@ refused with `400 InvalidArgument`, which bounds the cost of evaluating it.
 ### Changes in this version
 
 - **Breaking:** `TULE_Auth_IdentityEndpoint` needs identity v0.5.0 or later,
-  whose signing-key endpoint reports the organization keys (version 4); an
-  older identity fails every request it verifies with `500`.
+  whose signing-key endpoint reports the organization keys (version 4) and
+  which serves the principal-ID endpoint; an older identity fails every
+  request it verifies with `500`.
+- **Behavior:** with an identity endpoint, PutBucketPolicy binds user and
+  role ARNs to unique IDs and refuses one no user or role has with `400
+  MalformedPolicy`, "Invalid principal in policy"; GetBucketPolicy shows
+  them back as ARNs, or as IDs for principals that are gone; and either
+  fails with `500` when identity cannot be asked
+  ([Unique-ID principals](#unique-id-principals)).
 - **Behavior:** `aws:PrincipalOrgID` and `aws:PrincipalOrgPaths` are
   supplied. A negated condition on them, which held for every principal
   when they were not supplied, now holds only outside the organization.
+- **Upgrade:** policies stored by v0.7.0 and earlier stay unbound and
+  match by ARN until saved again; save each one again to bind it.
 
 ### Changes in v0.7.0
 
