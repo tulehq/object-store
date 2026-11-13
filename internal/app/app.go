@@ -33,6 +33,10 @@ func New(cfg *Config, extra ...gas.Option) (*gas.App, error) {
 	if vErr != nil {
 		return nil, vErr
 	}
+	bound, pErr := newPolicyPrincipals(cfg.Auth)
+	if pErr != nil {
+		return nil, pErr
+	}
 
 	// S3 requests are authenticated by signature, not cookies, so the
 	// cross-origin protection meant for browser sessions only gets in the way
@@ -49,7 +53,7 @@ func New(cfg *Config, extra ...gas.Option) (*gas.App, error) {
 	app := gas.NewApp(opts...)
 
 	registerInfraServices(app, cfg, logger)
-	registerAppServices(app, cfg, verifier)
+	registerAppServices(app, cfg, verifier, bound)
 	registerAppModules(app, cfg)
 	installMiddleware(app.Router(), cfg, logger, verifier)
 	app.ReadyFunc(createBuckets(cfg.Storage.Buckets))
@@ -66,9 +70,15 @@ func registerInfraServices(app *gas.App, cfg *Config, logger gas.Logger) {
 // registerAppServices registers the storage, the signature verifier, whose
 // ReadBody the modules read small request documents with, and the
 // authorizer the modules evaluate each operation with, which reads bucket
-// policies from the storage.
-func registerAppServices(app *gas.App, cfg *Config, verifier *sigv4.Verifier) {
+// policies from the storage, and how bucket policies' principals are bound.
+func registerAppServices(
+	app *gas.App,
+	cfg *Config,
+	verifier *sigv4.Verifier,
+	bound contracts.PolicyPrincipals,
+) {
 	app.RegisterServiceInstance[*sigv4.Verifier](verifier)
+	app.RegisterServiceInstance[contracts.PolicyPrincipals](bound)
 	app.RegisterSingletonService[contracts.StorageProvider](dirimpl.NewService(cfg.Storage))
 	app.RegisterSingletonService[*authz.Authorizer](
 		func(storage contracts.StorageProvider) *authz.Authorizer {

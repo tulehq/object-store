@@ -20,6 +20,7 @@ import (
 	awshttp "github.com/aws/smithy-go/transport/http"
 	"github.com/gasmod/gas/config"
 	"tule.dev/identity/keysource"
+	"tule.dev/identity/principals"
 	"tule.dev/sigv4"
 
 	"tule.dev/object-store/internal/authz"
@@ -32,13 +33,84 @@ const (
 	testUserID     = "AKIAUSERKEYEXAMPLE01"
 	testUserSecret = "user-secret"
 	testUserARN    = "arn:aws:iam::000000000000:user/dev"
+	testUserUID    = "AIDAUSEREXAMPLE00001"
 )
 
 // fakeIdentity is a signing-key endpoint that knows one IAM user key, with
-// the policies set on it.
+// the policies set on it, and a principal-ID endpoint that knows that user,
+// dev, by testUserARN and testUserUID, unless setPrincipals says otherwise.
 type fakeIdentity struct {
-	policies []json.RawMessage
-	mu       sync.Mutex
+	// principals maps the ARN of each user that exists to its unique ID;
+	// nil is dev alone.
+	principals map[string]string
+	policies   []json.RawMessage
+	// bound and shown count the principal-ID calls that resolved ARNs and
+	// IDs.
+	bound, shown int
+	// principalsDown makes the principal-ID endpoint fail.
+	principalsDown bool
+	mu             sync.Mutex
+}
+
+// setPrincipals sets which IAM users exist: their ARNs, to their unique IDs.
+func (f *fakeIdentity) setPrincipals(users map[string]string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.principals = users
+}
+
+// setPrincipalsDown makes the principal-ID endpoint fail, or answer again.
+func (f *fakeIdentity) setPrincipalsDown(down bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.principalsDown = down
+}
+
+// calls returns how many principal-ID calls resolved ARNs and IDs.
+func (f *fakeIdentity) calls() (bound, shown int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.bound, f.shown
+}
+
+// servePrincipals answers a principal-ID call from f.principals.
+func (f *fakeIdentity) servePrincipals(w http.ResponseWriter, r *http.Request) {
+	var req principals.Request
+	if json.NewDecoder(r.Body).Decode(&req) != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.principalsDown {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(principals.ErrorResponse{
+			Code: "InternalFailure", Message: "down",
+		})
+		return
+	}
+	users := f.principals
+	if users == nil {
+		users = map[string]string{testUserARN: testUserUID}
+	}
+	out := principals.Response{IDs: map[string]string{}, ARNs: map[string]string{}}
+	for _, arn := range req.ARNs {
+		if id, ok := users[arn]; ok {
+			out.IDs[arn] = id
+		}
+	}
+	for arn, id := range users {
+		if slices.Contains(req.IDs, id) {
+			out.ARNs[id] = arn
+		}
+	}
+	if len(req.ARNs) > 0 {
+		f.bound++
+	}
+	if len(req.IDs) > 0 {
+		f.shown++
+	}
+	_ = json.NewEncoder(w).Encode(out)
 }
 
 func (f *fakeIdentity) setPolicies(docs ...string) {
@@ -51,6 +123,10 @@ func (f *fakeIdentity) setPolicies(docs ...string) {
 }
 
 func (f *fakeIdentity) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == principals.Path {
+		f.servePrincipals(w, r)
+		return
+	}
 	var req keysource.Request
 	if r.URL.Path != keysource.Path || json.NewDecoder(r.Body).Decode(&req) != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -70,7 +146,7 @@ func (f *fakeIdentity) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		SigningKey: sigv4.DeriveSigningKey(testUserSecret, req.Date, req.Region, req.Service),
 		Principal: keysource.Principal{
 			AccountID: "000000000000", ARN: testUserARN, PrincipalARN: testUserARN,
-			UserID: "AIDAUSEREXAMPLE00001", PrincipalType: "User", AccessKeyID: testUserID,
+			UserID: testUserUID, PrincipalType: "User", AccessKeyID: testUserID,
 			Policies: policies,
 		},
 		Version: keysource.Version,
