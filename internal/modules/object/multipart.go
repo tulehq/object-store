@@ -98,10 +98,15 @@ func (m *Module) completeMultipartUpload(ctx gas.Context, t s3api.Target, upload
 		return s3api.WriteError(ctx, t, err)
 	}
 
+	// The whole body is verified against the signature before it is decoded,
+	// since the decoder stops at the end of its value and would act on a
+	// forged body padded to the signed one's length.
+	body, err := m.verifier.ReadBody(r, maxCompleteBody)
+	if err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
 	var req s3api.CompleteMultipartUpload
-	// An oversized body surfaces as a decode error too.
-	dec := xml.NewDecoder(http.MaxBytesReader(ctx.ResponseWriter(), r.Body, maxCompleteBody))
-	if err = dec.Decode(&req); err != nil || len(req.Parts) == 0 {
+	if err = xml.Unmarshal(body, &req); err != nil || len(req.Parts) == 0 {
 		return s3api.WriteError(ctx, t, s3api.ErrMalformedXML())
 	}
 

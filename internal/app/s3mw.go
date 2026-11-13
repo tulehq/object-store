@@ -126,7 +126,8 @@ func s3AuthError(e *sigv4.Error) error {
 // verifySignature rejects requests whose SigV4 signature does not verify
 // against v, and serves the request Verify returns, whose body is checked
 // against its declared hash as it is read. It runs before virtualHost, since
-// clients sign the path as they sent it.
+// clients sign the path as they sent it, and no later middleware wraps the
+// body, so the modules' v.ReadBody can tell it is verified.
 //
 // The health probes are exempt, so health checks need no credentials. On a
 // <bucket>.<domain> host the same path is an object key, which stays signed.

@@ -48,7 +48,7 @@ func New(cfg *Config, extra ...gas.Option) (*gas.App, error) {
 	app := gas.NewApp(opts...)
 
 	registerInfraServices(app, cfg, logger)
-	registerAppServices(app, cfg)
+	registerAppServices(app, cfg, verifier)
 	registerAppModules(app, cfg)
 	installMiddleware(app.Router(), cfg, logger, verifier)
 	app.ReadyFunc(createBuckets(cfg.Storage.Buckets))
@@ -62,7 +62,10 @@ func registerInfraServices(app *gas.App, cfg *Config, logger gas.Logger) {
 	app.RegisterScopedService[httpx.RequestLogger](resolveRequestLogger)
 }
 
-func registerAppServices(app *gas.App, cfg *Config) {
+// registerAppServices registers the storage and the signature verifier,
+// whose ReadBody the modules read small request documents with.
+func registerAppServices(app *gas.App, cfg *Config, verifier *sigv4.Verifier) {
+	app.RegisterServiceInstance[*sigv4.Verifier](verifier)
 	app.RegisterSingletonService[contracts.StorageProvider](dirimpl.NewService(cfg.Storage))
 }
 

@@ -58,6 +58,27 @@ func tampered(t *testing.T, srv *httptest.Server, edit func(*testing.T, *http.Re
 	}
 }
 
+// swapBody replaces old with replacement in a request body of the same
+// length, keeping Content-Length and the signed payload hash.
+func swapBody(old, replacement string) func(*testing.T, *http.Request) {
+	return func(t *testing.T, r *http.Request) {
+		t.Helper()
+		if r.Body == nil {
+			return
+		}
+		b, err := io.ReadAll(r.Body)
+		requireNoErr(t, err, "read signed body")
+		_ = r.Body.Close()
+		if !bytes.Contains(b, []byte(old)) {
+			t.Fatalf("signed body %q does not contain %q", b, old)
+		}
+		forged := bytes.Replace(b, []byte(old), []byte(replacement), 1)
+		requireEqual(t, len(forged), len(b), "forged body length")
+		r.Body = io.NopCloser(bytes.NewReader(forged))
+		r.GetBody = nil
+	}
+}
+
 // s3Error is an S3 error response body.
 type s3Error struct {
 	Code    string `xml:"Code"`
@@ -170,6 +191,12 @@ func requireAbsent(t *testing.T, c *s3.Client, bucket, key string) {
 	}
 }
 
+func requireBody(t *testing.T, c *s3.Client, bucket, key, want string) {
+	t.Helper()
+	_, body := get(t, c, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
+	requireEqual(t, string(body), want, key+" body")
+}
+
 // TestUnsignedAmzHeader checks that an x-amz-* header added after signing is
 // refused, so it cannot change what a signed request does.
 func TestUnsignedAmzHeader(t *testing.T) {
@@ -227,6 +254,97 @@ func TestPresignedNotYetValid(t *testing.T) {
 
 	status, e := send(t, srv.Client(), presign(time.Now().Add(time.Hour)))
 	requireS3Error(t, status, e, http.StatusForbidden, "AccessDenied", "Request is not yet valid")
+}
+
+// TestTamperedPutObject checks that an upload whose body does not match its
+// signed payload hash stores nothing: no partial object for a new key, and
+// the old object for an existing one.
+func TestTamperedPutObject(t *testing.T) {
+	srv := startServer(t, false, nil)
+	c := clientFor(srv)
+	ctx := context.Background()
+	createBucket(t, c, "tamper")
+	put(t, c, "tamper", "existing", []byte("original"))
+
+	forge := tampered(t, srv, swapBody("signed-body", "forged-body"))
+	for _, key := range []string{"new", "existing"} {
+		_, err := c.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: aws.String("tamper"), Key: aws.String(key),
+			Body: strings.NewReader(strings.Repeat("x", 100_000) + "signed-body"),
+		}, forge)
+		requireCode(t, err, "XAmzContentSHA256Mismatch")
+	}
+	requireAbsent(t, c, "tamper", "new")
+	requireBody(t, c, "tamper", "existing", "original")
+}
+
+// TestTamperedUploadPart checks that a part whose body does not match its
+// signed payload hash is not stored.
+func TestTamperedUploadPart(t *testing.T) {
+	srv := startServer(t, false, nil)
+	c := clientFor(srv)
+	ctx := context.Background()
+	createBucket(t, c, "tamper")
+	up := startUpload(t, c, "tamper", "mp")
+	up.part(1, []byte("first signed-body"))
+
+	for _, n := range []int32{1, 2} {
+		_, err := c.UploadPart(ctx, &s3.UploadPartInput{
+			Bucket: up.bucket, Key: up.key, UploadId: up.id, PartNumber: aws.Int32(n),
+			Body: strings.NewReader("second signed-body"),
+		}, tampered(t, srv, swapBody("signed-body", "forged-body")))
+		requireCode(t, err, "XAmzContentSHA256Mismatch")
+	}
+
+	out, err := c.ListParts(ctx, &s3.ListPartsInput{
+		Bucket: up.bucket, Key: up.key, UploadId: up.id,
+	})
+	requireNoErr(t, err, "list parts")
+	requireEqual(t, len(out.Parts), 1, "parts")
+	requireEqual(t, aws.ToString(out.Parts[0].ETag), md5Hex([]byte("first signed-body")),
+		"part 1 etag")
+}
+
+// TestTamperedDeleteObjects checks that a DeleteObjects document forged to
+// the signed one's length is refused before anything is deleted.
+func TestTamperedDeleteObjects(t *testing.T) {
+	srv := startServer(t, false, nil)
+	c := clientFor(srv)
+	createBucket(t, c, "tamper")
+	put(t, c, "tamper", "keep", []byte("keep"))
+
+	_, err := c.DeleteObjects(context.Background(), &s3.DeleteObjectsInput{
+		Bucket: aws.String("tamper"),
+		Delete: &types.Delete{Objects: []types.ObjectIdentifier{{Key: aws.String("gone")}}},
+	}, tampered(t, srv, swapBody("<Key>gone</Key>", "<Key>keep</Key>")))
+	requireCode(t, err, "XAmzContentSHA256Mismatch")
+	requireBody(t, c, "tamper", "keep", "keep")
+}
+
+// TestTamperedCompleteMultipartUpload checks that a completion document
+// forged to the signed one's length is refused before the upload completes.
+func TestTamperedCompleteMultipartUpload(t *testing.T) {
+	srv := startServer(t, false, nil)
+	c := clientFor(srv)
+	createBucket(t, c, "tamper")
+	up := startUpload(t, c, "tamper", "mp")
+	part := up.part(1, []byte("the part"))
+
+	// Signed for a part ETag that was never uploaded, forged to the real one.
+	wrong := md5Hex([]byte("not the part"))
+	_, err := clientFor(srv, tampered(t, srv, swapBody(
+		strings.Trim(wrong, `"`), strings.Trim(aws.ToString(part.ETag), `"`),
+	))).CompleteMultipartUpload(context.Background(), &s3.CompleteMultipartUploadInput{
+		Bucket: up.bucket, Key: up.key, UploadId: up.id,
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: []types.CompletedPart{
+			{PartNumber: aws.Int32(1), ETag: aws.String(wrong)},
+		}},
+	})
+	requireCode(t, err, "XAmzContentSHA256Mismatch")
+	requireAbsent(t, c, "tamper", "mp")
+
+	_, err = up.complete(part)
+	requireNoErr(t, err, "complete after the forged attempt")
 }
 
 // TestStrictSignedHeaders checks that a SignedHeaders list that is not

@@ -8,6 +8,7 @@ import (
 	"net/http"
 
 	"github.com/gasmod/gas"
+	"tule.dev/sigv4"
 
 	"tule.dev/object-store/internal/contracts"
 )
@@ -19,15 +20,25 @@ type Module struct {
 	router  *gas.Router
 	logger  gas.Logger
 	storage contracts.StorageProvider
+	// verifier reads the request documents an operation acts on, so their
+	// bytes are verified against the signature before they are decoded.
+	verifier *sigv4.Verifier
 }
 
-// NewModule returns a Module serving from storage. It registers its routes
-// when the app initializes it.
-func NewModule(router *gas.Router, logger gas.Logger, storage contracts.StorageProvider) *Module {
+// NewModule returns a Module serving from storage, reading request
+// documents through verifier. It registers its routes when the app
+// initializes it.
+func NewModule(
+	router *gas.Router,
+	logger gas.Logger,
+	storage contracts.StorageProvider,
+	verifier *sigv4.Verifier,
+) *Module {
 	return &Module{
-		router:  router,
-		logger:  logger.With().Str("module", moduleName).Logger(),
-		storage: storage,
+		router:   router,
+		logger:   logger.With().Str("module", moduleName).Logger(),
+		storage:  storage,
+		verifier: verifier,
 	}
 }
 
