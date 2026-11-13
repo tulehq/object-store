@@ -98,10 +98,9 @@ func (m *Module) completeMultipartUpload(ctx gas.Context, t s3api.Target, upload
 		return s3api.WriteError(ctx, t, err)
 	}
 
-	// The whole body is verified against the signature before it is decoded,
-	// since the decoder stops at the end of its value and would act on a
-	// forged body padded to the signed one's length.
-	body, err := m.verifier.ReadBody(r, maxCompleteBody)
+	// The whole body is read before it is decoded, and verified against the
+	// signature when it is signed.
+	body, err := s3api.ReadDocument(r, maxCompleteBody, m.verifier.ReadBody)
 	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}

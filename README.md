@@ -160,11 +160,10 @@ any origin, and response headers such as `ETag` are exposed.
     region;
   - any session token is refused with `400 InvalidToken`, since there are no
     temporary credentials;
-  - a DeleteObjects or CompleteMultipartUpload document must be covered by a
-    hex `x-amz-content-sha256`, as the SDKs send it, and is verified before it
-    is read; one sent as `UNSIGNED-PAYLOAD` or `STREAMING-*` is refused with
-    `400 InvalidRequest`, and one over 2 MiB with `400
-    MaxMessageLengthExceeded`.
+  - a DeleteObjects or CompleteMultipartUpload document over 2 MiB is
+    refused with `400 MaxMessageLengthExceeded`. One signed with a hex
+    `x-amz-content-sha256` is verified before it is acted on; one sent as
+    `UNSIGNED-PAYLOAD` or `STREAMING-*` is read as sent, as on S3.
 - **Not implemented** (requests return `501 NotImplemented`): enabling
   versioning, tagging, ACLs, bucket policies, CORS and lifecycle configuration,
   object lock, UploadPartCopy, and browser POST-policy uploads.

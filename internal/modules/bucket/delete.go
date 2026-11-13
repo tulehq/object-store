@@ -69,11 +69,9 @@ func (m *Module) deleteOne(ctx gas.Context, bucket string, obj s3api.ObjectIdent
 }
 
 // readDeleteRequest reads and decodes a DeleteObjects document. The whole
-// body is read and verified against the signature first, since the decoder
-// stops at the end of its value and would act on a forged body padded to
-// the signed one's length.
+// body is read first, and verified against the signature when it is signed.
 func (m *Module) readDeleteRequest(r *http.Request) (*s3api.Delete, error) {
-	body, err := m.verifier.ReadBody(r, maxDeleteBody)
+	body, err := s3api.ReadDocument(r, maxDeleteBody, m.verifier.ReadBody)
 	if err != nil {
 		return nil, fmt.Errorf("read delete request: %w", err)
 	}

@@ -534,3 +534,47 @@ func TestHostMustBeSigned(t *testing.T) {
 	requireEqual(t, status, http.StatusOK, "presigned virtual-hosted get")
 	requireEqual(t, string(body), "public", "presigned virtual-hosted get body")
 }
+
+// TestUnsignedDocuments checks that DeleteObjects and CompleteMultipartUpload
+// documents the client chose not to sign, as UNSIGNED-PAYLOAD or STREAMING-*,
+// are read and acted on, as S3 does.
+func TestUnsignedDocuments(t *testing.T) {
+	srv := startServer(t, false, nil)
+	c := clientFor(srv)
+	createBucket(t, c, "docs")
+	put(t, c, "docs", "unsigned", []byte("v"))
+	put(t, c, "docs", "chunked", []byte("v"))
+
+	del := `<Delete><Object><Key>unsigned</Key></Object></Delete>`
+	req := signedRequest(t, srv, http.MethodPost, "/docs?delete", []byte(del),
+		"UNSIGNED-PAYLOAD", "s3", "us-east-1", time.Now())
+	status, _ := send(t, srv.Client(), req)
+	requireEqual(t, status, http.StatusOK, "unsigned delete objects")
+	requireAbsent(t, c, "docs", "unsigned")
+
+	del = `<Delete><Object><Key>chunked</Key></Object></Delete>`
+	chunked := strconv.FormatInt(int64(len(del)), 16) + "\r\n" + del + "\r\n0\r\n\r\n"
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
+		srv.URL+"/docs?delete", strings.NewReader(chunked))
+	requireNoErr(t, err, "build chunked delete")
+	const trailer = "STREAMING-UNSIGNED-PAYLOAD-TRAILER"
+	req.Header.Set("X-Amz-Content-Sha256", trailer)
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	req.Header.Set("X-Amz-Decoded-Content-Length", strconv.Itoa(len(del)))
+	err = v4.NewSigner().SignHTTP(context.Background(), testCreds, req, trailer, "s3",
+		"us-east-1", time.Now())
+	requireNoErr(t, err, "sign chunked delete")
+	status, _ = send(t, srv.Client(), req)
+	requireEqual(t, status, http.StatusOK, "streaming delete objects")
+	requireAbsent(t, c, "docs", "chunked")
+
+	up := startUpload(t, c, "docs", "mp")
+	part := up.part(1, []byte("the part"))
+	complete := "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>" +
+		aws.ToString(part.ETag) + "</ETag></Part></CompleteMultipartUpload>"
+	req = signedRequest(t, srv, http.MethodPost, "/docs/mp?uploadId="+aws.ToString(up.id),
+		[]byte(complete), "UNSIGNED-PAYLOAD", "s3", "us-east-1", time.Now())
+	status, _ = send(t, srv.Client(), req)
+	requireEqual(t, status, http.StatusOK, "unsigned complete multipart upload")
+	requireBody(t, c, "docs", "mp", "the part")
+}
