@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gasmod/gas/storage"
 
@@ -155,5 +156,50 @@ func TestALegacyBucketPins(t *testing.T) {
 		t.Fatal(err)
 	} else {
 		release()
+	}
+}
+
+// DeleteBucket waits for an operation pinned to the bucket without blocking
+// other pins, and gives up with ErrOperationAborted past its wait.
+// CreateBucket of the existing bucket does not wait at all.
+func TestDeleteBucketGivesUpOnAnOperationInProgress(t *testing.T) {
+	s := newTestService(t)
+	s.deleteWait = 100 * time.Millisecond
+	bg := context.Background()
+	r := ref(t, s, "bucket")
+	_, release := pin(t, s)
+
+	deleted := make(chan error, 1)
+	go func() { deleted <- s.DeleteBucket(bg, r) }()
+	time.Sleep(20 * time.Millisecond)
+	_, rel2, err := s.Pin(bg, r)
+	if err != nil {
+		t.Fatalf("pin while the delete waits: %v", err)
+	}
+	rel2()
+	_, err = s.CreateBucket(bg, "bucket")
+	requireIs(t, "create of the existing bucket", err, contracts.ErrBucketExists)
+	requireIs(t, "delete past its wait", <-deleted, contracts.ErrOperationAborted)
+
+	release()
+	if err = s.DeleteBucket(bg, r); err != nil {
+		t.Fatalf("delete once released: %v", err)
+	}
+}
+
+// A bucket that is not empty is answered at once, even while an operation
+// holds it.
+func TestDeleteBucketNotEmptyIsAnsweredAtOnce(t *testing.T) {
+	s := newTestService(t)
+	ctx, _ := pin(t, s)
+	if _, err := s.PutObject(ctx, "bucket", "k", strings.NewReader("x"),
+		contracts.PutObjectInput{}, contracts.Precondition{}); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	requireIs(t, "delete", s.DeleteBucket(context.Background(), ref(t, s, "bucket")),
+		contracts.ErrBucketNotEmpty)
+	if d := time.Since(start); d > s.deleteWait/2 {
+		t.Fatalf("took %v", d)
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gasmod/gas/storage"
 
@@ -73,6 +74,30 @@ func (l *bucketLocks) lock(bucket string) func() {
 		l.put(bucket, bl)
 	}
 }
+
+// tryLock write-locks bucket within wait and returns the function that
+// unlocks it, or false when the lock stayed held. It polls TryLock rather
+// than waiting in Lock, since a writer waiting in Lock blocks every new
+// reader: the bucket would freeze for as long as the operations already
+// pinned to it run.
+func (l *bucketLocks) tryLock(bucket string, wait time.Duration) (func(), bool) {
+	bl := l.get(bucket)
+	deadline := time.Now().Add(wait)
+	for !bl.TryLock() {
+		if time.Now().After(deadline) {
+			l.put(bucket, bl)
+			return nil, false
+		}
+		time.Sleep(lockPoll)
+	}
+	return func() {
+		bl.Unlock()
+		l.put(bucket, bl)
+	}, true
+}
+
+// lockPoll is how often tryLock tries the lock again.
+const lockPoll = 5 * time.Millisecond
 
 // rlock read-locks bucket and returns the function that unlocks it.
 func (l *bucketLocks) rlock(bucket string) func() {

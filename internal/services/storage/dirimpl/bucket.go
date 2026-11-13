@@ -203,16 +203,25 @@ func (s *Service) HeadBucket(_ context.Context, bucket string) (*contracts.Bucke
 // interrupted DeleteBucket of the same name is removed first, so the new
 // bucket has none. Its registry entry is made under a temporary name with
 // a new generation and renamed into place, so the bucket exists only with
-// its generation. It holds the bucket's write lock throughout.
+// its generation.
+//
+// An existing bucket is found under its read lock, so creating a bucket
+// that exists, as an "ensure bucket" call does, never queues the bucket's
+// requests behind a writer. Only an absent bucket takes the write lock,
+// and is checked again under it.
 func (s *Service) CreateBucket(ctx context.Context, bucket string) (*contracts.BucketInfo, error) {
 	if !bucketNameRe.MatchString(bucket) || isReservedBucketName(bucket) {
 		return nil, contracts.ErrInvalidBucketName
 	}
+	runlock := s.bucketLocks.rlock(bucket)
+	err := s.checkAbsent(ctx, bucket)
+	runlock()
+	if err != nil {
+		return nil, err
+	}
 	unlock := s.bucketLocks.lock(bucket)
 	defer unlock()
-	if _, err := s.HeadBucket(ctx, bucket); err == nil {
-		return nil, contracts.ErrBucketExists
-	} else if !errors.Is(err, storage.ErrBucketNotFound) {
+	if err = s.checkAbsent(ctx, bucket); err != nil {
 		return nil, err
 	}
 
@@ -230,6 +239,32 @@ func (s *Service) CreateBucket(ctx context.Context, bucket string) (*contracts.B
 	}
 
 	return s.HeadBucket(ctx, bucket)
+}
+
+// checkAbsent returns contracts.ErrBucketExists when bucket exists.
+func (s *Service) checkAbsent(ctx context.Context, bucket string) error {
+	_, err := s.HeadBucket(ctx, bucket)
+	switch {
+	case err == nil:
+		return contracts.ErrBucketExists
+	case errors.Is(err, storage.ErrBucketNotFound):
+		return nil
+	}
+	return err
+}
+
+// checkDeletable returns storage.ErrBucketNotFound when there is no bucket
+// of ref's generation, and contracts.ErrBucketNotEmpty when it holds an
+// object. The caller holds the bucket's lock.
+func (s *Service) checkDeletable(ctx context.Context, ref contracts.BucketRef) error {
+	gen, err := s.generation(ctx, ref.Name)
+	if err != nil {
+		return err
+	}
+	if ref.Generation == "" || gen != ref.Generation {
+		return storage.ErrBucketNotFound
+	}
+	return s.checkEmpty(ctx, ref.Name)
 }
 
 // checkEmpty returns contracts.ErrBucketNotEmpty when bucket holds an
@@ -275,24 +310,29 @@ func (s *Service) registerBucket(bucket string) error {
 // storage.ErrBucketNotFound when there is no such bucket or it is of
 // another generation.
 //
-// It holds the bucket's write lock, so it waits for the operations pinned
-// to the bucket and none starts until it is done. The registry entry is
-// renamed away first, which makes the bucket not exist, then the policy and
+// The generation and emptiness are checked under the bucket's read lock
+// first, so a bucket that is not empty is answered at once. The write lock
+// is then tried for at most s.deleteWait, polling rather than waiting, so
+// the bucket's requests are not blocked meanwhile; an operation pinned to
+// the bucket that outlasts it fails the delete with
+// contracts.ErrOperationAborted. Under the write lock both are checked
+// again, and the registry entry is renamed away, which makes the bucket not exist; then the policy and
 // the index are removed. The bucket is left in the backend, empty.
-// Creating the bucket again reuses it, with a new generation, so an upload
-// started on this bucket does not complete into the new one.
+// Creating the bucket again reuses it, with a new generation.
 func (s *Service) DeleteBucket(ctx context.Context, ref contracts.BucketRef) error {
 	bucket := ref.Name
-	unlock := s.bucketLocks.lock(bucket)
-	defer unlock()
-	gen, err := s.generation(ctx, bucket)
+	runlock := s.bucketLocks.rlock(bucket)
+	err := s.checkDeletable(ctx, ref)
+	runlock()
 	if err != nil {
 		return err
 	}
-	if ref.Generation == "" || gen != ref.Generation {
-		return storage.ErrBucketNotFound
+	unlock, ok := s.bucketLocks.tryLock(bucket, s.deleteWait)
+	if !ok {
+		return contracts.ErrOperationAborted
 	}
-	if err = s.checkEmpty(ctx, bucket); err != nil {
+	defer unlock()
+	if err = s.checkDeletable(ctx, ref); err != nil {
 		return err
 	}
 
