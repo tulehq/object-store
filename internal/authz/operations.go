@@ -28,6 +28,9 @@ const (
 	CompleteMultipartUpload Operation = "CompleteMultipartUpload"
 	AbortMultipartUpload    Operation = "AbortMultipartUpload"
 	ListParts               Operation = "ListParts"
+	PutBucketPolicy         Operation = "PutBucketPolicy"
+	GetBucketPolicy         Operation = "GetBucketPolicy"
+	DeleteBucketPolicy      Operation = "DeleteBucketPolicy"
 )
 
 // resourceKind is the S3 resource type an action is evaluated on, in the
@@ -53,6 +56,11 @@ type check struct {
 	// none of the request's action-specific keys: a GetObject's ?prefix is
 	// no listing's prefix.
 	implied bool
+	// ownerOnly marks an action only principals of the bucket owner's
+	// account may perform, whatever the policies allow: the bucket policy
+	// operations, which answer another account's allowed principal with
+	// 405 MethodNotAllowed.
+	ownerOnly bool
 }
 
 // operations maps every routed operation to the evaluations it needs, in
@@ -103,6 +111,15 @@ var operations = map[Operation][]check{
 	CompleteMultipartUpload: {{action: "s3:PutObject", kind: objectResource}},
 	AbortMultipartUpload:    {{action: "s3:AbortMultipartUpload", kind: objectResource}},
 	ListParts:               {{action: "s3:ListMultipartUploadParts", kind: objectResource}},
+	PutBucketPolicy: {
+		{action: "s3:PutBucketPolicy", kind: bucketResource, ownerOnly: true},
+	},
+	GetBucketPolicy: {
+		{action: "s3:GetBucketPolicy", kind: bucketResource, ownerOnly: true},
+	},
+	DeleteBucketPolicy: {
+		{action: "s3:DeleteBucketPolicy", kind: bucketResource, ownerOnly: true},
+	},
 }
 
 // Operations returns every routed operation, for tests that drive each one.

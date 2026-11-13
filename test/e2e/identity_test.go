@@ -388,10 +388,11 @@ func startMemberAccount(t *testing.T) (string, string) {
 
 // TestIdentitySessionKeys checks that the credentials of an AssumeRole
 // session into a member account are verified with their token, and refused
-// without it or with another. Verified, the session is still refused every
-// request: it is another account's principal, which only a resource-based
-// policy could grant access, and none is evaluated. TestPolicyRoleSession
-// covers a same-account session that succeeds.
+// without it or with another. Verified, the session is another account's
+// principal: it lists its own account's buckets, none, and a bucket of the
+// server's account needs a bucket policy granting it, which
+// TestBucketPolicyCrossAccount covers. (Before bucket policies were
+// evaluated, it was refused every request, ListBuckets included.)
 func TestIdentitySessionKeys(t *testing.T) {
 	account, identityURL := startMemberAccount(t)
 	srv := startWithIdentity(t, identityURL)
@@ -416,11 +417,16 @@ func TestIdentitySessionKeys(t *testing.T) {
 		SessionToken:    aws.ToString(assumed.Credentials.SessionToken),
 	}
 
-	_, err = s3As(srv, session).ListBuckets(ctx, &s3.ListBucketsInput{})
+	createBucket(t, s3As(srv, rootCreds()), "mgmt")
+	listed, err := s3As(srv, session).ListBuckets(ctx, &s3.ListBucketsInput{})
+	requireNoErr(t, err, "member session list buckets")
+	requireEqual(t, len(listed.Buckets), 0, "buckets the member account owns")
+	_, err = s3As(srv, session).ListObjectsV2(ctx,
+		&s3.ListObjectsV2Input{Bucket: aws.String("mgmt")})
 	requireAPIError(t, err, "AccessDenied", "User: arn:aws:sts::"+account+
 		":assumed-role/OrganizationAccountAccessRole/e2e is not authorized to perform: "+
-		"s3:ListAllMyBuckets because no resource-based policy allows the "+
-		"s3:ListAllMyBuckets action")
+		"s3:ListBucket on resource: \"arn:aws:s3:::mgmt\" because no resource-based policy "+
+		"allows the s3:ListBucket action")
 	requireResponse(t, err, http.StatusForbidden)
 	requireRootWorks(t, srv)
 

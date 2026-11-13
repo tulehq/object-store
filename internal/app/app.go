@@ -65,11 +65,15 @@ func registerInfraServices(app *gas.App, cfg *Config, logger gas.Logger) {
 
 // registerAppServices registers the storage, the signature verifier, whose
 // ReadBody the modules read small request documents with, and the
-// authorizer the modules evaluate each operation with.
+// authorizer the modules evaluate each operation with, which reads bucket
+// policies from the storage.
 func registerAppServices(app *gas.App, cfg *Config, verifier *sigv4.Verifier) {
 	app.RegisterServiceInstance[*sigv4.Verifier](verifier)
-	app.RegisterServiceInstance[*authz.Authorizer](authz.New(cfg.Auth.AccountID))
 	app.RegisterSingletonService[contracts.StorageProvider](dirimpl.NewService(cfg.Storage))
+	app.RegisterSingletonService[*authz.Authorizer](
+		func(storage contracts.StorageProvider) *authz.Authorizer {
+			return authz.New(cfg.Auth.AccountID, storage)
+		})
 }
 
 func registerAppModules(app *gas.App, _ *Config) {
