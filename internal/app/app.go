@@ -11,6 +11,7 @@ import (
 	"github.com/gasmod/gas"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
+	"tule.dev/sigv4"
 
 	"tule.dev/object-store/internal/contracts"
 	"tule.dev/object-store/internal/httpx"
@@ -18,7 +19,6 @@ import (
 	"tule.dev/object-store/internal/modules/health"
 	"tule.dev/object-store/internal/modules/object"
 	"tule.dev/object-store/internal/services/storage/dirimpl"
-	"tule.dev/object-store/internal/sigv4"
 )
 
 // New builds the application from cfg. extra options are applied after the
@@ -27,6 +27,10 @@ func New(cfg *Config, extra ...gas.Option) (*gas.App, error) {
 	logger, lErr := newLogger(cfg.Log, cfg.Env)
 	if lErr != nil {
 		return nil, lErr
+	}
+	verifier, vErr := newVerifier(cfg.Auth.AccessKeyID, cfg.Auth.SecretAccessKey)
+	if vErr != nil {
+		return nil, vErr
 	}
 
 	// S3 requests are authenticated by signature, not cookies, so the
@@ -46,7 +50,7 @@ func New(cfg *Config, extra ...gas.Option) (*gas.App, error) {
 	registerInfraServices(app, cfg, logger)
 	registerAppServices(app, cfg)
 	registerAppModules(app, cfg)
-	installMiddleware(app.Router(), cfg, logger)
+	installMiddleware(app.Router(), cfg, logger, verifier)
 	app.ReadyFunc(createBuckets(cfg.Storage.Buckets))
 
 	return app, nil
@@ -90,7 +94,7 @@ func createBuckets(names []string) func(*gas.ServiceContainer) error {
 	}
 }
 
-func installMiddleware(r *gas.Router, cfg *Config, logger gas.Logger) {
+func installMiddleware(r *gas.Router, cfg *Config, logger gas.Logger, verifier *sigv4.Verifier) {
 	r.UseMiddlewareFunc(nil, cors.Handler(cors.Options{
 		// Echo any origin back, which unlike "*" also works for credentialed
 		// requests.
@@ -116,10 +120,7 @@ func installMiddleware(r *gas.Router, cfg *Config, logger gas.Logger) {
 
 	r.UseMiddlewareFunc(nil, gas.RequestLogger[httpx.RequestLogger]())
 
-	r.UseMiddlewareFunc(nil, verifySignature(sigv4.NewVerifier(sigv4.Credentials{
-		AccessKeyID:     cfg.Auth.AccessKeyID,
-		SecretAccessKey: cfg.Auth.SecretAccessKey,
-	}), cfg.Server.Domain))
+	r.UseMiddlewareFunc(nil, verifySignature(verifier, cfg.Server.Domain))
 	if cfg.Server.Domain != "" {
 		r.UseMiddlewareFunc(nil, virtualHost(cfg.Server.Domain))
 	}
