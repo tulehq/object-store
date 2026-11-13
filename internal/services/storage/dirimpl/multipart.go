@@ -34,6 +34,19 @@ type uploadManifest struct {
 	Put       contracts.PutObjectInput `json:"put"`
 	Bucket    string                   `json:"bucket"`
 	Key       string                   `json:"key"`
+	// Generation is the bucket's generation when the upload started, so it
+	// completes only into that bucket, not one created again under its
+	// name. Empty in a manifest written before generations were recorded,
+	// which stands for legacyGeneration.
+	Generation string `json:"generation,omitempty"`
+}
+
+// generation is the generation of the bucket the upload started in.
+func (m *uploadManifest) generation() string {
+	if m.Generation == "" {
+		return legacyGeneration
+	}
+	return m.Generation
 }
 
 func uploadDir(id string) string {
@@ -50,28 +63,34 @@ func partETagFile(id string, n int) string {
 
 // CreateMultipartUpload starts a multipart upload of bucket/key and returns
 // its upload ID. in is applied to the object when the upload completes.
+// ctx must be pinned to bucket.
 func (s *Service) CreateMultipartUpload(
 	ctx context.Context,
 	bucket, key string,
 	in contracts.PutObjectInput,
 ) (string, error) {
-	if _, err := s.HeadBucket(ctx, bucket); err != nil {
+	gen, err := requirePin(ctx, bucket)
+	if err != nil {
 		return "", err
 	}
-	if err := s.checkKey(key); err != nil {
+	if _, err = s.HeadBucket(ctx, bucket); err != nil {
+		return "", err
+	}
+	if err = s.checkKey(key); err != nil {
 		return "", err
 	}
 
 	id := rand.Text()
-	if err := s.root.MkdirAll(uploadDir(id), 0o755); err != nil {
+	if err = s.root.MkdirAll(uploadDir(id), 0o755); err != nil {
 		return "", fmt.Errorf("%s: create upload %q: %w", s.Name(), key, err)
 	}
 
 	manifest, err := json.Marshal(uploadManifest{
-		Bucket:    bucket,
-		Key:       key,
-		Initiated: time.Now().UTC(),
-		Put:       in,
+		Bucket:     bucket,
+		Key:        key,
+		Generation: gen,
+		Initiated:  time.Now().UTC(),
+		Put:        in,
 	})
 	if err != nil {
 		return "", fmt.Errorf("%s: create upload %q: %w", s.Name(), key, err)
@@ -101,8 +120,13 @@ func (s *Service) readManifest(id string) (*uploadManifest, error) {
 }
 
 // loadUpload returns the manifest of upload id, or contracts.ErrNoSuchUpload
-// when there is no such upload for bucket/key.
-func (s *Service) loadUpload(bucket, key, id string) (*uploadManifest, error) {
+// when there is no such upload for bucket/key in the generation ctx pins
+// bucket to.
+func (s *Service) loadUpload(ctx context.Context, bucket, key, id string) (*uploadManifest, error) {
+	gen, err := requirePin(ctx, bucket)
+	if err != nil {
+		return nil, err
+	}
 	if !uploadIDRe.MatchString(id) {
 		return nil, contracts.ErrNoSuchUpload
 	}
@@ -114,7 +138,7 @@ func (s *Service) loadUpload(bucket, key, id string) (*uploadManifest, error) {
 	if err != nil {
 		return nil, err
 	}
-	if m.Bucket != bucket || m.Key != key {
+	if m.Bucket != bucket || m.Key != key || m.generation() != gen {
 		return nil, contracts.ErrNoSuchUpload
 	}
 
@@ -124,12 +148,12 @@ func (s *Service) loadUpload(bucket, key, id string) (*uploadManifest, error) {
 // UploadPart stores part partNumber of an upload, replacing any earlier
 // upload of the same part, and returns its ETag.
 func (s *Service) UploadPart(
-	_ context.Context,
+	ctx context.Context,
 	bucket, key, uploadID string,
 	partNumber int,
 	body io.Reader,
 ) (string, error) {
-	if _, err := s.loadUpload(bucket, key, uploadID); err != nil {
+	if _, err := s.loadUpload(ctx, bucket, key, uploadID); err != nil {
 		return "", err
 	}
 
@@ -183,7 +207,7 @@ func (s *Service) CompleteMultipartUpload(
 	parts []contracts.CompletedPart,
 	cond contracts.Precondition,
 ) (*contracts.ObjectInfo, error) {
-	m, err := s.loadUpload(bucket, key, uploadID)
+	m, err := s.loadUpload(ctx, bucket, key, uploadID)
 	if err != nil {
 		return nil, err
 	}
@@ -300,8 +324,8 @@ func (s *Service) checkPart(
 }
 
 // AbortMultipartUpload discards an upload and its parts.
-func (s *Service) AbortMultipartUpload(_ context.Context, bucket, key, uploadID string) error {
-	if _, err := s.loadUpload(bucket, key, uploadID); err != nil {
+func (s *Service) AbortMultipartUpload(ctx context.Context, bucket, key, uploadID string) error {
+	if _, err := s.loadUpload(ctx, bucket, key, uploadID); err != nil {
 		return err
 	}
 	if err := s.root.RemoveAll(uploadDir(uploadID)); err != nil {
@@ -312,10 +336,10 @@ func (s *Service) AbortMultipartUpload(_ context.Context, bucket, key, uploadID 
 
 // ListParts returns the uploaded parts of an upload, in part number order.
 func (s *Service) ListParts(
-	_ context.Context,
+	ctx context.Context,
 	bucket, key, uploadID string,
 ) ([]contracts.PartInfo, error) {
-	if _, err := s.loadUpload(bucket, key, uploadID); err != nil {
+	if _, err := s.loadUpload(ctx, bucket, key, uploadID); err != nil {
 		return nil, err
 	}
 
@@ -355,13 +379,33 @@ func (s *Service) ListParts(
 	return parts, nil
 }
 
+// uploadOf returns upload id when it is an upload into bucket of
+// generation gen. An upload completed or aborted meanwhile is none.
+func (s *Service) uploadOf(id, bucket, gen string) (contracts.UploadInfo, bool, error) {
+	m, err := s.readManifest(id)
+	if errors.Is(err, fs.ErrNotExist) {
+		return contracts.UploadInfo{}, false, nil
+	}
+	if err != nil {
+		return contracts.UploadInfo{}, false, err
+	}
+	if m.Bucket != bucket || m.generation() != gen {
+		return contracts.UploadInfo{}, false, nil
+	}
+	return contracts.UploadInfo{Key: m.Key, UploadID: id, Initiated: m.Initiated}, true, nil
+}
+
 // ListMultipartUploads returns the in-progress uploads into bucket, sorted by
 // key and then by initiation time.
 func (s *Service) ListMultipartUploads(
 	ctx context.Context,
 	bucket string,
 ) ([]contracts.UploadInfo, error) {
-	if _, err := s.HeadBucket(ctx, bucket); err != nil {
+	gen, err := requirePin(ctx, bucket)
+	if err != nil {
+		return nil, err
+	}
+	if _, err = s.HeadBucket(ctx, bucket); err != nil {
 		return nil, err
 	}
 
@@ -378,22 +422,13 @@ func (s *Service) ListMultipartUploads(
 		if !e.IsDir() || !uploadIDRe.MatchString(e.Name()) {
 			continue
 		}
-		m, rErr := s.readManifest(e.Name())
-		if errors.Is(rErr, fs.ErrNotExist) {
-			// Completed or aborted while listing.
-			continue
-		}
+		u, ok, rErr := s.uploadOf(e.Name(), bucket, gen)
 		if rErr != nil {
 			return nil, rErr
 		}
-		if m.Bucket != bucket {
-			continue
+		if ok {
+			uploads = append(uploads, u)
 		}
-		uploads = append(uploads, contracts.UploadInfo{
-			Key:       m.Key,
-			UploadID:  e.Name(),
-			Initiated: m.Initiated,
-		})
 	}
 
 	slices.SortFunc(uploads, func(a, b contracts.UploadInfo) int {

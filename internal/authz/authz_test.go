@@ -30,15 +30,28 @@ const (
 // missing from it does not exist, and one mapped to "" has no policy.
 type buckets map[string]string
 
-func (b buckets) GetBucketPolicy(_ context.Context, bucket string) ([]byte, error) {
+// Every bucket is of generation "g1".
+func (b buckets) GetBucketPolicy(_ context.Context, bucket string) (string, []byte, error) {
 	doc, ok := b[bucket]
 	switch {
 	case !ok:
-		return nil, storage.ErrBucketNotFound
+		return "", nil, storage.ErrBucketNotFound
 	case doc == "":
-		return nil, contracts.ErrNoSuchBucketPolicy
+		return "g1", nil, contracts.ErrNoSuchBucketPolicy
 	}
-	return []byte(doc), nil
+	return "g1", []byte(doc), nil
+}
+
+func (b buckets) Pin(
+	ctx context.Context,
+	refs ...contracts.BucketRef,
+) (context.Context, func(), error) {
+	for _, r := range refs {
+		if _, ok := b[r.Name]; !ok || r.Generation != "g1" {
+			return nil, nil, storage.ErrBucketNotFound
+		}
+	}
+	return ctx, func() {}, nil
 }
 
 // newAuthorizer returns an Authorizer for the account 000000000000 whose
@@ -93,20 +106,20 @@ var obj = s3api.Target{Bucket: "b", Key: "dir/k.txt"}
 func TestRootIsAlwaysAllowed(t *testing.T) {
 	a := newAuthorizer(nil)
 	r := request(rootOf("000000000000"), "/b/dir/k.txt")
-	if err := a.Authorize(r, DeleteObject, obj); err != nil {
+	if err := a.check(r, DeleteObject, obj); err != nil {
 		t.Fatalf("root: %v", err)
 	}
 }
 
 func TestAPrincipalWithNoPolicyIsDenied(t *testing.T) {
-	err := newAuthorizer(nil).Authorize(request(user(), "/b/dir/k.txt"), GetObject, obj)
+	err := newAuthorizer(nil).check(request(user(), "/b/dir/k.txt"), GetObject, obj)
 	requireDenied(t, err, `User: `+userARN+` is not authorized to perform: s3:GetObject `+
 		`on resource: "arn:aws:s3:::b/dir/k.txt" because no identity-based policy allows `+
 		`the s3:GetObject action`)
 }
 
 func TestAnActionWithoutAResourceTypeNamesNone(t *testing.T) {
-	err := newAuthorizer(nil).Authorize(request(user(), "/"), ListBuckets, s3api.Target{})
+	err := newAuthorizer(nil).check(request(user(), "/"), ListBuckets, s3api.Target{})
 	requireDenied(t, err, `User: `+userARN+` is not authorized to perform: `+
 		`s3:ListAllMyBuckets because no identity-based policy allows the `+
 		`s3:ListAllMyBuckets action`)
@@ -115,17 +128,17 @@ func TestAnActionWithoutAResourceTypeNamesNone(t *testing.T) {
 func TestAnAllowAllowsOnlyItsActionAndResource(t *testing.T) {
 	a := newAuthorizer(nil)
 	p := user(allow("s3:GetObject", "arn:aws:s3:::b/dir/*"))
-	if err := a.Authorize(request(p, "/b/dir/k.txt"), GetObject, obj); err != nil {
+	if err := a.check(request(p, "/b/dir/k.txt"), GetObject, obj); err != nil {
 		t.Fatalf("allowed get: %v", err)
 	}
-	if err := a.Authorize(request(p, "/b/dir/k.txt"), HeadObject, obj); err != nil {
+	if err := a.check(request(p, "/b/dir/k.txt"), HeadObject, obj); err != nil {
 		t.Fatalf("head is s3:GetObject: %v", err)
 	}
 	other := s3api.Target{Bucket: "b", Key: "other"}
-	requireDenied(t, a.Authorize(request(p, "/b/other"), GetObject, other),
+	requireDenied(t, a.check(request(p, "/b/other"), GetObject, other),
 		`User: `+userARN+` is not authorized to perform: s3:GetObject on resource: `+
 			`"arn:aws:s3:::b/other" because no identity-based policy allows the s3:GetObject action`)
-	if err := a.Authorize(request(p, "/b/dir/k.txt"), PutObject, obj); err == nil {
+	if err := a.check(request(p, "/b/dir/k.txt"), PutObject, obj); err == nil {
 		t.Fatal("put allowed by a get policy")
 	}
 }
@@ -134,7 +147,7 @@ func TestAnExplicitDenyWins(t *testing.T) {
 	p := user(allow("s3:*", "*"),
 		`{"Version":"2012-10-17","Statement":{"Effect":"Deny","Action":"s3:DeleteObject",`+
 			`"Resource":"*"}}`)
-	err := newAuthorizer(nil).Authorize(request(p, "/b/dir/k.txt"), DeleteObject, obj)
+	err := newAuthorizer(nil).check(request(p, "/b/dir/k.txt"), DeleteObject, obj)
 	requireDenied(t, err, `User: `+userARN+` is not authorized to perform: s3:DeleteObject `+
 		`on resource: "arn:aws:s3:::b/dir/k.txt" with an explicit deny in an identity-based policy`)
 }
@@ -147,15 +160,15 @@ func TestCopyObjectChecksBothResources(t *testing.T) {
 	dst := s3api.Target{Bucket: "dst", Key: "b"}
 	both := user(allow("s3:PutObject", "arn:aws:s3:::dst/*"),
 		allow("s3:GetObject", "arn:aws:s3:::src/*"))
-	if err := a.Authorize(request(both, "/dst/b"), CopyObject, dst, src); err != nil {
+	if err := a.check(request(both, "/dst/b"), CopyObject, dst, src); err != nil {
 		t.Fatalf("copy: %v", err)
 	}
 	putOnly := user(allow("s3:PutObject", "arn:aws:s3:::dst/*"))
-	requireDenied(t, a.Authorize(request(putOnly, "/dst/b"), CopyObject, dst, src),
+	requireDenied(t, a.check(request(putOnly, "/dst/b"), CopyObject, dst, src),
 		`User: `+userARN+` is not authorized to perform: s3:GetObject on resource: `+
 			`"arn:aws:s3:::src/a" because no identity-based policy allows the s3:GetObject action`)
 	getOnly := user(allow("s3:GetObject", "arn:aws:s3:::src/*"))
-	requireDenied(t, a.Authorize(request(getOnly, "/dst/b"), CopyObject, dst, src),
+	requireDenied(t, a.check(request(getOnly, "/dst/b"), CopyObject, dst, src),
 		`User: `+userARN+` is not authorized to perform: s3:PutObject on resource: `+
 			`"arn:aws:s3:::dst/b" because no identity-based policy allows the s3:PutObject action`)
 }
@@ -163,14 +176,14 @@ func TestCopyObjectChecksBothResources(t *testing.T) {
 func TestAHandlerMistakeFailsClosed(t *testing.T) {
 	a := newAuthorizer(nil)
 	root := request(rootOf("000000000000"), "/")
-	if err := a.Authorize(root, Operation("PutBucketAcl"), obj); err == nil {
+	if err := a.check(root, Operation("PutBucketAcl"), obj); err == nil {
 		t.Error("an operation without an entry was allowed")
 	}
-	if err := a.Authorize(root, CopyObject, obj); err == nil {
+	if err := a.check(root, CopyObject, obj); err == nil {
 		t.Error("CopyObject with one target was allowed")
 	}
 	unverified := httptest.NewRequest(http.MethodGet, "/", http.NoBody)
-	err := a.Authorize(unverified, ListBuckets, s3api.Target{})
+	err := a.check(unverified, ListBuckets, s3api.Target{})
 	if !errors.Is(err, errNoPrincipal) {
 		t.Errorf("an unverified request: %v", err)
 	}
@@ -179,7 +192,7 @@ func TestAHandlerMistakeFailsClosed(t *testing.T) {
 func TestAPolicyThatDoesNotParseIsAnInternalError(t *testing.T) {
 	err := newAuthorizer(
 		nil,
-	).Authorize(request(user(`{"Statement":[]}`), "/"), ListBuckets, s3api.Target{})
+	).check(request(user(`{"Statement":[]}`), "/"), ListBuckets, s3api.Target{})
 	var s3Err *s3api.Error
 	if err == nil || errors.As(err, &s3Err) {
 		t.Fatalf("got %v, want an internal error", err)
@@ -191,7 +204,7 @@ func TestParsedPoliciesAreCachedAndBounded(t *testing.T) {
 	a.limit = 2
 	doc := allow("s3:GetObject", "*")
 	for range 3 {
-		if err := a.Authorize(request(user(doc), "/b/k"), GetObject, obj); err != nil {
+		if err := a.check(request(user(doc), "/b/k"), GetObject, obj); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -199,7 +212,7 @@ func TestParsedPoliciesAreCachedAndBounded(t *testing.T) {
 		t.Fatalf("cache holds %d documents, want 1", len(a.cache))
 	}
 	for _, res := range []string{"arn:aws:s3:::x/*", "arn:aws:s3:::y/*", "arn:aws:s3:::z/*"} {
-		if err := a.Authorize(request(user(allow("s3:GetObject", res)), "/b/k"),
+		if err := a.check(request(user(allow("s3:GetObject", res)), "/b/k"),
 			GetObject, obj); err == nil {
 			t.Fatalf("%s allowed b/dir/k.txt", res)
 		}
@@ -269,21 +282,21 @@ func TestAConditionOnAServiceKeyIsHonored(t *testing.T) {
 	p := user(`{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:ListBucket",` +
 		`"Resource":"arn:aws:s3:::b","Condition":{"StringLike":{"s3:prefix":"home/${aws:username}/*"}}}}`)
 	b := s3api.Target{Bucket: "b"}
-	if err := a.Authorize(
+	if err := a.check(
 		request(p, "/b?list-type=2&prefix=home/dev/x"),
 		ListObjectsV2,
 		b,
 	); err != nil {
 		t.Fatalf("own prefix: %v", err)
 	}
-	if err := a.Authorize(
+	if err := a.check(
 		request(p, "/b?list-type=2&prefix=home/other/"),
 		ListObjectsV2,
 		b,
 	); err == nil {
 		t.Fatal("another prefix allowed")
 	}
-	if err := a.Authorize(request(p, "/b?list-type=2"), ListObjectsV2, b); err == nil {
+	if err := a.check(request(p, "/b?list-type=2"), ListObjectsV2, b); err == nil {
 		t.Fatal("no prefix allowed")
 	}
 }
@@ -298,7 +311,7 @@ func TestAPresignedURLIsQueryStringAuth(t *testing.T) {
 func TestAnOverlongContextValueIsRefused(t *testing.T) {
 	r := request(user(allow("s3:*", "*")), "/b?prefix="+strings.Repeat("a", maxContextValue+1))
 	var s3Err *s3api.Error
-	err := newAuthorizer(nil).Authorize(r, ListObjects, s3api.Target{Bucket: "b"})
+	err := newAuthorizer(nil).check(r, ListObjects, s3api.Target{Bucket: "b"})
 	if !errors.As(err, &s3Err) || s3Err.Code != "InvalidArgument" {
 		t.Fatalf("got %v, want InvalidArgument", err)
 	}
@@ -308,7 +321,7 @@ func TestAnOverlongContextValueIsRefused(t *testing.T) {
 	)
 	if err = newAuthorizer(
 		nil,
-	).Authorize(root, ListObjects, s3api.Target{Bucket: "b"}); err != nil {
+	).check(root, ListObjects, s3api.Target{Bucket: "b"}); err != nil {
 		t.Fatalf("root is not evaluated: %v", err)
 	}
 }
@@ -322,38 +335,38 @@ func TestAnotherAccountNeedsBothPolicies(t *testing.T) {
 		`{"Version":"2012-10-17","Statement":{"Effect":"Deny","Action":"s3:PutObject",`+
 			`"Resource":"*"}}`)
 	a := newAuthorizer(nil)
-	requireDenied(t, a.Authorize(request(p, "/b/dir/k.txt"), GetObject, obj),
+	requireDenied(t, a.check(request(p, "/b/dir/k.txt"), GetObject, obj),
 		`User: `+sessionARN+` is not authorized to perform: s3:GetObject on resource: `+
 			`"arn:aws:s3:::b/dir/k.txt" because no resource-based policy allows the s3:GetObject action`)
-	requireDenied(t, a.Authorize(request(p, "/b/dir/k.txt"), PutObject, obj),
+	requireDenied(t, a.check(request(p, "/b/dir/k.txt"), PutObject, obj),
 		`User: `+sessionARN+` is not authorized to perform: s3:PutObject on resource: `+
 			`"arn:aws:s3:::b/dir/k.txt" with an explicit deny in an identity-based policy`)
 
 	granted := newAuthorizer(
 		buckets{"b": grant(`"111111111111"`, "s3:GetObject", "arn:aws:s3:::b/*")},
 	)
-	if err := granted.Authorize(request(p, "/b/dir/k.txt"), GetObject, obj); err != nil {
+	if err := granted.check(request(p, "/b/dir/k.txt"), GetObject, obj); err != nil {
 		t.Fatalf("granted by both: %v", err)
 	}
-	requireDenied(t, granted.Authorize(request(session(), "/b/dir/k.txt"), GetObject, obj),
+	requireDenied(t, granted.check(request(session(), "/b/dir/k.txt"), GetObject, obj),
 		`User: `+sessionARN+` is not authorized to perform: s3:GetObject on resource: `+
 			`"arn:aws:s3:::b/dir/k.txt" because no identity-based policy allows the s3:GetObject action`)
 
 	// Another account's root is not root here: it has its account's
 	// identity allow, so the bucket policy decides.
 	root := rootOf("111111111111")
-	requireDenied(t, a.Authorize(request(root, "/b/dir/k.txt"), GetObject, obj),
+	requireDenied(t, a.check(request(root, "/b/dir/k.txt"), GetObject, obj),
 		`User: arn:aws:iam::111111111111:root is not authorized to perform: s3:GetObject `+
 			`on resource: "arn:aws:s3:::b/dir/k.txt" because no resource-based policy allows `+
 			`the s3:GetObject action`)
-	if err := granted.Authorize(request(root, "/b/dir/k.txt"), GetObject, obj); err != nil {
+	if err := granted.check(request(root, "/b/dir/k.txt"), GetObject, obj); err != nil {
 		t.Fatalf("another account's root, granted: %v", err)
 	}
 	// The server's own account's root is never evaluated.
 	own := rootOf("000000000000")
 	deny := newAuthorizer(buckets{"b": `{"Version":"2012-10-17","Statement":{"Effect":"Deny",` +
 		`"Principal":"*","Action":"s3:*","Resource":"arn:aws:s3:::b/*"}}`})
-	if err := deny.Authorize(request(own, "/b/dir/k.txt"), GetObject, obj); err != nil {
+	if err := deny.check(request(own, "/b/dir/k.txt"), GetObject, obj); err != nil {
 		t.Fatalf("root: %v", err)
 	}
 }
@@ -370,13 +383,13 @@ func TestCopySourceIsTheDecodedSource(t *testing.T) {
 	for _, header := range []string{"src/private/a", "/src/private/a", "src/%70rivate/a"} {
 		r := request(p, "/dst/b")
 		r.Header.Set("X-Amz-Copy-Source", header)
-		err := a.Authorize(r, CopyObject, dst, s3api.Target{Bucket: "src", Key: "private/a"})
+		err := a.check(r, CopyObject, dst, s3api.Target{Bucket: "src", Key: "private/a"})
 		requireDenied(t, err, `User: `+userARN+` is not authorized to perform: s3:PutObject `+
 			`on resource: "arn:aws:s3:::dst/b" with an explicit deny in an identity-based policy`)
 	}
 	r := request(p, "/dst/b")
 	r.Header.Set("X-Amz-Copy-Source", "src/private/a")
-	if err := a.Authorize(
+	if err := a.check(
 		r,
 		CopyObject,
 		dst,
@@ -409,12 +422,12 @@ func TestObjectCreationOperation(t *testing.T) {
 		}
 		// GetObject on the source is not allowed, so a copy that passes
 		// the Deny stops there instead.
-		err := a.Authorize(request(p, "/b/dir/k.txt"), op, targets...)
+		err := a.check(request(p, "/b/dir/k.txt"), op, targets...)
 		if denied {
 			requireDenied(t, err, explicit)
 			conditional := request(p, "/b/dir/k.txt")
 			conditional.Header.Set("If-Match", `"etag"`)
-			err = a.Authorize(conditional, op, targets...)
+			err = a.check(conditional, op, targets...)
 			if op == CopyObject {
 				requireDenied(t, err, notAllowedMsg("s3:GetObject", "arn:aws:s3:::b/src"))
 			} else if err != nil {
@@ -440,25 +453,25 @@ func TestNotFoundNeedsListBucket(t *testing.T) {
 	a := newAuthorizer(nil)
 	missing := fmt.Errorf("get: %w", storage.ErrObjectNotFound)
 	reader := user(allow("s3:GetObject", "*"))
-	requireDenied(t, a.NotFound(request(reader, "/b/k"), "b", missing),
+	requireDenied(t, a.notFound(request(reader, "/b/k"), missing),
 		notAllowedMsg("s3:ListBucket", "arn:aws:s3:::b"))
 
 	lister := user(allow("s3:GetObject", "*"), allow("s3:ListBucket", "arn:aws:s3:::b"))
-	if err := a.NotFound(request(lister, "/b/k"), "b", missing); !errors.Is(err, missing) {
+	if err := a.notFound(request(lister, "/b/k"), missing); !errors.Is(err, missing) {
 		t.Fatalf("lister: %v", err)
 	}
 
 	prefixed := user(`{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":` +
 		`"s3:ListBucket","Resource":"*","Condition":{"StringLike":{"s3:prefix":"public/*"}}}}`)
-	err := a.NotFound(request(prefixed, "/b/private/k?prefix=public/"), "b", missing)
+	err := a.notFound(request(prefixed, "/b/private/k?prefix=public/"), missing)
 	requireDenied(t, err, notAllowedMsg("s3:ListBucket", "arn:aws:s3:::b"))
 
 	root := rootOf("000000000000")
-	if err = a.NotFound(request(root, "/b/k"), "b", missing); !errors.Is(err, missing) {
+	if err = a.notFound(request(root, "/b/k"), missing); !errors.Is(err, missing) {
 		t.Fatalf("root: %v", err)
 	}
 	other := errors.New("other")
-	if err = a.NotFound(request(reader, "/b/k"), "b", other); !errors.Is(err, other) {
+	if err = a.notFound(request(reader, "/b/k"), other); !errors.Is(err, other) {
 		t.Fatalf("another error: %v", err)
 	}
 }
@@ -470,15 +483,15 @@ func TestOverlongNamesAreRefusedBeforeEvaluation(t *testing.T) {
 	} {
 		long := s3api.Target{Bucket: "b", Key: strings.Repeat("k", maxKey+1)}
 		var s3Err *s3api.Error
-		err := a.Authorize(request(p, "/"), GetObject, long)
+		err := a.check(request(p, "/"), GetObject, long)
 		if !errors.As(err, &s3Err) || s3Err.Code != "KeyTooLongError" || s3Err.Status != 400 {
 			t.Errorf("long key: %v", err)
 		}
-		err = a.Authorize(request(p, "/"), CopyObject, obj, long)
+		err = a.check(request(p, "/"), CopyObject, obj, long)
 		if !errors.As(err, &s3Err) || s3Err.Code != "KeyTooLongError" {
 			t.Errorf("long copy source: %v", err)
 		}
-		err = a.Authorize(request(p, "/"), ListObjects,
+		err = a.check(request(p, "/"), ListObjects,
 			s3api.Target{Bucket: strings.Repeat("b", maxBucketName+1)})
 		if !errors.As(err, &s3Err) || s3Err.Code != "InvalidBucketName" {
 			t.Errorf("long bucket: %v", err)
@@ -487,7 +500,7 @@ func TestOverlongNamesAreRefusedBeforeEvaluation(t *testing.T) {
 			Bucket: strings.Repeat("b", maxBucketName),
 			Key:    strings.Repeat("k", maxKey),
 		}
-		if err = a.Authorize(request(p, "/"), GetObject, ok); err != nil {
+		if err = a.check(request(p, "/"), GetObject, ok); err != nil {
 			t.Errorf("names at the limits: %v", err)
 		}
 	}
@@ -505,7 +518,7 @@ func TestRequestedRegionIsTheServers(t *testing.T) {
 		"AWS4-HMAC-SHA256 Credential=AKIAUSER/20261113/eu-west-1/s3/aws4_request",
 	)
 	r = r.WithContext(sigv4.NewContext(r.Context(), p))
-	err := newAuthorizer(nil).Authorize(r, GetObject, obj)
+	err := newAuthorizer(nil).check(r, GetObject, obj)
 	requireDenied(t, err, `User: `+userARN+` is not authorized to perform: s3:GetObject `+
 		`on resource: "arn:aws:s3:::b/dir/k.txt" with an explicit deny in an identity-based policy`)
 }

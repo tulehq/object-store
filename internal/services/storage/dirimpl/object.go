@@ -57,8 +57,20 @@ func objectInfo(key string, tr *trailer, size int64) (*contracts.ObjectInfo, err
 
 // StatObject returns an object's metadata, with its ETag split out of the
 // user metadata. The metadata is in the object's trailer, so this opens the
-// object to read it.
+// object to read it. ctx must be pinned to bucket.
 func (s *Service) StatObject(
+	ctx context.Context,
+	bucket, key string,
+) (*contracts.ObjectInfo, error) {
+	if _, err := requirePin(ctx, bucket); err != nil {
+		return nil, err
+	}
+	return s.statObject(ctx, bucket, key)
+}
+
+// statObject is StatObject without the pin, for DeleteBucket, which holds
+// the bucket's write lock instead.
+func (s *Service) statObject(
 	ctx context.Context,
 	bucket, key string,
 ) (*contracts.ObjectInfo, error) {
@@ -74,8 +86,11 @@ func (s *Service) StatObject(
 
 // GetObject opens an object for reading. The caller must close its Body. The
 // info and body come from the same read, so they match even when the object
-// is overwritten meanwhile.
+// is overwritten meanwhile. ctx must be pinned to bucket.
 func (s *Service) GetObject(ctx context.Context, bucket, key string) (*contracts.Object, error) {
+	if _, err := requirePin(ctx, bucket); err != nil {
+		return nil, err
+	}
 	return s.openObject(ctx, "get", bucket, key)
 }
 
@@ -127,8 +142,11 @@ func (s *Service) openObject(
 }
 
 // DeleteObject removes an object. Deleting a key that holds no object
-// succeeds.
+// succeeds. ctx must be pinned to bucket.
 func (s *Service) DeleteObject(ctx context.Context, bucket, key string) error {
+	if _, err := requirePin(ctx, bucket); err != nil {
+		return err
+	}
 	if _, err := s.HeadBucket(ctx, bucket); err != nil {
 		return err
 	}
@@ -152,7 +170,7 @@ func (s *Service) DeleteObject(ctx context.Context, bucket, key string) error {
 
 // PutObject stores body with the content type, user metadata and system
 // headers in in, and returns the stored object's info. The write only happens
-// if cond holds.
+// if cond holds. ctx must be pinned to bucket.
 func (s *Service) PutObject(
 	ctx context.Context,
 	bucket, key string,
@@ -160,6 +178,9 @@ func (s *Service) PutObject(
 	in contracts.PutObjectInput,
 	cond contracts.Precondition,
 ) (*contracts.ObjectInfo, error) {
+	if _, err := requirePin(ctx, bucket); err != nil {
+		return nil, err
+	}
 	if _, err := s.HeadBucket(ctx, bucket); err != nil {
 		return nil, err
 	}
@@ -230,7 +251,7 @@ func (s *Service) checkKey(key string) error {
 
 // CopyObject copies an object within or across buckets. Copying an object
 // onto itself is safe: the backend writes the copy to a new data file, while
-// the source stays open for reading.
+// the source stays open for reading. ctx must be pinned to both buckets.
 func (s *Service) CopyObject(
 	ctx context.Context,
 	in contracts.CopyObjectInput,

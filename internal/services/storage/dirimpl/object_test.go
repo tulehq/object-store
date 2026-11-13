@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/gasmod/gas"
@@ -21,7 +22,7 @@ import (
 // holding the metadata map is encoded once the body is read to EOF.
 func TestPutRecordsETag(t *testing.T) {
 	s := newTestService(t)
-	ctx := context.Background()
+	ctx, _ := pin(t, s)
 
 	meta := map[string]string{"owner": "me"}
 	if _, err := s.PutObject(ctx, "bucket", "k", strings.NewReader("hello"),
@@ -49,7 +50,7 @@ func TestPutRecordsETag(t *testing.T) {
 // bucket from being deleted.
 func TestStaleIndexEntries(t *testing.T) {
 	s := newTestService(t)
-	ctx := context.Background()
+	ctx, release := pin(t, s)
 
 	if err := s.addToIndex("bucket", "ghost"); err != nil {
 		t.Fatalf("index: %v", err)
@@ -63,7 +64,8 @@ func TestStaleIndexEntries(t *testing.T) {
 		t.Fatalf("listed %d objects, want none", len(out.Objects))
 	}
 
-	if err = s.DeleteBucket(ctx, "bucket"); err != nil {
+	release()
+	if err = s.DeleteBucket(context.Background(), ref(t, s, "bucket")); err != nil {
 		t.Fatalf("delete bucket: %v", err)
 	}
 }
@@ -73,7 +75,7 @@ func TestStaleIndexEntries(t *testing.T) {
 // hold.
 func TestManyPartSizes(t *testing.T) {
 	s := newTestService(t)
-	ctx := context.Background()
+	ctx, _ := pin(t, s)
 
 	sizes := make([]int64, contracts.MaxPartNumber)
 	for i := range sizes {
@@ -133,7 +135,7 @@ func TestDamagedDataFile(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			s := newTestService(t)
-			ctx := context.Background()
+			ctx, _ := pin(t, s)
 			if _, err := s.PutObject(ctx, "bucket", "k", strings.NewReader("hello"),
 				contracts.PutObjectInput{}, contracts.Precondition{}); err != nil {
 				t.Fatalf("put: %v", err)
@@ -180,4 +182,28 @@ func damageDataFile(t *testing.T, root *os.Root, damage func(*os.File, int64) er
 	if err = damage(f, info.Size()); err != nil {
 		t.Fatalf("damage data file: %v", err)
 	}
+}
+
+// ref is bucket as of its current generation.
+func ref(t *testing.T, s *Service, bucket string) contracts.BucketRef {
+	t.Helper()
+	gen, _, err := s.GetBucketPolicy(context.Background(), bucket)
+	if err != nil && !errors.Is(err, contracts.ErrNoSuchBucketPolicy) {
+		t.Fatalf("read bucket %s: %v", bucket, err)
+	}
+	return contracts.BucketRef{Name: bucket, Generation: gen}
+}
+
+// pin pins the bucket "bucket" in its current generation until release,
+// or the end of the test.
+func pin(t *testing.T, s *Service) (context.Context, func()) {
+	t.Helper()
+	ctx, release, err := s.Pin(context.Background(), ref(t, s, "bucket"))
+	if err != nil {
+		t.Fatalf("pin: %v", err)
+	}
+	var once sync.Once
+	release2 := func() { once.Do(release) }
+	t.Cleanup(release2)
+	return ctx, release2
 }

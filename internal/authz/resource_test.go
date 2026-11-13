@@ -44,16 +44,16 @@ func TestABucketPolicyWithinTheAccount(t *testing.T) {
 	direct := newAuthorizer(
 		buckets{"b": grant(`"`+userARN+`"`, "s3:GetObject", "arn:aws:s3:::b/*")},
 	)
-	if err := direct.Authorize(request(user(), "/b/dir/k.txt"), GetObject, obj); err != nil {
+	if err := direct.check(request(user(), "/b/dir/k.txt"), GetObject, obj); err != nil {
 		t.Fatalf("a grant naming the IAM user: %v", err)
 	}
 	account := newAuthorizer(
 		buckets{"b": grant(`"000000000000"`, "s3:GetObject", "arn:aws:s3:::b/*")},
 	)
-	requireDenied(t, account.Authorize(request(user(), "/b/dir/k.txt"), GetObject, obj),
+	requireDenied(t, account.check(request(user(), "/b/dir/k.txt"), GetObject, obj),
 		deniedMsg(userARN, "s3:GetObject", "arn:aws:s3:::b/dir/k.txt",
 			"because no identity-based policy allows the s3:GetObject action"))
-	if err := account.Authorize(request(user(allow("s3:GetObject", "*")), "/b/dir/k.txt"),
+	if err := account.check(request(user(allow("s3:GetObject", "*")), "/b/dir/k.txt"),
 		GetObject, obj); err != nil {
 		t.Fatalf("an account grant with an identity allow: %v", err)
 	}
@@ -62,7 +62,7 @@ func TestABucketPolicyWithinTheAccount(t *testing.T) {
 func TestAnExplicitDenyInTheBucketPolicyWins(t *testing.T) {
 	a := newAuthorizer(buckets{"b": `{"Version":"2012-10-17","Statement":{"Effect":"Deny",` +
 		`"Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}}`})
-	requireDenied(t, a.Authorize(request(user(allow("s3:*", "*")), "/b/dir/k.txt"), GetObject, obj),
+	requireDenied(t, a.check(request(user(allow("s3:*", "*")), "/b/dir/k.txt"), GetObject, obj),
 		deniedMsg(userARN, "s3:GetObject", "arn:aws:s3:::b/dir/k.txt",
 			"with an explicit deny in a resource-based policy"))
 }
@@ -72,24 +72,24 @@ func TestAnExplicitDenyInTheBucketPolicyWins(t *testing.T) {
 func TestARoleSessionMatchesItsRoleWithThePath(t *testing.T) {
 	p := session(allow("s3:GetObject", "*"))
 	a := newAuthorizer(buckets{"b": grant(`"`+roleARN+`"`, "s3:GetObject", "arn:aws:s3:::b/*")})
-	if err := a.Authorize(request(p, "/b/dir/k.txt"), GetObject, obj); err != nil {
+	if err := a.check(request(p, "/b/dir/k.txt"), GetObject, obj); err != nil {
 		t.Fatalf("a grant to the role: %v", err)
 	}
 	pathless := newAuthorizer(buckets{"b": grant(`"arn:aws:iam::111111111111:role/Reader"`,
 		"s3:GetObject", "arn:aws:s3:::b/*")})
-	if err := pathless.Authorize(request(p, "/b/dir/k.txt"), GetObject, obj); err == nil {
+	if err := pathless.check(request(p, "/b/dir/k.txt"), GetObject, obj); err == nil {
 		t.Fatal("a grant to the role ARN without its path matched")
 	}
 	cond := newAuthorizer(buckets{"b": `{"Version":"2012-10-17","Statement":{"Effect":"Allow",` +
 		`"Principal":{"AWS":"111111111111"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*",` +
 		`"Condition":{"ArnLike":{"aws:PrincipalArn":"arn:aws:iam::111111111111:role/ops/*"}}}}`})
-	if err := cond.Authorize(request(p, "/b/dir/k.txt"), GetObject, obj); err != nil {
+	if err := cond.check(request(p, "/b/dir/k.txt"), GetObject, obj); err != nil {
 		t.Fatalf("a condition on the role's path: %v", err)
 	}
 	// A session whose role was deleted is refused.
 	orphan := session(allow("s3:GetObject", "*"))
 	orphan.PrincipalARN = ""
-	if err := cond.Authorize(request(orphan, "/b/dir/k.txt"), GetObject, obj); err == nil {
+	if err := cond.check(request(orphan, "/b/dir/k.txt"), GetObject, obj); err == nil {
 		t.Fatal("a session whose role was deleted was allowed")
 	}
 }
@@ -99,11 +99,11 @@ func TestAConditionOnAPrincipalTag(t *testing.T) {
 		`"Principal":"*","Action":"s3:*","Resource":"arn:aws:s3:::b/*",` +
 		`"Condition":{"StringNotEquals":{"aws:PrincipalTag/team":"storage"}}}}`})
 	p := user(allow("s3:*", "*"))
-	requireDenied(t, a.Authorize(request(p, "/b/dir/k.txt"), GetObject, obj),
+	requireDenied(t, a.check(request(p, "/b/dir/k.txt"), GetObject, obj),
 		deniedMsg(userARN, "s3:GetObject", "arn:aws:s3:::b/dir/k.txt",
 			"with an explicit deny in a resource-based policy"))
 	p.Tags = map[string]string{"Team": "storage"}
-	if err := a.Authorize(request(p, "/b/dir/k.txt"), GetObject, obj); err != nil {
+	if err := a.check(request(p, "/b/dir/k.txt"), GetObject, obj); err != nil {
 		t.Fatalf("tagged: %v", err)
 	}
 }
@@ -117,14 +117,14 @@ func TestCopyObjectUsesEachBucketsPolicy(t *testing.T) {
 	a := newAuthorizer(
 		buckets{"dst": grant(`"111111111111"`, "s3:PutObject", "arn:aws:s3:::dst/*")},
 	)
-	requireDenied(t, a.Authorize(request(p, "/dst/b"), CopyObject, dst, src),
+	requireDenied(t, a.check(request(p, "/dst/b"), CopyObject, dst, src),
 		deniedMsg(sessionARN, "s3:GetObject", "arn:aws:s3:::src/a",
 			"because no resource-based policy allows the s3:GetObject action"))
 	both := newAuthorizer(buckets{
 		"dst": grant(`"111111111111"`, "s3:PutObject", "arn:aws:s3:::dst/*"),
 		"src": grant(`"111111111111"`, "s3:GetObject", "arn:aws:s3:::src/*"),
 	})
-	if err := both.Authorize(request(p, "/dst/b"), CopyObject, dst, src); err != nil {
+	if err := both.check(request(p, "/dst/b"), CopyObject, dst, src); err != nil {
 		t.Fatalf("copy granted by both buckets: %v", err)
 	}
 }
@@ -156,7 +156,10 @@ type countingSource struct {
 	reads *int
 }
 
-func (s countingSource) GetBucketPolicy(ctx context.Context, bucket string) ([]byte, error) {
+func (s countingSource) GetBucketPolicy(
+	ctx context.Context,
+	bucket string,
+) (string, []byte, error) {
 	*s.reads++
 	return s.buckets.GetBucketPolicy(ctx, bucket)
 }
@@ -182,10 +185,10 @@ func TestResourceAccountIsTheOwner(t *testing.T) {
 	doc := `{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:*",` +
 		`"Resource":"*","Condition":{"StringEquals":{"s3:ResourceAccount":"000000000000"}}}}`
 	a := newAuthorizer(nil)
-	if err := a.Authorize(request(user(doc), "/b/dir/k.txt"), GetObject, obj); err != nil {
+	if err := a.check(request(user(doc), "/b/dir/k.txt"), GetObject, obj); err != nil {
 		t.Fatalf("owned bucket: %v", err)
 	}
-	if err := a.Authorize(request(session(doc), "/"), ListBuckets, s3api.Target{}); err == nil {
+	if err := a.check(request(session(doc), "/"), ListBuckets, s3api.Target{}); err == nil {
 		t.Fatal("ListBuckets of account 111111111111 matched s3:ResourceAccount 000000000000")
 	}
 }
@@ -195,7 +198,7 @@ func TestResourceAccountIsTheOwner(t *testing.T) {
 func TestPolicyOperationsAreTheOwnersOnly(t *testing.T) {
 	a := newAuthorizer(buckets{"b": grant(`"111111111111"`, "s3:*Policy", "arn:aws:s3:::b")})
 	for _, op := range []Operation{PutBucketPolicy, GetBucketPolicy, DeleteBucketPolicy} {
-		err := a.Authorize(request(session(allow("s3:*", "*")), "/b?policy"), op,
+		err := a.check(request(session(allow("s3:*", "*")), "/b?policy"), op,
 			s3api.Target{Bucket: "b"})
 		var s3Err *s3api.Error
 		if !errors.As(err, &s3Err) || s3Err.Status != http.StatusMethodNotAllowed ||
@@ -204,11 +207,11 @@ func TestPolicyOperationsAreTheOwnersOnly(t *testing.T) {
 		}
 		requireDenied(
 			t,
-			a.Authorize(request(session(), "/b?policy"), op, s3api.Target{Bucket: "b"}),
+			a.check(request(session(), "/b?policy"), op, s3api.Target{Bucket: "b"}),
 			deniedMsg(sessionARN, Actions(op)[0], "arn:aws:s3:::b",
 				"because no identity-based policy allows the "+Actions(op)[0]+" action"),
 		)
-		if err = a.Authorize(request(user(allow("s3:*", "*")), "/b?policy"), op,
+		if err = a.check(request(user(allow("s3:*", "*")), "/b?policy"), op,
 			s3api.Target{Bucket: "b"}); err != nil {
 			t.Errorf("%s by the owner's user: %v", op, err)
 		}
@@ -237,7 +240,7 @@ func TestAnExpectedOwnerOtherThanTheServersIsRefused(t *testing.T) {
 			GetObject: {obj}, HeadBucket: {{Bucket: "b"}}, CopyObject: {obj, obj},
 			ListBuckets: {{}},
 		}[tc.op]
-		err := a.Authorize(r, tc.op, targets...)
+		err := a.check(r, tc.op, targets...)
 		if tc.ok && err != nil {
 			t.Errorf("%s %s: %v", tc.op, tc.header, err)
 		}
@@ -253,7 +256,7 @@ func TestAnExpectedOwnerOtherThanTheServersIsRefused(t *testing.T) {
 	r := request(root, "/b")
 	r.Header.Add(expectedOwnerHeader, "000000000000")
 	r.Header.Add(expectedOwnerHeader, "111111111111")
-	if err := a.Authorize(r, HeadBucket, s3api.Target{Bucket: "b"}); err == nil {
+	if err := a.check(r, HeadBucket, s3api.Target{Bucket: "b"}); err == nil {
 		t.Fatal("a repeated header with another account was allowed")
 	}
 }
@@ -265,7 +268,7 @@ func TestABucketPolicyThatCannotBeUsedFailsClosed(t *testing.T) {
 		"unparsable": buckets{"b": `{"Statement":[]}`},
 		"unreadable": failingSource{},
 	} {
-		err := New("000000000000", src).Authorize(
+		err := New("000000000000", src).check(
 			request(user(allow("s3:*", "*")), "/b/dir/k.txt"), GetObject, obj)
 		var s3Err *s3api.Error
 		if err == nil || errors.As(err, &s3Err) {
@@ -274,10 +277,10 @@ func TestABucketPolicyThatCannotBeUsedFailsClosed(t *testing.T) {
 	}
 }
 
-type failingSource struct{}
+type failingSource struct{ buckets }
 
-func (failingSource) GetBucketPolicy(context.Context, string) ([]byte, error) {
-	return nil, errors.New("disk on fire")
+func (failingSource) GetBucketPolicy(context.Context, string) (string, []byte, error) {
+	return "", nil, errors.New("disk on fire")
 }
 
 // The Caller carries the principal's attributes as identity reports them,
@@ -364,10 +367,25 @@ func TestRootAndTheAccountTypeMustAgree(t *testing.T) {
 	for name, p := range map[string]sigv4.Principal{
 		"an Account that is not Root": notRoot, "a Root User": rootUser,
 	} {
-		err := a.Authorize(request(p, "/b/dir/k.txt"), GetObject, obj)
+		err := a.check(request(p, "/b/dir/k.txt"), GetObject, obj)
 		var s3Err *s3api.Error
 		if err == nil || errors.As(err, &s3Err) {
 			t.Errorf("%s: got %v, want an internal error", name, err)
 		}
 	}
+}
+
+// check is Authorize's error alone.
+func (a *Authorizer) check(r *http.Request, op Operation, targets ...s3api.Target) error {
+	_, err := a.Authorize(r, op, targets...)
+	return err
+}
+
+// notFound is the NotFound of r's caller, for the bucket "b".
+func (a *Authorizer) notFound(r *http.Request, err error) error {
+	c, cErr := a.Caller(r)
+	if cErr != nil {
+		return cErr
+	}
+	return c.NotFound("b", err)
 }

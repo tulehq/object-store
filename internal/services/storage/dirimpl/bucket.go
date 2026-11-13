@@ -2,6 +2,7 @@ package dirimpl
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -115,7 +116,11 @@ func (s *Service) ListObjects(
 
 // bucketKeys returns the keys in bucket's index, sorted, or
 // storage.ErrBucketNotFound when there is no such bucket.
+// It requires ctx to be pinned to bucket.
 func (s *Service) bucketKeys(ctx context.Context, bucket string) ([]string, error) {
+	if _, err := requirePin(ctx, bucket); err != nil {
+		return nil, err
+	}
 	if _, err := s.HeadBucket(ctx, bucket); err != nil {
 		return nil, err
 	}
@@ -196,13 +201,15 @@ func (s *Service) HeadBucket(_ context.Context, bucket string) (*contracts.Bucke
 // it is added to the registry, which is what makes it exist, so an
 // interrupted create is completed by the next one. A policy left by an
 // interrupted DeleteBucket of the same name is removed first, so the new
-// bucket has none.
+// bucket has none. Its registry entry is made under a temporary name with
+// a new generation and renamed into place, so the bucket exists only with
+// its generation. It holds the bucket's write lock throughout.
 func (s *Service) CreateBucket(ctx context.Context, bucket string) (*contracts.BucketInfo, error) {
 	if !bucketNameRe.MatchString(bucket) || isReservedBucketName(bucket) {
 		return nil, contracts.ErrInvalidBucketName
 	}
-	s.bucketsMu.Lock()
-	defer s.bucketsMu.Unlock()
+	unlock := s.bucketLocks.lock(bucket)
+	defer unlock()
 	if _, err := s.HeadBucket(ctx, bucket); err == nil {
 		return nil, contracts.ErrBucketExists
 	} else if !errors.Is(err, storage.ErrBucketNotFound) {
@@ -218,29 +225,22 @@ func (s *Service) CreateBucket(ctx context.Context, bucket string) (*contracts.B
 	if err := s.removePolicy(bucket); err != nil {
 		return nil, err
 	}
-	if err := s.root.Mkdir(filepath.Join(bucketsDir, bucket), 0o750); err != nil {
-		if errors.Is(err, fs.ErrExist) {
-			return nil, contracts.ErrBucketExists
-		}
-		return nil, fmt.Errorf("%s: failed to create bucket: %s: %w", s.Name(), bucket, err)
+	if err := s.registerBucket(bucket); err != nil {
+		return nil, err
 	}
 
 	return s.HeadBucket(ctx, bucket)
 }
 
-// DeleteBucket removes an empty bucket. It returns contracts.ErrBucketNotEmpty
-// while the bucket holds objects.
-//
-// The bucket is left in the backend, empty. Creating the bucket again reuses
-// it. Its policy is removed after it leaves the registry, under bucketsMu,
-// so no reader sees the bucket without its policy.
-func (s *Service) DeleteBucket(ctx context.Context, bucket string) error {
-	keys, err := s.bucketKeys(ctx, bucket)
+// checkEmpty returns contracts.ErrBucketNotEmpty when bucket holds an
+// object. An indexed key that holds none does not count.
+func (s *Service) checkEmpty(ctx context.Context, bucket string) error {
+	keys, err := s.indexedKeys(bucket)
 	if err != nil {
 		return err
 	}
 	for _, key := range keys {
-		_, sErr := s.StatObject(ctx, bucket, key)
+		_, sErr := s.statObject(ctx, bucket, key)
 		if sErr == nil {
 			return contracts.ErrBucketNotEmpty
 		}
@@ -248,10 +248,59 @@ func (s *Service) DeleteBucket(ctx context.Context, bucket string) error {
 			return sErr
 		}
 	}
+	return nil
+}
 
-	s.bucketsMu.Lock()
-	defer s.bucketsMu.Unlock()
-	if err = s.root.Remove(filepath.Join(bucketsDir, bucket)); err != nil {
+// registerBucket adds bucket to the registry with a new generation. The
+// entry is written under a name no bucket can have, which ListBuckets and
+// HeadBucket ignore, and renamed into place.
+func (s *Service) registerBucket(bucket string) error {
+	tmp := filepath.Join(bucketsDir, ".new-"+rand.Text())
+	if err := s.root.Mkdir(tmp, 0o750); err != nil {
+		return fmt.Errorf("%s: failed to create bucket: %s: %w", s.Name(), bucket, err)
+	}
+	err := s.root.WriteFile(filepath.Join(tmp, generationFile), []byte(newGeneration()), 0o600)
+	if err == nil {
+		err = s.root.Rename(tmp, filepath.Join(bucketsDir, bucket))
+	}
+	if err != nil {
+		return errors.Join(fmt.Errorf("%s: failed to create bucket: %s: %w", s.Name(), bucket, err),
+			s.root.RemoveAll(tmp))
+	}
+	return nil
+}
+
+// DeleteBucket removes an empty bucket of ref's generation. It returns
+// contracts.ErrBucketNotEmpty while the bucket holds objects, and
+// storage.ErrBucketNotFound when there is no such bucket or it is of
+// another generation.
+//
+// It holds the bucket's write lock, so it waits for the operations pinned
+// to the bucket and none starts until it is done. The registry entry is
+// renamed away first, which makes the bucket not exist, then the policy and
+// the index are removed. The bucket is left in the backend, empty.
+// Creating the bucket again reuses it, with a new generation, so an upload
+// started on this bucket does not complete into the new one.
+func (s *Service) DeleteBucket(ctx context.Context, ref contracts.BucketRef) error {
+	bucket := ref.Name
+	unlock := s.bucketLocks.lock(bucket)
+	defer unlock()
+	gen, err := s.generation(ctx, bucket)
+	if err != nil {
+		return err
+	}
+	if ref.Generation == "" || gen != ref.Generation {
+		return storage.ErrBucketNotFound
+	}
+	if err = s.checkEmpty(ctx, bucket); err != nil {
+		return err
+	}
+
+	gone := filepath.Join(bucketsDir, ".gone-"+rand.Text())
+	if err = s.root.Rename(filepath.Join(bucketsDir, bucket), gone); err != nil {
+		return fmt.Errorf("%s: failed to delete bucket: %s: %w", s.Name(), bucket, err)
+	}
+	if err = s.root.RemoveAll(gone); err != nil {
 		return fmt.Errorf("%s: failed to delete bucket: %s: %w", s.Name(), bucket, err)
 	}
 	if err = s.removePolicy(bucket); err != nil {

@@ -72,10 +72,12 @@ func (m *Module) getBucket(ctx gas.Context) error {
 	if ctx.Query("list-type") == "2" {
 		op, list = authz.ListObjectsV2, m.listObjectsV2
 	}
-	if err := m.authz.Authorize(r, op, target); err != nil {
+	g, err := m.authz.AuthorizeAndPin(ctx, r, op, target)
+	if err != nil {
 		return s3api.WriteError(ctx, target, err)
 	}
-	return list(ctx)
+	defer g.Release()
+	return list(ctx, g)
 }
 
 // getBucketConfig serves GetBucketLocation (sub "location") and
@@ -88,12 +90,11 @@ func (m *Module) getBucketConfig(ctx gas.Context, sub string) error {
 	if sub == "location" {
 		op = authz.GetBucketLocation
 	}
-	if err := m.authz.Authorize(ctx.Request(), op, target); err != nil {
+	g, err := m.authz.AuthorizeAndPin(ctx, ctx.Request(), op, target)
+	if err != nil {
 		return s3api.WriteError(ctx, target, err)
 	}
-	if _, err := m.storage.HeadBucket(ctx, bucket); err != nil {
-		return s3api.WriteError(ctx, target, err)
-	}
+	g.Release()
 	if sub == "location" {
 		// Every bucket here is in us-east-1, which S3 reports as an empty
 		// constraint.
@@ -103,8 +104,8 @@ func (m *Module) getBucketConfig(ctx gas.Context, sub string) error {
 }
 
 // listObjectsV2 serves ListObjectsV2. Continuation tokens are the base64 of the
-// last key or common prefix returned.
-func (m *Module) listObjectsV2(ctx gas.Context) error {
+// last key or common prefix returned. g pins the bucket.
+func (m *Module) listObjectsV2(ctx gas.Context, g *authz.Grant) error {
 	bucket := ctx.Param("bucket")
 	target := s3api.Target{Bucket: bucket}
 
@@ -113,7 +114,7 @@ func (m *Module) listObjectsV2(ctx gas.Context) error {
 		return s3api.WriteError(ctx, target, err)
 	}
 
-	out, err := m.storage.ListObjects(ctx, bucket, in)
+	out, err := m.storage.ListObjects(g.Context(), bucket, in)
 	if err != nil {
 		return s3api.WriteError(ctx, target, err)
 	}
@@ -147,8 +148,8 @@ func (m *Module) listObjectsV2(ctx gas.Context) error {
 }
 
 // listObjectsV1 serves ListObjects (version 1), which pages with a marker
-// key instead of a continuation token.
-func (m *Module) listObjectsV1(ctx gas.Context) error {
+// key instead of a continuation token. g pins the bucket.
+func (m *Module) listObjectsV1(ctx gas.Context, g *authz.Grant) error {
 	bucket := ctx.Param("bucket")
 	target := s3api.Target{Bucket: bucket}
 
@@ -162,7 +163,7 @@ func (m *Module) listObjectsV1(ctx gas.Context) error {
 	}
 	in.StartAfter = ctx.Query("marker")
 
-	out, err := m.storage.ListObjects(ctx, bucket, in)
+	out, err := m.storage.ListObjects(g.Context(), bucket, in)
 	if err != nil {
 		return s3api.WriteError(ctx, target, err)
 	}
@@ -285,14 +286,14 @@ func (m *Module) headBucket(ctx gas.Context) error {
 	if err := s3api.CheckSubresource(ctx.Request()); err != nil {
 		return s3api.WriteError(ctx, s3api.Target{Bucket: bucket}, err)
 	}
-	if err := m.authz.Authorize(ctx.Request(), authz.HeadBucket,
-		s3api.Target{Bucket: bucket}); err != nil {
+	// Pinning the bucket checks that it exists in the generation
+	// evaluated.
+	g, err := m.authz.AuthorizeAndPin(ctx, ctx.Request(), authz.HeadBucket,
+		s3api.Target{Bucket: bucket})
+	if err != nil {
 		return s3api.WriteError(ctx, s3api.Target{Bucket: bucket}, err)
 	}
-
-	if _, err := m.storage.HeadBucket(ctx, bucket); err != nil {
-		return s3api.WriteError(ctx, s3api.Target{Bucket: bucket}, err)
-	}
+	g.Release()
 
 	ctx.ResponseWriter().WriteHeader(http.StatusOK)
 	return nil
@@ -308,7 +309,7 @@ func (m *Module) putBucket(ctx gas.Context) error {
 	if err := s3api.CheckSubresource(ctx.Request()); err != nil {
 		return s3api.WriteError(ctx, s3api.Target{Bucket: bucket}, err)
 	}
-	if err := m.authz.Authorize(ctx.Request(), authz.CreateBucket,
+	if _, err := m.authz.Authorize(ctx.Request(), authz.CreateBucket,
 		s3api.Target{Bucket: bucket}); err != nil {
 		return s3api.WriteError(ctx, s3api.Target{Bucket: bucket}, err)
 	}
@@ -332,12 +333,18 @@ func (m *Module) deleteBucket(ctx gas.Context) error {
 	if err := s3api.CheckSubresource(ctx.Request()); err != nil {
 		return s3api.WriteError(ctx, s3api.Target{Bucket: bucket}, err)
 	}
-	if err := m.authz.Authorize(ctx.Request(), authz.DeleteBucket,
-		s3api.Target{Bucket: bucket}); err != nil {
+	caller, err := m.authz.Authorize(ctx.Request(), authz.DeleteBucket,
+		s3api.Target{Bucket: bucket})
+	if err != nil {
 		return s3api.WriteError(ctx, s3api.Target{Bucket: bucket}, err)
 	}
-
-	if err := m.storage.DeleteBucket(ctx, bucket); err != nil {
+	// The bucket deleted is the one evaluated: one deleted and created
+	// again since is NoSuchBucket.
+	ref, err := caller.Ref(bucket)
+	if err != nil {
+		return s3api.WriteError(ctx, s3api.Target{Bucket: bucket}, err)
+	}
+	if err = m.storage.DeleteBucket(ctx, ref); err != nil {
 		return s3api.WriteError(ctx, s3api.Target{Bucket: bucket}, err)
 	}
 

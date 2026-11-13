@@ -18,16 +18,18 @@ func (m *Module) listMultipartUploads(ctx gas.Context) error {
 	bucket := ctx.Param("bucket")
 	target := s3api.Target{Bucket: bucket}
 
-	if err := m.authz.Authorize(ctx.Request(), authz.ListMultipartUploads, target); err != nil {
+	g, err := m.authz.AuthorizeAndPin(ctx, ctx.Request(), authz.ListMultipartUploads, target)
+	if err != nil {
 		return s3api.WriteError(ctx, target, err)
 	}
+	defer g.Release()
 
 	q, err := parseUploadsQuery(ctx)
 	if err != nil {
 		return s3api.WriteError(ctx, target, err)
 	}
 
-	uploads, err := m.storage.ListMultipartUploads(ctx, bucket)
+	uploads, err := m.storage.ListMultipartUploads(g.Context(), bucket)
 	if err != nil {
 		return s3api.WriteError(ctx, target, err)
 	}

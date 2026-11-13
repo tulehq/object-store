@@ -47,11 +47,18 @@ func (m *Module) postObject(ctx gas.Context) error {
 }
 
 func (m *Module) createMultipartUpload(ctx gas.Context, t s3api.Target) error {
-	if err := m.authz.Authorize(ctx.Request(), authz.CreateMultipartUpload, t); err != nil {
+	g, err := m.authz.AuthorizeAndPin(ctx, ctx.Request(), authz.CreateMultipartUpload, t)
+	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
+	defer g.Release()
 
-	id, err := m.storage.CreateMultipartUpload(ctx, t.Bucket, t.Key, putInput(ctx.Request()))
+	id, err := m.storage.CreateMultipartUpload(
+		g.Context(),
+		t.Bucket,
+		t.Key,
+		putInput(ctx.Request()),
+	)
 	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
@@ -65,9 +72,11 @@ func (m *Module) uploadPart(ctx gas.Context, t s3api.Target) error {
 	if r.Header.Get("X-Amz-Copy-Source") != "" {
 		return s3api.WriteError(ctx, t, s3api.ErrNotImplemented("UploadPartCopy is not supported."))
 	}
-	if err := m.authz.Authorize(r, authz.UploadPart, t); err != nil {
+	g, err := m.authz.AuthorizeAndPin(ctx, r, authz.UploadPart, t)
+	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
+	defer g.Release()
 
 	uploadID := r.URL.Query().Get("uploadId")
 	if uploadID == "" {
@@ -88,7 +97,7 @@ func (m *Module) uploadPart(ctx gas.Context, t s3api.Target) error {
 		return s3api.WriteError(ctx, t, err)
 	}
 
-	etag, err := m.storage.UploadPart(ctx, t.Bucket, t.Key, uploadID, n, body)
+	etag, err := m.storage.UploadPart(g.Context(), t.Bucket, t.Key, uploadID, n, body)
 	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
@@ -100,7 +109,8 @@ func (m *Module) uploadPart(ctx gas.Context, t s3api.Target) error {
 
 func (m *Module) completeMultipartUpload(ctx gas.Context, t s3api.Target, uploadID string) error {
 	r := ctx.Request()
-	if err := m.authz.Authorize(r, authz.CompleteMultipartUpload, t); err != nil {
+	caller, err := m.authz.Authorize(r, authz.CompleteMultipartUpload, t)
+	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
 
@@ -128,7 +138,14 @@ func (m *Module) completeMultipartUpload(ctx gas.Context, t s3api.Target, upload
 		}
 	}
 
-	info, err := m.storage.CompleteMultipartUpload(ctx, t.Bucket, t.Key, uploadID, parts, cond)
+	// Pinned after the document is read, so a slow body holds no lock, and
+	// to the generation evaluated; the upload must be of that generation too.
+	pinned, release, err := caller.Pin(ctx, t.Bucket)
+	if err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
+	defer release()
+	info, err := m.storage.CompleteMultipartUpload(pinned, t.Bucket, t.Key, uploadID, parts, cond)
 	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
@@ -138,11 +155,13 @@ func (m *Module) completeMultipartUpload(ctx gas.Context, t s3api.Target, upload
 }
 
 func (m *Module) abortMultipartUpload(ctx gas.Context, t s3api.Target) error {
-	if err := m.authz.Authorize(ctx.Request(), authz.AbortMultipartUpload, t); err != nil {
+	g, err := m.authz.AuthorizeAndPin(ctx, ctx.Request(), authz.AbortMultipartUpload, t)
+	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
+	defer g.Release()
 	uploadID := ctx.Request().URL.Query().Get("uploadId")
-	if err := m.storage.AbortMultipartUpload(ctx, t.Bucket, t.Key, uploadID); err != nil {
+	if err := m.storage.AbortMultipartUpload(g.Context(), t.Bucket, t.Key, uploadID); err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
 	return ctx.NoContent()
@@ -150,9 +169,11 @@ func (m *Module) abortMultipartUpload(ctx gas.Context, t s3api.Target) error {
 
 // listParts serves ListParts, paging by part-number-marker and max-parts.
 func (m *Module) listParts(ctx gas.Context, t s3api.Target) error {
-	if err := m.authz.Authorize(ctx.Request(), authz.ListParts, t); err != nil {
+	g, err := m.authz.AuthorizeAndPin(ctx, ctx.Request(), authz.ListParts, t)
+	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
+	defer g.Release()
 	q := ctx.Request().URL.Query()
 	uploadID := q.Get("uploadId")
 
@@ -166,7 +187,7 @@ func (m *Module) listParts(ctx gas.Context, t s3api.Target) error {
 		return s3api.WriteError(ctx, t, err)
 	}
 
-	parts, err := m.storage.ListParts(ctx, t.Bucket, t.Key, uploadID)
+	parts, err := m.storage.ListParts(g.Context(), t.Bucket, t.Key, uploadID)
 	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}

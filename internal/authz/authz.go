@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 
@@ -36,10 +37,12 @@ const defaultCacheSize = 1024
 // middleware never lets reach a handler.
 var errNoPrincipal = errors.New("authz: the request has no verified principal")
 
-// PolicySource reads the bucket policies requests are evaluated with:
-// contracts.StorageProvider's GetBucketPolicy.
+// PolicySource reads the bucket policies requests are evaluated with, and
+// pins the buckets an operation acts on to the generation evaluated:
+// contracts.StorageProvider's GetBucketPolicy and Pin.
 type PolicySource interface {
-	GetBucketPolicy(ctx context.Context, bucket string) ([]byte, error)
+	GetBucketPolicy(ctx context.Context, bucket string) (string, []byte, error)
+	Pin(ctx context.Context, refs ...contracts.BucketRef) (context.Context, func(), error)
 }
 
 // Authorizer evaluates requests against their principal's policies and
@@ -82,10 +85,13 @@ type Caller struct {
 	keys map[string][]string
 	// buckets are the bucket policies read for this request, by bucket,
 	// nil for a bucket that has none, so each is read once per request.
-	buckets   map[string]*policy.Policy
-	principal policy.Caller
-	policies  []*policy.Policy
-	root      bool
+	buckets map[string]*policy.Policy
+	// generations are the generations of the buckets read, by bucket, ""
+	// for a bucket that did not exist: the operation acts on these only.
+	generations map[string]string
+	principal   policy.Caller
+	policies    []*policy.Policy
+	root        bool
 }
 
 // Caller returns the caller of r, a request Verify passed. Its policies are
@@ -106,6 +112,7 @@ func (a *Authorizer) Caller(r *http.Request) (*Caller, error) {
 	if p.Root && p.AccountID == a.account {
 		return &Caller{
 			a: a, req: r, principal: policy.Caller{AccountID: p.AccountID, ARN: p.ARN}, root: true,
+			buckets: map[string]*policy.Policy{}, generations: map[string]string{},
 		}, nil
 	}
 	policies := make([]*policy.Policy, 0, len(p.Policies))
@@ -130,9 +137,10 @@ func (a *Authorizer) Caller(r *http.Request) (*Caller, error) {
 			UserID:       p.UserID,
 			Type:         policy.PrincipalType(p.Type),
 		},
-		policies: policies,
-		keys:     globalKeys(r, p, a.now()),
-		buckets:  map[string]*policy.Policy{},
+		policies:    policies,
+		keys:        globalKeys(r, p, a.now()),
+		buckets:     map[string]*policy.Policy{},
+		generations: map[string]string{},
 	}, nil
 }
 
@@ -143,12 +151,19 @@ func (c *Caller) InAccount() bool {
 }
 
 // Authorize is Caller(r) and its Authorize.
-func (a *Authorizer) Authorize(r *http.Request, op Operation, targets ...s3api.Target) error {
+func (a *Authorizer) Authorize(
+	r *http.Request,
+	op Operation,
+	targets ...s3api.Target,
+) (*Caller, error) {
 	c, err := a.Caller(r)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return c.Authorize(op, targets...)
+	if err = c.Authorize(op, targets...); err != nil {
+		return nil, err
+	}
+	return c, nil
 }
 
 // parse returns doc parsed as an identity-based policy, or a resource-based
@@ -208,7 +223,7 @@ func (c *Caller) Authorize(op Operation, targets ...s3api.Target) error {
 			return err
 		}
 	}
-	if err := c.checkExpectedOwner(op); err != nil {
+	if err := c.CheckExpectedOwner(op); err != nil {
 		return err
 	}
 	if c.root {
@@ -296,14 +311,11 @@ func operationKeys(op Operation, targets []s3api.Target) map[string]map[string]s
 // with s3:ListBucket on the bucket, and 403 AccessDenied to any other (the
 // GetObject and HeadObject API references, Permissions), so whether a key
 // exists is not revealed to a caller who could not list it. Any other err
-// is returned as is.
-func (a *Authorizer) NotFound(r *http.Request, bucket string, err error) error {
+// is returned as is. It is evaluated with the bucket policy the operation
+// was, without reading it again.
+func (c *Caller) NotFound(bucket string, err error) error {
 	if !errors.Is(err, storage.ErrObjectNotFound) {
 		return err
-	}
-	c, cErr := a.Caller(r)
-	if cErr != nil {
-		return cErr
 	}
 	if c.root {
 		return err
@@ -362,17 +374,26 @@ const resourceAccountKey = "s3:ResourceAccount"
 // evaluated is the one stored for the bucket the operation acts on. A
 // stored policy that no longer parses, or that cannot be read, fails the
 // request with an internal error: it is never evaluated as absent.
+//
+// The bucket's generation is recorded with it, and Pin pins the bucket to
+// it, so the operation acts on the bucket whose policy was evaluated, not
+// one deleted and created again under its name since. For the root
+// principal, which is not evaluated, only the generation is recorded.
 func (c *Caller) bucketPolicy(bucket string) (*policy.Policy, error) {
 	if p, ok := c.buckets[bucket]; ok {
 		return p, nil
 	}
-	doc, err := c.a.policies.GetBucketPolicy(c.req.Context(), bucket)
+	gen, doc, err := c.a.policies.GetBucketPolicy(c.req.Context(), bucket)
 	switch {
 	case errors.Is(err, storage.ErrBucketNotFound), errors.Is(err, contracts.ErrNoSuchBucketPolicy):
-		c.buckets[bucket] = nil
+		c.buckets[bucket], c.generations[bucket] = nil, gen
 		return nil, nil
 	case err != nil:
 		return nil, fmt.Errorf("authz: read the policy of bucket %s: %w", bucket, err)
+	}
+	if c.root {
+		c.buckets[bucket], c.generations[bucket] = nil, gen
+		return nil, nil
 	}
 	p, err := c.a.parse(doc, true)
 	if err != nil {
@@ -382,8 +403,42 @@ func (c *Caller) bucketPolicy(bucket string) (*policy.Policy, error) {
 			err,
 		)
 	}
-	c.buckets[bucket] = p
+	c.buckets[bucket], c.generations[bucket] = p, gen
 	return p, nil
+}
+
+// Ref returns bucket as of the generation this request read it in, reading
+// it now when it has not.
+func (c *Caller) Ref(bucket string) (contracts.BucketRef, error) {
+	if _, err := c.bucketPolicy(bucket); err != nil {
+		return contracts.BucketRef{}, err
+	}
+	return contracts.BucketRef{Name: bucket, Generation: c.generations[bucket]}, nil
+}
+
+// Pin pins buckets to the generations this request evaluated them in (see
+// contracts.StorageProvider's Pin), reading any it has not yet. The
+// returned context is the one to act on them with, and release must be
+// called when the operation is done. A bucket deleted, or deleted and
+// created again, since it was evaluated fails with
+// storage.ErrBucketNotFound, which S3 answers as NoSuchBucket.
+func (c *Caller) Pin(
+	ctx context.Context,
+	buckets ...string,
+) (pinned context.Context, release func(), err error) {
+	refs := make([]contracts.BucketRef, 0, len(buckets))
+	for _, b := range buckets {
+		ref, rErr := c.Ref(b)
+		if rErr != nil {
+			return nil, nil, rErr
+		}
+		refs = append(refs, ref)
+	}
+	pinned, release, err = c.a.policies.Pin(ctx, refs...)
+	if err != nil {
+		return nil, nil, err //nolint:wrapcheck // storage.ErrBucketNotFound, answered as NoSuchBucket
+	}
+	return pinned, release, nil
 }
 
 // The headers that name the account a request expects to own its bucket,
@@ -394,14 +449,14 @@ const (
 	expectedSourceOwnerHeader = "X-Amz-Source-Expected-Bucket-Owner"
 )
 
-// checkExpectedOwner refuses a request that expects its bucket, or
+// CheckExpectedOwner refuses a request that expects its bucket, or
 // CopyObject's source bucket, to belong to an account other than the
 // server's, which owns every bucket: "If the account ID that you provide
 // does not match the actual owner of the bucket, the request fails with the
 // HTTP status code 403 Forbidden (access denied)." It applies to every
 // caller, root included, and to every value of a repeated header.
 // ListBuckets and CreateBucket take no such header.
-func (c *Caller) checkExpectedOwner(op Operation) error {
+func (c *Caller) CheckExpectedOwner(op Operation) error {
 	if op == ListBuckets || op == CreateBucket {
 		return nil
 	}
@@ -506,4 +561,51 @@ func accessDenied(principal, action, resource, reason string) *s3api.Error {
 	}
 	return s3api.NewError(http.StatusForbidden, "AccessDenied",
 		"User: "+principal+" is not authorized to perform: "+action+on+" "+reason)
+}
+
+// Grant is an authorized operation whose buckets are pinned to the
+// generations it was evaluated in. Act on them with Context, and call
+// Release when the operation is done, its response body included.
+type Grant struct {
+	caller  *Caller
+	ctx     context.Context
+	release func()
+}
+
+// Context is the context pinned to the operation's buckets, which the
+// storage operations on them require.
+func (g *Grant) Context() context.Context { return g.ctx }
+
+// Release releases the operation's buckets.
+func (g *Grant) Release() { g.release() }
+
+// NotFound is the caller's NotFound.
+func (g *Grant) NotFound(bucket string, err error) error { return g.caller.NotFound(bucket, err) }
+
+// AuthorizeAndPin authorizes op on targets for r's caller, as Authorize
+// does, and pins the targets' buckets to the generations evaluated (see
+// Caller.Pin), so the operation acts on the buckets whose policies allowed
+// it. ctx is the context to derive the pinned one from.
+func (a *Authorizer) AuthorizeAndPin(
+	ctx context.Context,
+	r *http.Request,
+	op Operation,
+	targets ...s3api.Target,
+) (*Grant, error) {
+	//nolint:contextcheck // evaluation reads bucket policies with the request's context
+	c, err := a.Authorize(r, op, targets...)
+	if err != nil {
+		return nil, err
+	}
+	var buckets []string
+	for _, t := range targets {
+		if t.Bucket != "" && !slices.Contains(buckets, t.Bucket) {
+			buckets = append(buckets, t.Bucket)
+		}
+	}
+	pinned, release, err := c.Pin(ctx, buckets...)
+	if err != nil {
+		return nil, err
+	}
+	return &Grant{caller: c, ctx: pinned, release: release}, nil
 }
