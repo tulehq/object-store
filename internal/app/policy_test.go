@@ -7,6 +7,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 // The bucket policy API stores, returns and removes a bucket's policy with
@@ -115,4 +116,20 @@ func TestABucketCreatedAgainHasNoPolicy(t *testing.T) {
 	}
 	_, err := root.GetBucketPolicy(ctx, &s3.GetBucketPolicyInput{Bucket: name})
 	requireStatus(t, err, http.StatusNotFound, "NoSuchBucketPolicy")
+}
+
+// DeleteObjects with an expected owner other than the bucket's fails as a
+// whole with 403, rather than per key.
+func TestDeleteObjectsChecksTheExpectedOwnerOnce(t *testing.T) {
+	root, _ := startAuthzApp(t, &fakeIdentity{})
+	setup(t, root)
+	_, err := root.DeleteObjects(t.Context(), &s3.DeleteObjectsInput{
+		Bucket:              b,
+		ExpectedBucketOwner: aws.String("111111111111"),
+		Delete:              &s3types.Delete{Objects: []s3types.ObjectIdentifier{{Key: key}}},
+	})
+	requireStatus(t, err, http.StatusForbidden, "AccessDenied")
+	if _, err = root.HeadObject(t.Context(), &s3.HeadObjectInput{Bucket: b, Key: key}); err != nil {
+		t.Fatalf("the key was deleted: %v", err)
+	}
 }

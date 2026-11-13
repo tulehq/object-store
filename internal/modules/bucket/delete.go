@@ -36,6 +36,11 @@ func (m *Module) postBucket(ctx gas.Context) error {
 	if err != nil {
 		return s3api.WriteError(ctx, target, err)
 	}
+	// A mismatched expected owner fails the whole request with 403, not
+	// each key (the DeleteObjects API reference, ExpectedBucketOwner).
+	if err = caller.CheckExpectedOwner(authz.DeleteObjects); err != nil {
+		return s3api.WriteError(ctx, target, err)
+	}
 	req, err := m.readDeleteRequest(r)
 	if err != nil {
 		return s3api.WriteError(ctx, target, err)
