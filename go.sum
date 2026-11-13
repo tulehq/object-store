@@ -80,5 +80,5 @@ golang.org/x/sys v0.50.0 h1:dkKZEFTEKaLr1sjhs0WiKqoi8Jj5nHbS3Njmx1UoMJs=
 golang.org/x/sys v0.50.0/go.mod h1:hNLxWAXmnKAxqDtdwIYC4bM9oQPEecfsnNMuSxOs3og=
 golang.org/x/text v0.44.0 h1:YItdp/mQNGnsmrgpcdA5yQ3bnRxCfo/Tj/iByGW9GGo=
 golang.org/x/text v0.44.0/go.mod h1:S4FR1waQ9LbjQTls97SyRjDaUUVkaM+cXwwuG/G+MwY=
-tule.dev/sigv4 v0.1.0 h1:gnZLXhCmj1q73t5uTpRUdBL2XRjUuYBTCqsThw5inTs=
-tule.dev/sigv4 v0.1.0/go.mod h1:cyR3a41sjaH9yy97kZHLj8wCdlr89/76l6sO1n5yweo=
+tule.dev/sigv4 v0.2.0 h1:Vxmt2zIv5izqIJywHd3aDN7SMBPl1fZG87mPY/JM2Qo=
+tule.dev/sigv4 v0.2.0/go.mod h1:cyR3a41sjaH9yy97kZHLj8wCdlr89/76l6sO1n5yweo=

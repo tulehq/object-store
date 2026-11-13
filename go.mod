@@ -15,7 +15,7 @@ require (
 	github.com/go-chi/chi/v5 v5.5.1-0.20261018135022-9f8adb1aabaa
 	github.com/go-chi/cors v1.2.2
 	github.com/rs/zerolog v1.35.1
-	tule.dev/sigv4 v0.1.0
+	tule.dev/sigv4 v0.2.0
 )
 
 require (
