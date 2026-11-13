@@ -171,6 +171,8 @@ var sentinelErrors = []struct {
 	{storage.ErrInvalidKey, ErrInvalidArgument("The specified key is not valid. Keys must be " +
 		"1 to 1024 bytes of UTF-8 and must not end in a \".\" path segment.")},
 	{contracts.ErrPreconditionFailed, ErrPreconditionFailed()},
+	{contracts.ErrNoSuchBucketPolicy, NewError(http.StatusNotFound, "NoSuchBucketPolicy",
+		"The specified bucket does not have a bucket policy.")},
 }
 
 func toS3Error(err error) *Error {

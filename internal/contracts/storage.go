@@ -38,6 +38,10 @@ var (
 	// ErrPreconditionFailed is returned when a write's Precondition does not
 	// hold.
 	ErrPreconditionFailed = errors.New("storage: precondition failed")
+
+	// ErrNoSuchBucketPolicy is returned by GetBucketPolicy for a bucket that
+	// has no policy.
+	ErrNoSuchBucketPolicy = errors.New("storage: the bucket has no policy")
 )
 
 // MinPartSize is the smallest size S3 allows for every multipart part but the
@@ -87,6 +91,18 @@ type StorageProvider interface {
 	AbortMultipartUpload(ctx context.Context, bucket, key, uploadID string) error
 	ListParts(ctx context.Context, bucket, key, uploadID string) ([]PartInfo, error)
 	ListMultipartUploads(ctx context.Context, bucket string) ([]UploadInfo, error)
+
+	// GetBucketPolicy returns bucket's policy document as it was stored:
+	// storage.ErrBucketNotFound when there is no such bucket, and
+	// ErrNoSuchBucketPolicy when it has no policy. The bucket's existence
+	// and its policy are read together, so a policy is never returned for a
+	// bucket deleted, or deleted and created again, in between.
+	GetBucketPolicy(ctx context.Context, bucket string) ([]byte, error)
+	// PutBucketPolicy stores doc as bucket's policy, replacing any it had.
+	PutBucketPolicy(ctx context.Context, bucket string, doc []byte) error
+	// DeleteBucketPolicy removes bucket's policy. A bucket without one is
+	// not an error.
+	DeleteBucketPolicy(ctx context.Context, bucket string) error
 }
 
 // BucketInfo describes a bucket.

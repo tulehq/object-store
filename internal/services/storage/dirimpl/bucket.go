@@ -194,11 +194,15 @@ func (s *Service) HeadBucket(_ context.Context, bucket string) (*contracts.Bucke
 //
 // The bucket is created in the backend and given an index directory before
 // it is added to the registry, which is what makes it exist, so an
-// interrupted create is completed by the next one.
+// interrupted create is completed by the next one. A policy left by an
+// interrupted DeleteBucket of the same name is removed first, so the new
+// bucket has none.
 func (s *Service) CreateBucket(ctx context.Context, bucket string) (*contracts.BucketInfo, error) {
 	if !bucketNameRe.MatchString(bucket) || isReservedBucketName(bucket) {
 		return nil, contracts.ErrInvalidBucketName
 	}
+	s.bucketsMu.Lock()
+	defer s.bucketsMu.Unlock()
 	if _, err := s.HeadBucket(ctx, bucket); err == nil {
 		return nil, contracts.ErrBucketExists
 	} else if !errors.Is(err, storage.ErrBucketNotFound) {
@@ -210,6 +214,9 @@ func (s *Service) CreateBucket(ctx context.Context, bucket string) (*contracts.B
 	}
 	if err := s.root.MkdirAll(filepath.Join(indexDir, bucket), 0o750); err != nil {
 		return nil, fmt.Errorf("%s: failed to create bucket: %s: %w", s.Name(), bucket, err)
+	}
+	if err := s.removePolicy(bucket); err != nil {
+		return nil, err
 	}
 	if err := s.root.Mkdir(filepath.Join(bucketsDir, bucket), 0o750); err != nil {
 		if errors.Is(err, fs.ErrExist) {
@@ -225,7 +232,8 @@ func (s *Service) CreateBucket(ctx context.Context, bucket string) (*contracts.B
 // while the bucket holds objects.
 //
 // The bucket is left in the backend, empty. Creating the bucket again reuses
-// it.
+// it. Its policy is removed after it leaves the registry, under bucketsMu,
+// so no reader sees the bucket without its policy.
 func (s *Service) DeleteBucket(ctx context.Context, bucket string) error {
 	keys, err := s.bucketKeys(ctx, bucket)
 	if err != nil {
@@ -241,8 +249,13 @@ func (s *Service) DeleteBucket(ctx context.Context, bucket string) error {
 		}
 	}
 
+	s.bucketsMu.Lock()
+	defer s.bucketsMu.Unlock()
 	if err = s.root.Remove(filepath.Join(bucketsDir, bucket)); err != nil {
 		return fmt.Errorf("%s: failed to delete bucket: %s: %w", s.Name(), bucket, err)
+	}
+	if err = s.removePolicy(bucket); err != nil {
+		return err
 	}
 	if err = s.root.RemoveAll(filepath.Join(indexDir, bucket)); err != nil {
 		return fmt.Errorf("%s: failed to delete bucket index: %s: %w", s.Name(), bucket, err)

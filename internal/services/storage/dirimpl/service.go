@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 
 	"github.com/gasmod/gas"
 	"github.com/gasmod/gas/storage/dir"
@@ -29,6 +30,10 @@ type Service struct {
 	settings *Settings
 	root     *os.Root
 	locks    keyLocks
+	// bucketsMu orders the bucket registry's changes (creating and deleting
+	// a bucket) and its policies' changes against the reads of a policy,
+	// so a policy is read together with its bucket's existence.
+	bucketsMu sync.RWMutex
 }
 
 var (
