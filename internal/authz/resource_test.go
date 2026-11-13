@@ -357,7 +357,8 @@ func rootOf(account string) sigv4.Principal {
 }
 
 // Root and the Account type must agree: evaluation is skipped for one and
-// full identity access granted for the other.
+// full identity access granted for the other. Both principals are of the
+// server's own account, so the check runs before the root shortcut.
 func TestRootAndTheAccountTypeMustAgree(t *testing.T) {
 	a := newAuthorizer(nil)
 	notRoot := rootOf("000000000000")
