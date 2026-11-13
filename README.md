@@ -124,13 +124,23 @@ gets its own entry, `AccessDenied` with the message `Access Denied`, as the
 DeleteObjects API reference's example shows it.
 
 Each operation reads the bucket's policy once, together with the bucket's
-existence, so the policy evaluated is the one stored for the bucket acted
-on: a bucket deleted and created again has no policy, and a policy left by
-an interrupted delete is removed when the bucket is created again. A bucket
-policy that changes while a request is in flight may be evaluated in its
-previous version, as a tag value may on AWS. A stored policy that cannot be
-read or no longer parses fails every evaluated request on its bucket with
-`500 InternalError`; it is never treated as absent.
+generation, a token that is new each time a bucket is created, so a bucket
+deleted and created again under the same name is a different bucket. The
+operation then acts only on that generation: it holds the bucket from the
+moment it acts until it is done, and a bucket deleted, or deleted and
+created again, since it was evaluated is answered with `404 NoSuchBucket`.
+A grant in a deleted bucket's policy therefore never reaches the bucket
+created again under its name, and an upload started in the old bucket does
+not complete into, or list in, the new one. DeleteBucket waits for the
+operations that hold the bucket, such as an upload in progress. A
+PutBucketPolicy or CompleteMultipartUpload document is read before the
+bucket is held, so a slow body holds nothing. A bucket policy that changes
+while a request is in flight may be evaluated in its previous version, as a
+tag value may on AWS. A stored policy that cannot be read or no longer
+parses fails every evaluated request on its bucket with `500
+InternalError`; it is never treated as absent. A new bucket has no policy,
+and a policy left by an interrupted delete is removed when the bucket is
+created again.
 
 A GetObject, HeadObject or CopyObject whose object does not exist answers
 `404 NoSuchKey` only to a caller allowed `s3:ListBucket` on the bucket, and
@@ -148,7 +158,8 @@ cost of evaluating a resource grows with its length.
 An `x-amz-expected-bucket-owner` header (or CopyObject's
 `x-amz-source-expected-bucket-owner`) other than `TULE_Auth_AccountID` is
 refused with `403 AccessDenied` ("Access Denied"), for every caller and
-before evaluation: "If the account ID that you provide does not match the
+before evaluation, DeleteObjects included, which fails as a whole rather
+than per key: "If the account ID that you provide does not match the
 actual owner of the bucket, the request fails with the HTTP status code
 `403 Forbidden`" (the S3 API Reference). Every value of a repeated header
 is checked.
@@ -164,7 +175,10 @@ bucket's policy, of any kind (its ARN, its account, or `"*"`), and no
 account's buckets, as on S3: another account's principal allowed
 `s3:ListAllMyBuckets` gets an empty list. CreateBucket needs a bucket
 policy, which a bucket that does not exist yet has none of, so other
-accounts cannot create buckets here.
+accounts cannot create buckets here; one that names an existing bucket, if
+its policy allows it, is answered with `409 BucketAlreadyExists`, as S3
+answers a name another account owns, while the owner's account gets
+`409 BucketAlreadyOwnedByYou`.
 
 PutBucketPolicy, GetBucketPolicy and DeleteBucketPolicy answer another
 account's principal that both policies allow with `405 MethodNotAllowed`,
@@ -356,7 +370,14 @@ refused with `400 InvalidArgument`, which bounds the cost of evaluating it.
   `x-amz-source-expected-bucket-owner` were ignored; a value other than
   `TULE_Auth_AccountID` is now refused with `403 AccessDenied`.
 - **Behavior:** a principal whose `Root` flag and `Account` type disagree,
-  which identity never reports, fails with `500 InternalError`.
+  which identity never reports, fails with `500 InternalError`, in the
+  server's own account too.
+- **Behavior:** buckets have generations. A request whose bucket was
+  deleted, or deleted and created again, after it was authorized gets `404
+  NoSuchBucket`; DeleteBucket waits for operations in progress on the
+  bucket; a multipart upload does not survive its bucket being deleted and
+  created again. Buckets created by earlier versions keep working, under
+  one fixed generation.
 
 ## Health checks
 
