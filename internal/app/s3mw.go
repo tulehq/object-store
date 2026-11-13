@@ -16,7 +16,8 @@ import (
 
 // newVerifier returns the verifier for the one access key the server
 // accepts, configured for S3: presigned URLs, a streamed payload checked
-// against a hex hash as it is read, any other payload hash, the path encoded once, and failures
+// against a hex hash as it is read, UNSIGNED-PAYLOAD and STREAMING-*
+// payloads, the path encoded once, and failures
 // answered with S3's errors. The credential's region and service are not
 // checked, so a client may sign for any region.
 func newVerifier(accessKeyID, secretAccessKey string) (*sigv4.Verifier, error) {
@@ -32,7 +33,8 @@ func newVerifier(accessKeyID, secretAccessKey string) (*sigv4.Verifier, error) {
 		sigv4.WithPresignedURLs(true),
 		sigv4.WithS3PathEncoding(),
 		sigv4.WithStreamedPayload(),
-		sigv4.WithAnyPayloadHash(true),
+		sigv4.WithUnsignedPayload(true),
+		sigv4.WithStreamingPayload(true),
 		sigv4.WithRequiredSignedHeaders(),
 		sigv4.WithErrorMap(s3AuthError),
 	)
@@ -72,6 +74,10 @@ var s3AuthErrors = map[sigv4.Kind]struct{ header, query *s3api.Error }{
 	sigv4.KindExpiredSessionToken: {header: s3api.NewError(http.StatusBadRequest, "ExpiredToken",
 		"The provided token has expired.")},
 	sigv4.KindMissingPayloadHash: {header: s3api.ErrInvalidRequest("")},
+	// The error S3 answers an X-Amz-Content-Sha256 it does not recognize
+	// with.
+	sigv4.KindPayloadHashNotAccepted: {header: s3api.ErrInvalidArgument("x-amz-content-sha256 " +
+		"must be UNSIGNED-PAYLOAD, STREAMING-AWS4-HMAC-SHA256-PAYLOAD, or a valid sha256 value.")},
 	sigv4.KindPayloadHashMismatch: {header: s3api.NewError(http.StatusBadRequest,
 		"XAmzContentSHA256Mismatch", "")},
 	// S3 has no error for a body it cannot verify, since it accepts unsigned
