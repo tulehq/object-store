@@ -17,9 +17,9 @@ import (
 // newVerifier returns the verifier for the one access key the server
 // accepts, configured for S3: presigned URLs, a streamed payload checked
 // against a hex hash as it is read, UNSIGNED-PAYLOAD and STREAMING-*
-// payloads, the path encoded once, and failures
-// answered with S3's errors. The credential's region and service are not
-// checked, so a client may sign for any region.
+// payloads, the path encoded once, credentials scoped to s3, and failures
+// answered with S3's errors. The credential's region is not checked, so a
+// client may sign for any region.
 func newVerifier(accessKeyID, secretAccessKey string) (*sigv4.Verifier, error) {
 	keys, err := sigv4.NewStaticKey(sigv4.StaticKeyConfig{
 		AccessKeyID:     accessKeyID,
@@ -36,6 +36,7 @@ func newVerifier(accessKeyID, secretAccessKey string) (*sigv4.Verifier, error) {
 		sigv4.WithUnsignedPayload(true),
 		sigv4.WithStreamingPayload(true),
 		sigv4.WithRequiredSignedHeaders(),
+		sigv4.WithService("s3"),
 		sigv4.WithErrorMap(s3AuthError),
 	)
 	if err != nil {
@@ -57,6 +58,7 @@ var s3AuthErrors = map[sigv4.Kind]struct{ header, query *s3api.Error }{
 	sigv4.KindIncompleteAuth:         {header: malformedHeader, query: malformedQuery},
 	sigv4.KindMalformedCredential:    {header: malformedHeader, query: malformedQuery},
 	sigv4.KindCredentialDateMismatch: {header: malformedHeader, query: malformedQuery},
+	sigv4.KindWrongService:           {header: malformedHeader, query: malformedQuery},
 	sigv4.KindInvalidDate: {
 		header: s3api.NewError(http.StatusForbidden, "AccessDenied", ""), query: malformedQuery,
 	},
