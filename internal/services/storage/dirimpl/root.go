@@ -25,6 +25,10 @@ var (
 	// multipartDir is where in-progress multipart uploads are staged, one
 	// directory per upload ID.
 	multipartDir = filepath.Join(stateDir, "multipart")
+
+	// policiesDir holds the bucket policies, one file per bucket that has
+	// one, named after it.
+	policiesDir = filepath.Join(stateDir, "policies")
 )
 
 func (s *Service) openRoot() (*os.Root, error) {
@@ -35,7 +39,7 @@ func (s *Service) openRoot() (*os.Root, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to open storage root: %w", err)
 	}
-	for _, d := range []string{bucketsDir, indexDir, multipartDir} {
+	for _, d := range []string{bucketsDir, indexDir, multipartDir, policiesDir} {
 		if err = root.MkdirAll(d, 0o750); err != nil {
 			return nil, errors.Join(
 				fmt.Errorf("failed to create %s in storage root: %w", d, err), root.Close())
