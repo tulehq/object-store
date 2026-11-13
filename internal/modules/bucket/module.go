@@ -20,8 +20,9 @@ type Module struct {
 	router  *gas.Router
 	logger  gas.Logger
 	storage contracts.StorageProvider
-	// verifier reads the request documents an operation acts on, so their
-	// bytes are verified against the signature before they are decoded.
+	// verifier reads the signed request documents an operation acts on, so
+	// their bytes are verified against the signature before they are
+	// decoded.
 	verifier *sigv4.Verifier
 }
 

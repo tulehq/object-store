@@ -60,6 +60,12 @@ func ErrMalformedXML() *Error {
 	)
 }
 
+// ErrMaxMessageLengthExceeded is a 400 MaxMessageLengthExceeded error, for a
+// request document over its size limit.
+func ErrMaxMessageLengthExceeded() *Error {
+	return NewError(http.StatusBadRequest, "MaxMessageLengthExceeded", "Your request was too big.")
+}
+
 // ErrInvalidPartNumber is a 416 InvalidPartNumber error, for a GET or HEAD
 // of a part the object does not have.
 func ErrInvalidPartNumber() *Error {

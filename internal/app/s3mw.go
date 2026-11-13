@@ -88,8 +88,7 @@ var s3AuthErrors = map[sigv4.Kind]struct{ header, query *s3api.Error }{
 	sigv4.KindUnverifiedPayload: {header: s3api.ErrInvalidRequest("")},
 	// ReadBody reads the DeleteObjects and CompleteMultipartUpload
 	// documents, which S3 bounds with MaxMessageLengthExceeded.
-	sigv4.KindBodyTooLarge: {header: s3api.NewError(http.StatusBadRequest,
-		"MaxMessageLengthExceeded", "Your request was too big.")},
+	sigv4.KindBodyTooLarge: {header: s3api.ErrMaxMessageLengthExceeded()},
 	sigv4.KindRequestTimeTooSkewed: {header: s3api.NewError(http.StatusForbidden,
 		"RequestTimeTooSkewed",
 		"The difference between the request time and the current time is too large.")},
