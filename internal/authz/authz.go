@@ -91,7 +91,10 @@ type Caller struct {
 	generations map[string]string
 	principal   policy.Caller
 	policies    []*policy.Policy
-	root        bool
+	// unknown are the condition keys whose values could not be told, which
+	// policy.Authorize resolves against the caller.
+	unknown []string
+	root    bool
 }
 
 // Caller returns the caller of r, a request Verify passed. Its policies are
@@ -139,6 +142,7 @@ func (a *Authorizer) Caller(r *http.Request) (*Caller, error) {
 		},
 		policies:    policies,
 		keys:        globalKeys(r, p, a.now()),
+		unknown:     unknownKeys(p),
 		buckets:     map[string]*policy.Policy{},
 		generations: map[string]string{},
 	}, nil
@@ -354,6 +358,7 @@ func (c *Caller) evaluate(ch check, t s3api.Target, extra map[string]map[string]
 		ResourceAccount: owner,
 		Caller:          c.principal,
 		Context:         keys,
+		Unknown:         c.unknown,
 	}, bucketPolicy, c.policies...)
 	if az.Decision != policy.Allow {
 		return accessDenied(c.principal.ARN, ch.action, resource, az.Reason.Message(ch.action))

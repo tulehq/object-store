@@ -114,7 +114,11 @@ func (k serviceKey) appliesTo(action string) bool {
 // check that, so a caller could pick it. aws:SourceIp is the TCP peer's
 // address, never X-Forwarded-For, which any client can set.
 // aws:PrincipalTag/<key> is each of the principal's tags, as identity
-// reports them: an IAM user's, or a session's role's.
+// reports them: an IAM user's, or a session's role's. aws:PrincipalOrgID
+// and aws:PrincipalOrgPaths are the organization identity reports the
+// principal's account in, and are left out for one in no organization, as
+// AWS leaves them out; when identity could not tell, they are unknown
+// instead (see unknownKeys).
 func globalKeys(r *http.Request, p sigv4.Principal, now time.Time) map[string][]string {
 	keys := map[string][]string{
 		"aws:CurrentTime":     {now.UTC().Format(time.RFC3339)},
@@ -128,7 +132,31 @@ func globalKeys(r *http.Request, p sigv4.Principal, now time.Time) map[string][]
 	for k, v := range p.Tags {
 		keys[principalTagPrefix+k] = []string{v}
 	}
+	if p.OrgID != "" {
+		keys[orgIDKey] = []string{p.OrgID}
+		keys[orgPathsKey] = slices.Clone(p.OrgPaths)
+	}
 	return keys
+}
+
+// The organization condition keys.
+const (
+	orgIDKey    = "aws:PrincipalOrgID"
+	orgPathsKey = "aws:PrincipalOrgPaths"
+)
+
+// unknownKeys are the condition keys whose values identity could not tell
+// for p: both organization keys when it could not ask the accounts service
+// (p.OrgUnknown). They are passed to policy.Authorize as unknown, never left
+// out: an absent key satisfies a negated operator, so StringNotEquals on
+// aws:PrincipalOrgID would grant, or let a Deny lapse, for a principal whose
+// organization is not known. An unknown key never helps an Allow apply and
+// always lets a Deny apply.
+func unknownKeys(p sigv4.Principal) []string {
+	if p.OrgUnknown {
+		return []string{orgIDKey, orgPathsKey}
+	}
+	return nil
 }
 
 // principalTagPrefix is the prefix of the aws:PrincipalTag/<key> keys.

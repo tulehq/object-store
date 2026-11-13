@@ -47,7 +47,7 @@ Settings come from environment variables prefixed with `TULE_`, and from a
 | `TULE_Auth_AccessKeyID` | required | The access key clients sign requests with |
 | `TULE_Auth_SecretAccessKey` | required | Its secret |
 | `TULE_Auth_AccountID` | `000000000000` | The account the configured key and the buckets belong to: identity's management account (`TULE_Identity_AccountID`), 12 digits. Principals of other accounts need a bucket policy granting them ([below](#cross-account-access)) |
-| `TULE_Auth_IdentityEndpoint` | unset | The [identity](https://github.com/tulehq/identity) service's base URL, such as `http://localhost:9030`, to also accept the keys it issues and enforce their IAM policies and bucket policies ([below](#permissions)). Must be an absolute `http` or `https` URL; needs identity v0.4.0 or later |
+| `TULE_Auth_IdentityEndpoint` | unset | The [identity](https://github.com/tulehq/identity) service's base URL, such as `http://localhost:9030`, to also accept the keys it issues and enforce their IAM policies and bucket policies ([below](#permissions)). Must be an absolute `http` or `https` URL; needs identity v0.5.0 or later |
 | `TULE_GasEnv` | | `development` logs at trace level, `testing` disables logging |
 
 The server refuses to start without credentials, and every request must be
@@ -283,10 +283,25 @@ checked, so it is not trusted for this), and the principal's own keys as
 identity reports them: `aws:PrincipalArn` (a user's ARN with its path, a
 session's role's ARN with the role's path, absent for a session whose role
 was deleted, which is refused), `aws:userid`, `aws:PrincipalType`,
-`aws:PrincipalAccount`, for IAM users `aws:username`, and
+`aws:PrincipalAccount`, for IAM users `aws:username`,
 `aws:PrincipalTag/<key>` for each tag of an IAM user or of a session's role
-(identity issues no session tags). They also fill policy variables such as
+(identity issues no session tags), and `aws:PrincipalOrgID` and
+`aws:PrincipalOrgPaths` (below). They also fill policy variables such as
 `${aws:username}`.
+
+`aws:PrincipalOrgID` (the organization's ID, `o-...`) and
+`aws:PrincipalOrgPaths` (one path, `o-.../r-.../ou-.../`, down to the
+account's parent) are supplied as identity's signing-key endpoint reports
+them: for a principal whose account is an `ACTIVE` member of the
+organization the accounts service reports, or its management account, and
+left out otherwise, as AWS leaves them out for an account in no
+organization. Identity keeps them for 30 seconds, so an account moved,
+removed or closed keeps its old keys for up to that long. When identity
+could not ask the accounts service, both are evaluated as unknown, with
+tule.dev/policy's unknown keys, never as absent: a condition on them never
+helps an `Allow` apply and always lets a `Deny` apply, so `StringNotEquals`
+on `aws:PrincipalOrgID` neither grants nor lets a `Deny` lapse. A request
+whose policies do not test them is decided as usual.
 
 S3 keys, each for the actions the reference lists it for and only when the
 request carries a value: `s3:prefix`, `s3:delimiter` and `s3:max-keys`
@@ -324,12 +339,6 @@ refused with `400 InvalidArgument`, which bounds the cost of evaluating it.
   same name does not inherit the grant. Here policies match by ARN, so a
   recreated principal does inherit it, until identity can resolve unique IDs
   for the services. A session whose role was deleted is refused.
-- `aws:PrincipalOrgID` and `aws:PrincipalOrgPaths` are not supplied
-  (identity does not carry the organization). A positive condition on them
-  never holds, and a negated one (`StringNotEquals` and the like) always
-  does, so a `Deny` written with a negated operator on them, such as one
-  refusing principals outside the organization, denies every evaluated
-  principal.
 - Service principals (`{"Service": ...}`), `CanonicalUser` and
   federated-user principals are accepted in a bucket policy but match no
   caller.
@@ -364,6 +373,15 @@ refused with `400 InvalidArgument`, which bounds the cost of evaluating it.
   exists; S3's order is not documented either.
 
 ### Changes in this version
+
+- **Breaking:** `TULE_Auth_IdentityEndpoint` needs identity v0.5.0 or later,
+  whose signing-key endpoint reports the organization keys (version 4); an
+  older identity fails every request it verifies with `500`.
+- **Behavior:** `aws:PrincipalOrgID` and `aws:PrincipalOrgPaths` are
+  supplied. A negated condition on them, which held for every principal
+  when they were not supplied, now holds only outside the organization.
+
+### Changes in v0.7.0
 
 - **Breaking:** `TULE_Auth_IdentityEndpoint` needs identity v0.4.0 or later,
   whose signing-key endpoint reports the principal attributes (version 3);
