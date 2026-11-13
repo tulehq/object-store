@@ -9,6 +9,7 @@ import (
 
 	"github.com/gasmod/gas"
 
+	"tule.dev/object-store/internal/authz"
 	"tule.dev/object-store/internal/contracts"
 	"tule.dev/object-store/internal/s3api"
 )
@@ -46,6 +47,10 @@ func (m *Module) postObject(ctx gas.Context) error {
 }
 
 func (m *Module) createMultipartUpload(ctx gas.Context, t s3api.Target) error {
+	if err := m.authz.Authorize(ctx.Request(), authz.CreateMultipartUpload, t); err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
+
 	id, err := m.storage.CreateMultipartUpload(ctx, t.Bucket, t.Key, putInput(ctx.Request()))
 	if err != nil {
 		return s3api.WriteError(ctx, t, err)
@@ -59,6 +64,9 @@ func (m *Module) uploadPart(ctx gas.Context, t s3api.Target) error {
 
 	if r.Header.Get("X-Amz-Copy-Source") != "" {
 		return s3api.WriteError(ctx, t, s3api.ErrNotImplemented("UploadPartCopy is not supported."))
+	}
+	if err := m.authz.Authorize(r, authz.UploadPart, t); err != nil {
+		return s3api.WriteError(ctx, t, err)
 	}
 
 	uploadID := r.URL.Query().Get("uploadId")
@@ -92,6 +100,9 @@ func (m *Module) uploadPart(ctx gas.Context, t s3api.Target) error {
 
 func (m *Module) completeMultipartUpload(ctx gas.Context, t s3api.Target, uploadID string) error {
 	r := ctx.Request()
+	if err := m.authz.Authorize(r, authz.CompleteMultipartUpload, t); err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
 
 	cond, err := precondition(r)
 	if err != nil {
@@ -127,6 +138,9 @@ func (m *Module) completeMultipartUpload(ctx gas.Context, t s3api.Target, upload
 }
 
 func (m *Module) abortMultipartUpload(ctx gas.Context, t s3api.Target) error {
+	if err := m.authz.Authorize(ctx.Request(), authz.AbortMultipartUpload, t); err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
 	uploadID := ctx.Request().URL.Query().Get("uploadId")
 	if err := m.storage.AbortMultipartUpload(ctx, t.Bucket, t.Key, uploadID); err != nil {
 		return s3api.WriteError(ctx, t, err)
@@ -136,6 +150,9 @@ func (m *Module) abortMultipartUpload(ctx gas.Context, t s3api.Target) error {
 
 // listParts serves ListParts, paging by part-number-marker and max-parts.
 func (m *Module) listParts(ctx gas.Context, t s3api.Target) error {
+	if err := m.authz.Authorize(ctx.Request(), authz.ListParts, t); err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
 	q := ctx.Request().URL.Query()
 	uploadID := q.Get("uploadId")
 

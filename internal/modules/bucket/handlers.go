@@ -8,6 +8,7 @@ import (
 
 	"github.com/gasmod/gas"
 
+	"tule.dev/object-store/internal/authz"
 	"tule.dev/object-store/internal/contracts"
 	"tule.dev/object-store/internal/s3api"
 )
@@ -18,6 +19,10 @@ const (
 )
 
 func (m *Module) listBuckets(ctx gas.Context) error {
+	if err := m.authz.Authorize(ctx.Request(), authz.ListBuckets, s3api.Target{}); err != nil {
+		return s3api.WriteError(ctx, s3api.Target{}, err)
+	}
+
 	buckets, err := m.storage.ListBuckets(ctx)
 	if err != nil {
 		return s3api.WriteError(ctx, s3api.Target{}, err)
@@ -44,15 +49,7 @@ func (m *Module) getBucket(ctx gas.Context) error {
 
 	switch sub := s3api.Subresource(r); sub {
 	case "location", "versioning":
-		if _, err := m.storage.HeadBucket(ctx, bucket); err != nil {
-			return s3api.WriteError(ctx, target, err)
-		}
-		if sub == "location" {
-			// Every bucket here is in us-east-1, which S3 reports as an empty
-			// constraint.
-			return ctx.XML(http.StatusOK, s3api.NewLocationConstraint(""))
-		}
-		return ctx.XML(http.StatusOK, s3api.NewVersioningConfiguration())
+		return m.getBucketConfig(ctx, sub)
 	case "uploads":
 		return m.listMultipartUploads(ctx)
 	case "":
@@ -60,10 +57,38 @@ func (m *Module) getBucket(ctx gas.Context) error {
 		return s3api.WriteError(ctx, target, s3api.CheckSubresource(r))
 	}
 
+	op, list := authz.ListObjects, m.listObjectsV1
 	if ctx.Query("list-type") == "2" {
-		return m.listObjectsV2(ctx)
+		op, list = authz.ListObjectsV2, m.listObjectsV2
 	}
-	return m.listObjectsV1(ctx)
+	if err := m.authz.Authorize(r, op, target); err != nil {
+		return s3api.WriteError(ctx, target, err)
+	}
+	return list(ctx)
+}
+
+// getBucketConfig serves GetBucketLocation (sub "location") and
+// GetBucketVersioning (sub "versioning").
+func (m *Module) getBucketConfig(ctx gas.Context, sub string) error {
+	bucket := ctx.Param("bucket")
+	target := s3api.Target{Bucket: bucket}
+
+	op := authz.GetBucketVersioning
+	if sub == "location" {
+		op = authz.GetBucketLocation
+	}
+	if err := m.authz.Authorize(ctx.Request(), op, target); err != nil {
+		return s3api.WriteError(ctx, target, err)
+	}
+	if _, err := m.storage.HeadBucket(ctx, bucket); err != nil {
+		return s3api.WriteError(ctx, target, err)
+	}
+	if sub == "location" {
+		// Every bucket here is in us-east-1, which S3 reports as an empty
+		// constraint.
+		return ctx.XML(http.StatusOK, s3api.NewLocationConstraint(""))
+	}
+	return ctx.XML(http.StatusOK, s3api.NewVersioningConfiguration())
 }
 
 // listObjectsV2 serves ListObjectsV2. Continuation tokens are the base64 of the
@@ -249,6 +274,10 @@ func (m *Module) headBucket(ctx gas.Context) error {
 	if err := s3api.CheckSubresource(ctx.Request()); err != nil {
 		return s3api.WriteError(ctx, s3api.Target{Bucket: bucket}, err)
 	}
+	if err := m.authz.Authorize(ctx.Request(), authz.HeadBucket,
+		s3api.Target{Bucket: bucket}); err != nil {
+		return s3api.WriteError(ctx, s3api.Target{Bucket: bucket}, err)
+	}
 
 	if _, err := m.storage.HeadBucket(ctx, bucket); err != nil {
 		return s3api.WriteError(ctx, s3api.Target{Bucket: bucket}, err)
@@ -262,6 +291,10 @@ func (m *Module) putBucket(ctx gas.Context) error {
 	bucket := ctx.Param("bucket")
 
 	if err := s3api.CheckSubresource(ctx.Request()); err != nil {
+		return s3api.WriteError(ctx, s3api.Target{Bucket: bucket}, err)
+	}
+	if err := m.authz.Authorize(ctx.Request(), authz.CreateBucket,
+		s3api.Target{Bucket: bucket}); err != nil {
 		return s3api.WriteError(ctx, s3api.Target{Bucket: bucket}, err)
 	}
 
@@ -278,6 +311,10 @@ func (m *Module) deleteBucket(ctx gas.Context) error {
 	bucket := ctx.Param("bucket")
 
 	if err := s3api.CheckSubresource(ctx.Request()); err != nil {
+		return s3api.WriteError(ctx, s3api.Target{Bucket: bucket}, err)
+	}
+	if err := m.authz.Authorize(ctx.Request(), authz.DeleteBucket,
+		s3api.Target{Bucket: bucket}); err != nil {
 		return s3api.WriteError(ctx, s3api.Target{Bucket: bucket}, err)
 	}
 

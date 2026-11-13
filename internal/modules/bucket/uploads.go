@@ -6,6 +6,7 @@ import (
 
 	"github.com/gasmod/gas"
 
+	"tule.dev/object-store/internal/authz"
 	"tule.dev/object-store/internal/contracts"
 	"tule.dev/object-store/internal/s3api"
 )
@@ -16,6 +17,10 @@ import (
 func (m *Module) listMultipartUploads(ctx gas.Context) error {
 	bucket := ctx.Param("bucket")
 	target := s3api.Target{Bucket: bucket}
+
+	if err := m.authz.Authorize(ctx.Request(), authz.ListMultipartUploads, target); err != nil {
+		return s3api.WriteError(ctx, target, err)
+	}
 
 	q, err := parseUploadsQuery(ctx)
 	if err != nil {

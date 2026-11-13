@@ -1,6 +1,7 @@
 package object
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -8,7 +9,9 @@ import (
 	"strings"
 
 	"github.com/gasmod/gas"
+	"github.com/gasmod/gas/storage"
 
+	"tule.dev/object-store/internal/authz"
 	"tule.dev/object-store/internal/contracts"
 	"tule.dev/object-store/internal/s3api"
 )
@@ -39,10 +42,13 @@ func (m *Module) getObject(ctx gas.Context) error {
 	if err := s3api.CheckSubresource(r, "partNumber"); err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
+	if err := m.authz.Authorize(r, authz.GetObject, t); err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
 
 	obj, err := m.storage.GetObject(ctx, t.Bucket, t.Key)
 	if err != nil {
-		return s3api.WriteError(ctx, t, err)
+		return s3api.WriteError(ctx, t, m.authz.NotFound(r, t.Bucket, err))
 	}
 	defer func() {
 		if cErr := obj.Body.Close(); cErr != nil {
@@ -76,10 +82,14 @@ func (m *Module) headObject(ctx gas.Context) error {
 	if err := s3api.CheckSubresource(r, "partNumber"); err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
+	if err := m.authz.Authorize(r, authz.HeadObject, t); err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
 
 	info, err := m.storage.StatObject(ctx, t.Bucket, t.Key)
 	if err != nil {
-		return s3api.WriteError(ctx, t, err)
+		// A HEAD's error has no body; the status alone tells 403 from 404.
+		return s3api.WriteError(ctx, t, m.authz.NotFound(r, t.Bucket, err))
 	}
 
 	w := ctx.ResponseWriter()
@@ -143,6 +153,15 @@ func (m *Module) putObject(ctx gas.Context) error {
 	if r.Header.Get("X-Amz-Copy-Source") != "" {
 		return m.copyObject(ctx, t)
 	}
+	return m.uploadObject(ctx, t)
+}
+
+// uploadObject serves PutObject.
+func (m *Module) uploadObject(ctx gas.Context, t s3api.Target) error {
+	r := ctx.Request()
+	if err := m.authz.Authorize(r, authz.PutObject, t); err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
 
 	cond, err := precondition(r)
 	if err != nil {
@@ -171,13 +190,34 @@ func (m *Module) copyObject(ctx gas.Context, t s3api.Target) error {
 	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
-
-	info, err := m.storage.CopyObject(ctx, in)
-	if err != nil {
+	// s3:PutObject on the destination, then s3:GetObject on the source.
+	if err = m.authz.Authorize(ctx.Request(), authz.CopyObject, t,
+		s3api.Target{Bucket: in.SrcBucket, Key: in.SrcKey}); err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
 
+	info, err := m.storage.CopyObject(ctx, in)
+	if err != nil {
+		return s3api.WriteError(ctx, t, m.copyNotFound(ctx, in, err))
+	}
+
 	return ctx.XML(http.StatusOK, s3api.NewCopyObjectResult(info.ETag, info.LastModified))
+}
+
+// copyNotFound is the error for a CopyObject that failed with err. A copy
+// finds no object either reading its source or, under If-Match, at its
+// destination; the source is checked again to tell which bucket's
+// s3:ListBucket decides between NoSuchKey and AccessDenied.
+func (m *Module) copyNotFound(ctx gas.Context, in contracts.CopyObjectInput, err error) error {
+	if !errors.Is(err, storage.ErrObjectNotFound) {
+		return err
+	}
+	bucket := in.DstBucket
+	if _, sErr := m.storage.StatObject(ctx, in.SrcBucket, in.SrcKey); errors.Is(sErr,
+		storage.ErrObjectNotFound) {
+		bucket = in.SrcBucket
+	}
+	return m.authz.NotFound(ctx.Request(), bucket, err)
 }
 
 // precondition reads the If-Match and If-None-Match headers of a write. S3
@@ -234,6 +274,9 @@ func (m *Module) deleteObject(ctx gas.Context) error {
 	}
 
 	if err := s3api.CheckSubresource(r); err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
+	if err := m.authz.Authorize(r, authz.DeleteObject, t); err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
 

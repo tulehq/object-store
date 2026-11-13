@@ -35,6 +35,7 @@ func newVerifier(auth *authSettings) (*sigv4.Verifier, error) {
 	root, err := sigv4.NewStaticKey(sigv4.StaticKeyConfig{
 		AccessKeyID:     auth.AccessKeyID,
 		SecretAccessKey: auth.SecretAccessKey,
+		AccountID:       auth.AccountID,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("app: failed to create the signing key: %w", err)
