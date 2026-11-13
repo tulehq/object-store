@@ -27,8 +27,27 @@ jobs:
       - name: Unit tests
         run: make test
 
+      # The cross-service end-to-end tests build and run the identity and
+      # accounts services from their source. They run against the siblings'
+      # released versions; move these pins when identity or accounts
+      # releases.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: tulehq/identity
+          ref: v0.1.0
+          path: identity
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: tulehq/accounts
+          ref: v0.1.1
+          path: accounts
+
       - name: End-to-end tests
         run: make test-e2e
+        env:
+          TULE_E2E_IDENTITY_DIR: ${{ github.workspace }}/identity
+          TULE_E2E_ACCOUNTS_DIR: ${{ github.workspace }}/accounts
 
   smoke:
     # The tests run the app in-process; this runs the image as users do.

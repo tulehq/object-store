@@ -215,6 +215,13 @@ make smoke      # build the image, run it, and check it serves signed requests
 make push VERSION=0.1.0   # build for amd64 and arm64 and push
 ```
 
+The end-to-end tests include cross-service tests that build and run the
+[identity](https://github.com/tulehq/identity) and
+[accounts](https://github.com/tulehq/accounts) services from their source,
+by default from checkouts beside this one (`../identity` and `../accounts`).
+`TULE_E2E_IDENTITY_DIR` and `TULE_E2E_ACCOUNTS_DIR` point them at checkouts
+elsewhere. A missing checkout fails the tests; they are never skipped.
+
 ## License
 
 [MIT](LICENSE)
