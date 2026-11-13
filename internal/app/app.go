@@ -28,7 +28,7 @@ func New(cfg *Config, extra ...gas.Option) (*gas.App, error) {
 	if lErr != nil {
 		return nil, lErr
 	}
-	verifier, vErr := newVerifier(cfg.Auth.AccessKeyID, cfg.Auth.SecretAccessKey)
+	verifier, vErr := newVerifier(cfg.Auth)
 	if vErr != nil {
 		return nil, vErr
 	}

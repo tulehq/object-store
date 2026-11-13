@@ -46,12 +46,25 @@ Settings come from environment variables prefixed with `TULE_`, and from a
 | `TULE_Server_Domain` | `localhost` | Enables virtual-hosted-style requests to `<bucket>.<domain>` |
 | `TULE_Auth_AccessKeyID` | required | The access key clients sign requests with |
 | `TULE_Auth_SecretAccessKey` | required | Its secret |
+| `TULE_Auth_IdentityEndpoint` | unset | The [identity](https://github.com/tulehq/identity) service's base URL, such as `http://localhost:9030`, to also accept the keys it issues. Must be an absolute `http` or `https` URL |
 | `TULE_GasEnv` | | `development` logs at trace level, `testing` disables logging |
 
 The server refuses to start without credentials, and every request must be
 signed with them (SigV4) or carry a presigned URL made with them. Any web page
 you visit can send requests to a server on localhost; signatures are what stop
 it from using this one.
+
+Those two settings are all it needs: it runs on its own, with no IAM,
+organizations or permissions. To also accept the access keys and STS
+session credentials of the identity service, set
+`TULE_Auth_IdentityEndpoint`. The configured key must then be identity's root
+key, since the server authenticates to identity's signing-key endpoint with
+it. The root key is still checked locally first. Any other key is looked up
+in identity on every request, so a key made inactive or deleted there is
+refused on the next one with `403 InvalidAccessKeyId`. A lookup that fails,
+such as identity being unreachable or not answering within 10 seconds, fails
+the request with `500 InternalError`; it is never treated as an unknown key
+or as a valid one.
 
 ## Health checks
 
@@ -153,9 +166,8 @@ any origin, and response headers such as `ETag` are exposed.
   (`STREAMING-AWS4-*`) is refused with `400 InvalidRequest`. A body is
   decoded as aws-chunked only under a `STREAMING-*` `x-amz-content-sha256`;
   `Content-Encoding: aws-chunked` with any other value is refused with `400
-  InvalidRequest`. There is one access key, with access to everything. As
-  on S3, a request is refused when it carries an `x-amz-*` header it did not
-  sign (`403 AccessDenied`), when its
+  InvalidRequest`. As on S3, a request is refused when it carries an
+  `x-amz-*` header it did not sign (`403 AccessDenied`), when its
   `SignedHeaders` are not lowercase, sorted and unique, when it is signed for
   a service other than `s3`, when its `x-amz-content-sha256` is not a hex
   SHA-256, `UNSIGNED-PAYLOAD` or `STREAMING-*` (`400 InvalidArgument`), and
@@ -164,13 +176,22 @@ any origin, and response headers such as `ETag` are exposed.
   `Host`. Unlike S3:
   - the credential's region is not checked, so clients may sign for any
     region;
-  - any session token is refused with `400 InvalidToken`, since there are no
-    temporary credentials;
+  - the configured key is a long-term one, so a request carrying a session
+    token on it is refused with `400 InvalidToken`. Without
+    `TULE_Auth_IdentityEndpoint`, a session token on any other key ID gets
+    `403 InvalidAccessKeyId`, as that key is unknown. With it, identity's
+    session credentials are accepted, and a token that is not the session's
+    is refused with `400 InvalidToken` and an expired one with `400
+    ExpiredToken`;
   - a DeleteObjects or CompleteMultipartUpload document over 2 MiB is
     refused with `400 MaxMessageLengthExceeded`. One signed with a hex
     `x-amz-content-sha256` is verified before it is acted on; one sent as
     `UNSIGNED-PAYLOAD` or `STREAMING-UNSIGNED-PAYLOAD-TRAILER` is read as
     sent, as on S3.
+- **Every key shares all the data.** The root key and every key from
+  identity, whichever account it belongs to, see and change the same buckets
+  and objects. There is no per-account isolation, and no permissions or
+  policies: an accepted key may do everything.
 - **Presigned DeleteObjects and CompleteMultipartUpload URLs sign no body**,
   as on S3. Whoever holds such a URL chooses the document it sends, so the
   URL is a bearer grant over every key in the bucket for that operation:

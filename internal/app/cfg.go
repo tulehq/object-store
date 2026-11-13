@@ -30,11 +30,15 @@ type hstsSettings struct {
 	MaxAge time.Duration
 }
 
-// authSettings holds the one access key the server accepts. Every request
-// must be SigV4-signed with it, so both fields are required.
+// authSettings holds the root access key the server accepts. Every request
+// must be SigV4-signed with it, so both fields are required, or, when
+// IdentityEndpoint is set, with a key the identity service at that base URL
+// issued. The server authenticates to identity with the root key, which must
+// then be identity's root key too.
 type authSettings struct {
-	AccessKeyID     string
-	SecretAccessKey string
+	AccessKeyID      string
+	SecretAccessKey  string
+	IdentityEndpoint string `validate:"omitempty,http_url"`
 }
 
 // errNoCredentials is returned when the access key is not configured.

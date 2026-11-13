@@ -43,3 +43,30 @@ func TestLoadConfigRequiresCredentials(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadConfigValidatesTheIdentityEndpoint(t *testing.T) {
+	tests := []struct {
+		name, endpoint string
+		wantErr        bool
+	}{
+		{name: "unset"},
+		{name: "http", endpoint: "http://localhost:9030"},
+		{name: "https", endpoint: "https://identity.example.com/"},
+		{name: "no scheme", endpoint: "localhost:9030", wantErr: true},
+		{name: "another scheme", endpoint: "ftp://localhost:9030", wantErr: true},
+		{name: "no host", endpoint: "http://", wantErr: true},
+		{name: "relative", endpoint: "/identity", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.endpoint != "" {
+				t.Setenv("TULE_Auth_IdentityEndpoint", tt.endpoint)
+			}
+			err := loadEnvConfig(t, "AKID", "secret")
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("got %v, want an error: %v", err, tt.wantErr)
+			}
+		})
+	}
+}
