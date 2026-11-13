@@ -578,3 +578,69 @@ func TestUnsignedDocuments(t *testing.T) {
 	requireEqual(t, status, http.StatusOK, "unsigned complete multipart upload")
 	requireBody(t, c, "docs", "mp", "the part")
 }
+
+// TestSignedChunkDocuments checks that DeleteObjects and
+// CompleteMultipartUpload documents sent with signed chunks are refused
+// before they are acted on, since chunk signatures are not verified.
+func TestSignedChunkDocuments(t *testing.T) {
+	srv := startServer(t, false, nil)
+	c := clientFor(srv)
+	createBucket(t, c, "docs")
+	put(t, c, "docs", "k", []byte("v"))
+	up := startUpload(t, c, "docs", "mp")
+	part := up.part(1, []byte("the part"))
+
+	const streaming = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+	post := func(path, doc string) {
+		t.Helper()
+		chunked := strconv.FormatInt(int64(len(doc)), 16) + ";chunk-signature=" +
+			strings.Repeat("a", 64) + "\r\n" + doc + "\r\n0;chunk-signature=" +
+			strings.Repeat("a", 64) + "\r\n\r\n"
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
+			srv.URL+path, strings.NewReader(chunked))
+		requireNoErr(t, err, "build request")
+		req.Header.Set("X-Amz-Content-Sha256", streaming)
+		req.Header.Set("Content-Encoding", "aws-chunked")
+		req.Header.Set("X-Amz-Decoded-Content-Length", strconv.Itoa(len(doc)))
+		err = v4.NewSigner().SignHTTP(context.Background(), testCreds, req, streaming, "s3",
+			"us-east-1", time.Now())
+		requireNoErr(t, err, "sign request")
+		status, e := send(t, srv.Client(), req)
+		requireS3Error(t, status, e, http.StatusBadRequest, "InvalidRequest",
+			"The signed streaming chunks of a request document are not verified; send it "+
+				"with a hex x-amz-content-sha256 or UNSIGNED-PAYLOAD.")
+	}
+
+	post("/docs?delete", `<Delete><Object><Key>k</Key></Object></Delete>`)
+	requireBody(t, c, "docs", "k", "v")
+
+	post("/docs/mp?uploadId="+aws.ToString(up.id),
+		"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"+
+			aws.ToString(part.ETag)+"</ETag></Part></CompleteMultipartUpload>")
+	requireAbsent(t, c, "docs", "mp")
+	_, err := up.complete(part)
+	requireNoErr(t, err, "complete after the refused attempt")
+}
+
+// TestPresignedDeleteObjects checks that a presigned DeleteObjects URL,
+// which declares no payload hash, has its document read as unsigned.
+func TestPresignedDeleteObjects(t *testing.T) {
+	srv := startServer(t, false, nil)
+	c := clientFor(srv)
+	createBucket(t, c, "docs")
+	put(t, c, "docs", "presigned", []byte("v"))
+	del := `<Delete><Object><Key>presigned</Key></Object></Delete>`
+	pre, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
+		srv.URL+"/docs?delete&X-Amz-Expires=900", nil)
+	requireNoErr(t, err, "build presigned delete")
+	u, _, err := v4.NewSigner().PresignHTTP(context.Background(), testCreds, pre,
+		"UNSIGNED-PAYLOAD", "s3", "us-east-1", time.Now())
+	requireNoErr(t, err, "presign delete")
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, u,
+		strings.NewReader(del))
+	requireNoErr(t, err, "build presigned delete request")
+	requireEqual(t, req.Header.Get("X-Amz-Content-Sha256"), "", "presigned payload hash")
+	status, _ := send(t, srv.Client(), req)
+	requireEqual(t, status, http.StatusOK, "presigned delete objects")
+	requireAbsent(t, c, "docs", "presigned")
+}
