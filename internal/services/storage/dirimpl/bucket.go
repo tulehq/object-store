@@ -294,7 +294,7 @@ func (s *Service) registerBucket(bucket string) error {
 	if err := s.root.Mkdir(tmp, 0o750); err != nil {
 		return fmt.Errorf("%s: failed to create bucket: %s: %w", s.Name(), bucket, err)
 	}
-	err := s.root.WriteFile(filepath.Join(tmp, generationFile), []byte(newGeneration()), 0o600)
+	err := s.writeGeneration(filepath.Join(tmp, generationFile))
 	if err == nil {
 		err = s.root.Rename(tmp, filepath.Join(bucketsDir, bucket))
 	}
@@ -316,7 +316,8 @@ func (s *Service) registerBucket(bucket string) error {
 // the bucket's requests are not blocked meanwhile; an operation pinned to
 // the bucket that outlasts it fails the delete with
 // contracts.ErrOperationAborted. Under the write lock both are checked
-// again, and the registry entry is renamed away, which makes the bucket not exist; then the policy and
+// again, the uploads of this generation are removed, and the registry entry
+// is renamed away, which makes the bucket not exist; then the policy and
 // the index are removed. The bucket is left in the backend, empty.
 // Creating the bucket again reuses it, with a new generation.
 func (s *Service) DeleteBucket(ctx context.Context, ref contracts.BucketRef) error {
@@ -333,6 +334,9 @@ func (s *Service) DeleteBucket(ctx context.Context, ref contracts.BucketRef) err
 	}
 	defer unlock()
 	if err = s.checkDeletable(ctx, ref); err != nil {
+		return err
+	}
+	if err = s.removeUploads(bucket, ref.Generation); err != nil {
 		return err
 	}
 

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -189,8 +190,26 @@ func (s *Service) generation(ctx context.Context, bucket string) (string, error)
 		return legacyGeneration, nil
 	case err != nil:
 		return "", fmt.Errorf("%s: read the generation of bucket %s: %w", s.Name(), bucket, err)
+	case len(b) == 0:
+		// The file is synced before the entry is renamed into place, so
+		// this is damage, not a write in progress.
+		return "", fmt.Errorf("%s: the generation of bucket %s is empty", s.Name(), bucket)
 	}
 	return string(b), nil
+}
+
+// writeGeneration writes a new generation to name and syncs it, so the
+// registry entry it is renamed into place with never holds a torn one.
+func (s *Service) writeGeneration(name string) (err error) {
+	f, err := s.root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err //nolint:wrapcheck // wrapped by registerBucket
+	}
+	defer func() { err = errors.Join(err, f.Close()) }()
+	if _, err = f.WriteString(newGeneration()); err != nil {
+		return err //nolint:wrapcheck // wrapped by registerBucket
+	}
+	return f.Sync() //nolint:wrapcheck // wrapped by registerBucket
 }
 
 // newGeneration returns a fresh generation token.
