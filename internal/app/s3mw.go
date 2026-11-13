@@ -17,7 +17,8 @@ import (
 // newVerifier returns the verifier for the one access key the server
 // accepts, configured for S3: presigned URLs, a streamed payload checked
 // against a hex hash as it is read, UNSIGNED-PAYLOAD and STREAMING-*
-// payloads, the path encoded once, credentials scoped to s3, and failures
+// payloads, the path encoded once, Host and X-Amz-Date signed (a presigned
+// URL signs its date in the query), credentials scoped to s3, and failures
 // answered with S3's errors. The credential's region is not checked, so a
 // client may sign for any region.
 func newVerifier(accessKeyID, secretAccessKey string) (*sigv4.Verifier, error) {
@@ -35,7 +36,7 @@ func newVerifier(accessKeyID, secretAccessKey string) (*sigv4.Verifier, error) {
 		sigv4.WithStreamedPayload(),
 		sigv4.WithUnsignedPayload(true),
 		sigv4.WithStreamingPayload(true),
-		sigv4.WithRequiredSignedHeaders(),
+		sigv4.WithRequiredSignedHeaders("host", "x-amz-date"),
 		sigv4.WithService("s3"),
 		sigv4.WithErrorMap(s3AuthError),
 	)
