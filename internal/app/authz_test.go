@@ -18,12 +18,15 @@ import (
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	awshttp "github.com/aws/smithy-go/transport/http"
+	"github.com/gasmod/gas"
 	"github.com/gasmod/gas/config"
 	"tule.dev/identity/keysource"
 	"tule.dev/identity/principals"
 	"tule.dev/sigv4"
 
 	"tule.dev/object-store/internal/authz"
+	"tule.dev/object-store/internal/contracts"
+	"tule.dev/object-store/internal/services/storage/dirimpl"
 )
 
 //nolint:gosec // G101: test keys
@@ -164,6 +167,17 @@ func startAuthzApp(t *testing.T, f *fakeIdentity) (root, user *s3.Client) {
 // startAuthzServer is startAuthzApp, also returning the server's URL.
 func startAuthzServer(t *testing.T, f *fakeIdentity) (root, user *s3.Client, url string) {
 	t.Helper()
+	return startAuthzServerWith(t, f, nil)
+}
+
+// startAuthzServerWith is startAuthzServer, with the app's storage the one
+// wrap returns for the app's own, when wrap is not nil.
+func startAuthzServerWith(
+	t *testing.T,
+	f *fakeIdentity,
+	wrap func(*dirimpl.Service) contracts.StorageProvider,
+) (root, user *s3.Client, url string) {
+	t.Helper()
 	identity := httptest.NewServer(f)
 	t.Cleanup(identity.Close)
 
@@ -180,6 +194,12 @@ func startAuthzServer(t *testing.T, f *fakeIdentity) (root, user *s3.Client, url
 	a, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if wrap != nil {
+		a.RegisterSingletonService[contracts.StorageProvider](
+			func(c gas.ConfigProvider, l gas.Logger) contracts.StorageProvider {
+				return wrap(dirimpl.NewService(cfg.Storage)(c, l))
+			})
 	}
 	if err = a.Start(context.Background()); err != nil {
 		t.Fatal(err)
@@ -215,7 +235,10 @@ var (
 )
 
 // calls makes a request of every routed operation, on the bucket bkt and the
-// object k that setup creates.
+// objects k and copy-src that setup creates. CopyObject copies copy-src,
+// which no call tags, so the tags PutObjectTagging gives k, which a copy
+// under COPY would need s3:GetObjectTagging and s3:PutObjectTagging for,
+// do not depend on the order the calls are made in.
 var calls = map[authz.Operation]call{
 	authz.ListBuckets: func(ctx context.Context, c *s3.Client) error {
 		return sdkErr(c.ListBuckets(ctx, &s3.ListBucketsInput{}))
@@ -278,7 +301,7 @@ var calls = map[authz.Operation]call{
 	},
 	authz.CopyObject: func(ctx context.Context, c *s3.Client) error {
 		return sdkErr(c.CopyObject(ctx, &s3.CopyObjectInput{
-			Bucket: b, Key: aws.String("copy"), CopySource: aws.String("bkt/k"),
+			Bucket: b, Key: aws.String("copy"), CopySource: aws.String("bkt/copy-src"),
 		}))
 	},
 	authz.DeleteObject: func(ctx context.Context, c *s3.Client) error {
@@ -488,10 +511,12 @@ func setup(t *testing.T, root *s3.Client) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := root.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: b, Key: key, Body: strings.NewReader("data"),
-	}); err != nil {
-		t.Fatal(err)
+	for _, k := range []*string{key, aws.String("copy-src")} {
+		if _, err := root.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: b, Key: k, Body: strings.NewReader("data"),
+		}); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

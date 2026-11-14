@@ -36,6 +36,8 @@ var objectAttributes = []string{
 // upload, one page of its parts as ListParts pages them, by
 // x-amz-max-parts and x-amz-part-number-marker, each with its number and
 // size. A missing object is NoSuchKey or AccessDenied as for GetObject.
+// The attributes are answered only for the object the request was
+// evaluated for (authz.CheckObject).
 func (m *Module) getObjectAttributes(ctx gas.Context, t s3api.Target) error {
 	r := ctx.Request()
 	// s3:GetObject, then s3:GetObjectAttributes, both on the object.
@@ -49,9 +51,14 @@ func (m *Module) getObjectAttributes(ctx gas.Context, t s3api.Target) error {
 	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
-	info, err := m.storage.StatObject(g.Context(), t.Bucket, t.Key)
+	// The object is read with its tags, to check it against those it was
+	// evaluated with.
+	info, err := m.storage.StatObjectTagging(g.Context(), t.Bucket, t.Key)
 	if err != nil {
 		return s3api.WriteError(ctx, t, g.NotFound(t.Bucket, err))
+	}
+	if err = g.CheckObject(t, info); err != nil {
+		return s3api.WriteError(ctx, t, err)
 	}
 	if err = checkReadEncryption(r, info); err != nil {
 		return s3api.WriteError(ctx, t, err)

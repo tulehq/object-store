@@ -73,7 +73,8 @@ func (m *Module) getObject(ctx gas.Context) error {
 	return m.serveObject(ctx, g.Caller(), t, obj)
 }
 
-// serveObject answers caller's GetObject of t with obj, open.
+// serveObject answers caller's GetObject of t with obj, open, if it is
+// the object the request was evaluated for (authz.CheckObject).
 func (m *Module) serveObject(
 	ctx gas.Context,
 	caller *authz.Caller,
@@ -83,6 +84,9 @@ func (m *Module) serveObject(
 	r := ctx.Request()
 	w := ctx.ResponseWriter()
 	info := &obj.ObjectInfo
+	if err := caller.CheckObject(t, info); err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
 	if err := checkReadEncryption(r, info); err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
@@ -131,6 +135,9 @@ func (m *Module) headObject(ctx gas.Context) error {
 		return s3api.WriteError(ctx, t, fmt.Errorf("close object %q: %w", t.Key, err))
 	}
 	info := &obj.ObjectInfo
+	if err = g.CheckObject(t, info); err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
 	if err = checkReadEncryption(r, info); err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
@@ -262,14 +269,20 @@ func (m *Module) uploadObject(ctx gas.Context, t s3api.Target) error {
 	return nil
 }
 
+// copyObject serves CopyObject. Under the COPY tagging directive a source
+// with tags also needs s3:GetObjectTagging on it and s3:PutObjectTagging
+// on the destination, and its tags are the destination's
+// s3:RequestObjectTag keys (see authz). The copy is made only of the
+// source the request was evaluated for, with the tags it was evaluated
+// with (authz.CheckObject).
 func (m *Module) copyObject(ctx gas.Context, t s3api.Target) error {
 	in, err := copyInput(ctx.Request(), t)
 	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
+	src := s3api.Target{Bucket: in.SrcBucket, Key: in.SrcKey}
 	// s3:PutObject on the destination, then s3:GetObject on the source.
-	g, err := m.authz.AuthorizeAndPin(ctx, ctx.Request(), authz.CopyObject, t,
-		s3api.Target{Bucket: in.SrcBucket, Key: in.SrcKey})
+	g, err := m.authz.AuthorizeAndPin(ctx, ctx.Request(), authz.CopyObject, t, src)
 	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
@@ -295,6 +308,7 @@ func (m *Module) copyObject(ctx gas.Context, t s3api.Target) error {
 	// Under COPY, the default, the copy takes its source's tags and the
 	// request's x-amz-tagging is not read.
 	in.CopyTags, in.Tags = !replacesTags(ctx.Request()), ws.tags
+	in.SourceCheck = g.ObjectCheck(src)
 
 	info, err := m.storage.CopyObject(g.Context(), in)
 	if err != nil {

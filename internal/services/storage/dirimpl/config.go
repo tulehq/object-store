@@ -154,9 +154,14 @@ func aclFile(bucket, key string) string {
 }
 
 // GetObjectACL returns the ACL stored for the object at key, if it was
-// stored for the object as it now is. ctx must be pinned to bucket.
-func (s *Service) GetObjectACL(ctx context.Context, bucket, key string) ([]byte, error) {
-	info, err := s.StatObject(ctx, bucket, key)
+// stored for the object as it now is and check passes for that object.
+// ctx must be pinned to bucket.
+func (s *Service) GetObjectACL(
+	ctx context.Context,
+	bucket, key string,
+	check contracts.ObjectCheck,
+) ([]byte, error) {
+	info, err := s.statChecked(ctx, bucket, key, check)
 	if err != nil {
 		return nil, err
 	}
@@ -178,15 +183,20 @@ func (s *Service) GetObjectACL(ctx context.Context, bucket, key string) ([]byte,
 }
 
 // PutObjectACL stores doc as the ACL of the object at key as it now is,
-// under the key's lock, so the object it is stored for is not written over
-// meanwhile. ctx must be pinned to bucket.
-func (s *Service) PutObjectACL(ctx context.Context, bucket, key string, doc []byte) error {
+// if check passes for it, under the key's lock, so the object it is
+// stored for is not written over meanwhile. ctx must be pinned to bucket.
+func (s *Service) PutObjectACL(
+	ctx context.Context,
+	bucket, key string,
+	doc []byte,
+	check contracts.ObjectCheck,
+) error {
 	if _, err := requirePin(ctx, bucket); err != nil {
 		return err
 	}
 	unlock := s.locks.lock(bucket, key)
 	defer unlock()
-	info, err := s.StatObject(ctx, bucket, key)
+	info, err := s.statChecked(ctx, bucket, key, check)
 	if err != nil {
 		return err
 	}

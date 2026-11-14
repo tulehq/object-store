@@ -31,7 +31,7 @@ func TestBucketConfigs(t *testing.T) {
 	for name, err := range map[string]error{
 		"put":    s.PutBucketConfig(context.Background(), "bucket", contracts.ConfigCORS, nil),
 		"delete": s.DeleteBucketConfig(context.Background(), "bucket", contracts.ConfigCORS),
-		"acl":    s.PutObjectACL(context.Background(), "bucket", "k", nil),
+		"acl":    s.PutObjectACL(context.Background(), "bucket", "k", nil, nil),
 	} {
 		if err == nil {
 			t.Errorf("%s without a pin succeeded", name)
@@ -138,24 +138,36 @@ func TestObjectACLs(t *testing.T) {
 		}
 	}
 
-	_, err := s.GetObjectACL(ctx, "bucket", "k")
+	_, err := s.GetObjectACL(ctx, "bucket", "k", nil)
 	requireIs(t, "no object", err, storage.ErrObjectNotFound)
-	requireIs(t, "put on no object", s.PutObjectACL(ctx, "bucket", "k", []byte("<a/>")),
+	requireIs(t, "put on no object", s.PutObjectACL(ctx, "bucket", "k", []byte("<a/>"), nil),
 		storage.ErrObjectNotFound)
 
 	write([]byte("<written/>"))
-	if got, gErr := s.GetObjectACL(ctx, "bucket", "k"); gErr != nil || string(got) != "<written/>" {
+	if got, gErr := s.GetObjectACL(
+		ctx,
+		"bucket",
+		"k",
+		nil,
+	); gErr != nil ||
+		string(got) != "<written/>" {
 		t.Fatalf("the ACL written with the object: %q %v", got, gErr)
 	}
-	if err = s.PutObjectACL(ctx, "bucket", "k", []byte("<put/>")); err != nil {
+	if err = s.PutObjectACL(ctx, "bucket", "k", []byte("<put/>"), nil); err != nil {
 		t.Fatal(err)
 	}
-	if got, gErr := s.GetObjectACL(ctx, "bucket", "k"); gErr != nil || string(got) != "<put/>" {
+	if got, gErr := s.GetObjectACL(
+		ctx,
+		"bucket",
+		"k",
+		nil,
+	); gErr != nil ||
+		string(got) != "<put/>" {
 		t.Fatalf("the ACL put: %q %v", got, gErr)
 	}
 
 	write(nil)
-	_, err = s.GetObjectACL(ctx, "bucket", "k")
+	_, err = s.GetObjectACL(ctx, "bucket", "k", nil)
 	requireIs(t, "written over without an ACL", err, contracts.ErrNoSuchBucketConfig)
 	requireNoACLFile(t, s, "k", "written over without an ACL")
 }
@@ -253,7 +265,7 @@ func TestACopysACL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = s.GetObjectACL(ctx, "bucket", "copy")
+	_, err = s.GetObjectACL(ctx, "bucket", "copy", nil)
 	requireIs(t, "a copy without an ACL", err, contracts.ErrNoSuchBucketConfig)
 	if _, err = s.CopyObject(ctx, contracts.CopyObjectInput{
 		SrcBucket: "bucket", SrcKey: "k", DstBucket: "bucket", DstKey: "copy",
@@ -261,7 +273,13 @@ func TestACopysACL(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if got, gErr := s.GetObjectACL(ctx, "bucket", "copy"); gErr != nil || string(got) != "<copy/>" {
+	if got, gErr := s.GetObjectACL(
+		ctx,
+		"bucket",
+		"copy",
+		nil,
+	); gErr != nil ||
+		string(got) != "<copy/>" {
 		t.Fatalf("a copy's ACL: %q %v", got, gErr)
 	}
 	info, err := s.StatObject(ctx, "bucket", "copy")

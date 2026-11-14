@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"tule.dev/object-store/internal/contracts"
 )
 
 // The backend's own metadata keeps S3's limits, 2 KB of printable ASCII,
@@ -36,11 +38,16 @@ const sniffSize = 512
 var errBadTrailer = errors.New("object has no valid trailer")
 
 // trailer is what is stored after an object's bytes. Meta is the flattened
-// metadata map described in etag.go.
+// metadata map described in etag.go. Tags are the tags the object was
+// written with, so the object and its tags become visible together, in the
+// one backend write; an object written before they were stored here has
+// none in its trailer (see readObjectTags). They are a field of their own,
+// not an entry of Meta, so no user metadata name can reach them.
 type trailer struct {
 	LastModified time.Time         `json:"lastModified"`
 	Meta         map[string]string `json:"meta"`
 	ContentType  string            `json:"contentType"`
+	Tags         []contracts.Tag   `json:"tags,omitempty"`
 }
 
 // withTrailer returns a reader of body followed by the trailer of tr. The

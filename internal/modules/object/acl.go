@@ -144,10 +144,15 @@ func objectOwner(ownership string, r *http.Request, writer, bucketOwner string) 
 
 // storedACL returns the owner and grants of the object at key: its stored
 // ACL's, or the bucket owner with FULL_CONTROL for an object without one.
-// It is storage.ErrObjectNotFound when there is no object.
-func (m *Module) storedACL(ctx context.Context, bucket, key string) (string, []s3api.Grant, error) {
+// It is storage.ErrObjectNotFound when there is no object, and check's
+// error when check does not pass for it.
+func (m *Module) storedACL(
+	ctx context.Context,
+	bucket, key string,
+	check contracts.ObjectCheck,
+) (string, []s3api.Grant, error) {
 	bucketOwner := s3api.CanonicalUserID(m.authz.Account())
-	doc, err := m.storage.GetObjectACL(ctx, bucket, key)
+	doc, err := m.storage.GetObjectACL(ctx, bucket, key, check)
 	if errors.Is(err, contracts.ErrNoSuchBucketConfig) {
 		return bucketOwner, []s3api.Grant{s3api.OwnerFullControl(bucketOwner)}, nil
 	}
@@ -183,7 +188,8 @@ func (m *Module) getObjectACL(ctx gas.Context, t s3api.Target) error {
 	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
-	owner, grants, err := m.storedACL(pinned, t.Bucket, t.Key)
+	// The ACL read is of the object the request was evaluated for.
+	owner, grants, err := m.storedACL(pinned, t.Bucket, t.Key, g.ObjectCheck(t))
 	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
@@ -223,7 +229,7 @@ func (m *Module) putObjectACL(ctx gas.Context, t s3api.Target) error {
 		return s3api.WriteError(ctx, t, err)
 	}
 	defer release()
-	if err = m.setObjectACL(pinned, r, t, doc); err != nil {
+	if err = m.setObjectACL(pinned, r, t, doc, caller.ObjectCheck(t)); err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
 	ctx.ResponseWriter().WriteHeader(http.StatusOK)
@@ -231,18 +237,21 @@ func (m *Module) putObjectACL(ctx gas.Context, t s3api.Target) error {
 }
 
 // setObjectACL sets the ACL r, with the document doc, sets on the object
-// t, ctx being pinned to its bucket, as putObjectACL describes.
+// t, ctx being pinned to its bucket, as putObjectACL describes, if check
+// passes for the object read and written, the one the request was
+// evaluated for.
 func (m *Module) setObjectACL(
 	ctx context.Context,
 	r *http.Request,
 	t s3api.Target,
 	doc []byte,
+	check contracts.ObjectCheck,
 ) error {
 	ownership, err := s3api.Ownership(ctx, m.storage, t.Bucket)
 	if err != nil {
 		return err //nolint:wrapcheck // an S3 or storage error, answered as is
 	}
-	owner, _, err := m.storedACL(ctx, t.Bucket, t.Key)
+	owner, _, err := m.storedACL(ctx, t.Bucket, t.Key, check)
 	if err != nil {
 		return err
 	}
@@ -274,5 +283,6 @@ func (m *Module) setObjectACL(
 		t.Bucket,
 		t.Key,
 		stored,
+		check,
 	) //nolint:wrapcheck // the storage's own error, answered as is
 }
