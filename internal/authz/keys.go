@@ -1,13 +1,19 @@
 package authz
 
 import (
+	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"slices"
 	"strconv"
 	"time"
 
+	"github.com/gasmod/gas/storage"
 	"tule.dev/sigv4"
+
+	"tule.dev/object-store/internal/contracts"
+	"tule.dev/object-store/internal/s3api"
 )
 
 // region is the region every bucket is in.
@@ -190,3 +196,138 @@ func unknownKeys(p sigv4.Principal) []string {
 
 // principalTagPrefix is the prefix of the aws:PrincipalTag/<key> keys.
 const principalTagPrefix = "aws:PrincipalTag/"
+
+// The object tag condition keys ("Tagging and access control policies", S3
+// User Guide): s3:ExistingObjectTag/<key>, each tag of the object acted
+// on, and s3:RequestObjectTag/<key> and s3:RequestObjectTagKeys, each tag
+// and the keys of the tag set the request sets.
+const (
+	existingTagPrefix = "s3:ExistingObjectTag/"
+	requestTagPrefix  = "s3:RequestObjectTag/"
+	requestTagKeysKey = "s3:RequestObjectTagKeys"
+)
+
+// existingTagActions are the actions evaluated here that the reference
+// lists s3:ExistingObjectTag/<key> for, and requestTagActions those it
+// lists s3:RequestObjectTag/<key> and s3:RequestObjectTagKeys for.
+var (
+	existingTagActions = []string{
+		"s3:GetObject", "s3:GetObjectAcl", "s3:PutObjectAcl", "s3:GetObjectAttributes",
+		"s3:GetObjectTagging", "s3:PutObjectTagging", "s3:DeleteObjectTagging",
+	}
+	requestTagActions = []string{"s3:PutObject", "s3:PutObjectTagging"}
+)
+
+// SetRequestTags gives the tags of the request's document, which
+// PutObjectTagging sets, as its s3:RequestObjectTag and
+// s3:RequestObjectTagKeys. It must be called before Authorize, so the
+// document is read and parsed before the request is evaluated.
+func (c *Caller) SetRequestTags(tags []contracts.Tag) {
+	c.bodyTags, c.bodyTagsSet = tags, true
+}
+
+// requestTagsOf returns the tags op's request sets: the document's, given
+// by SetRequestTags, or the x-amz-tagging header's for PutObject,
+// CreateMultipartUpload and a CopyObject under the REPLACE tagging
+// directive (s3api.RequestTags), whose error, a header that does not
+// parse, refuses the request. A copy under COPY sets its source's tags,
+// which are not the request's, a choice. Any other operation sets none.
+func (c *Caller) requestTagsOf(op Operation) ([]contracts.Tag, error) {
+	if c.bodyTagsSet {
+		return c.bodyTags, nil
+	}
+	switch op {
+	case PutObject, CreateMultipartUpload:
+	case CopyObject:
+		if !replacesTags(c.req) {
+			return nil, nil
+		}
+	default:
+		return nil, nil
+	}
+	tags, err := s3api.RequestTags(c.req)
+	if err != nil {
+		return nil, err //nolint:wrapcheck // an S3 error, answered as is
+	}
+	return tags, nil
+}
+
+// addTagKeys adds to keys the object tag keys of ch on t: the request's
+// tags for the actions requestTagActions lists, and t's tags as stored for
+// those existingTagActions lists, except for an implied check and one a
+// write's headers add (onWrite). An object that does not exist has no
+// tags. Values are bounded as every other value is (maxContextValue).
+func (c *Caller) addTagKeys(keys map[string][]string, ch check, t s3api.Target) error {
+	if ch.implied || ch.kind != objectResource {
+		return nil
+	}
+	if slices.Contains(requestTagActions, ch.action) {
+		if err := c.addRequestTagKeys(keys); err != nil {
+			return err
+		}
+	}
+	if ch.onWrite || !slices.Contains(existingTagActions, ch.action) {
+		return nil
+	}
+	tags, err := c.existing(t)
+	if err != nil {
+		return err
+	}
+	for _, tag := range tags {
+		if err = setTagKey(keys, existingTagPrefix+tag.Key, tag.Value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// addRequestTagKeys adds the request's tags to keys, and their keys as
+// s3:RequestObjectTagKeys, when it sets any.
+func (c *Caller) addRequestTagKeys(keys map[string][]string) error {
+	if len(c.requestTags) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(c.requestTags))
+	for _, tag := range c.requestTags {
+		if err := setTagKey(keys, requestTagPrefix+tag.Key, tag.Value); err != nil {
+			return err
+		}
+		names = append(names, tag.Key)
+	}
+	keys[requestTagKeysKey] = names
+	return nil
+}
+
+// setTagKey sets the tag key name to v, refusing a value longer than
+// maxContextValue, as Caller.context does.
+func setTagKey(keys map[string][]string, name, v string) error {
+	if len(name) > maxContextValue || len(v) > maxContextValue {
+		return s3api.ErrInvalidArgument(fmt.Sprintf(
+			"The value of the condition key %s is longer than %d bytes.", name, maxContextValue))
+	}
+	keys[name] = []string{v}
+	return nil
+}
+
+// existing returns the tags stored for the object t, read once per
+// request: none when there is no such object or bucket, or the key is not
+// one an object can have. A read that fails otherwise fails the request;
+// the tags are never treated as absent.
+func (c *Caller) existing(t s3api.Target) ([]contracts.Tag, error) {
+	if tags, ok := c.existingTags[t]; ok {
+		return tags, nil
+	}
+	tags, err := c.a.policies.GetObjectTagging(c.req.Context(), t.Bucket, t.Key)
+	switch {
+	case errors.Is(err, storage.ErrObjectNotFound), errors.Is(err, storage.ErrBucketNotFound),
+		errors.Is(err, storage.ErrInvalidKey):
+		tags = nil
+	case err != nil:
+		return nil, fmt.Errorf("authz: read the tags of %s/%s: %w", t.Bucket, t.Key, err)
+	}
+	if c.existingTags == nil {
+		c.existingTags = map[s3api.Target][]contracts.Tag{}
+	}
+	c.existingTags[t] = tags
+	return tags, nil
+}

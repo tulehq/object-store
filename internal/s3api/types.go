@@ -307,3 +307,58 @@ type ListMultipartUploadsResult struct {
 func NewListMultipartUploadsResult() *ListMultipartUploadsResult {
 	return &ListMultipartUploadsResult{Xmlns: xmlns}
 }
+
+// CopyPartResult is the UploadPartCopy response document.
+type CopyPartResult struct {
+	XMLName      xml.Name `xml:"CopyPartResult"`
+	Xmlns        string   `xml:"xmlns,attr"`
+	LastModified string   `xml:"LastModified"`
+	ETag         string   `xml:"ETag"`
+}
+
+// NewCopyPartResult returns an UploadPartCopy response for the part's ETag
+// digest and modification time.
+func NewCopyPartResult(etag string, lastModified time.Time) *CopyPartResult {
+	return &CopyPartResult{
+		Xmlns:        xmlns,
+		ETag:         ETag(etag),
+		LastModified: Timestamp(lastModified),
+	}
+}
+
+// GetObjectAttributesResponse is the GetObjectAttributes response
+// document. Each field is set only when its attribute is asked for. ETag
+// is the unquoted digest, as the AWS CLI's get-object-attributes example
+// shows it.
+type GetObjectAttributesResponse struct {
+	XMLName      xml.Name     `xml:"GetObjectAttributesResponse"`
+	ObjectParts  *ObjectParts `xml:"ObjectParts,omitempty"`
+	ObjectSize   *int64       `xml:"ObjectSize,omitempty"`
+	Xmlns        string       `xml:"xmlns,attr"`
+	ETag         string       `xml:"ETag,omitempty"`
+	StorageClass string       `xml:"StorageClass,omitempty"`
+}
+
+// NewGetObjectAttributesResponse returns an empty GetObjectAttributes
+// response document.
+func NewGetObjectAttributesResponse() *GetObjectAttributesResponse {
+	return &GetObjectAttributesResponse{Xmlns: xmlns}
+}
+
+// ObjectParts is the ObjectParts element of a GetObjectAttributes
+// response (API_GetObjectAttributesParts): one page of an object's parts.
+type ObjectParts struct {
+	Parts                []ObjectPart `xml:"Part"`
+	PartNumberMarker     int          `xml:"PartNumberMarker"`
+	NextPartNumberMarker int          `xml:"NextPartNumberMarker,omitempty"`
+	MaxParts             int          `xml:"MaxParts"`
+	PartsCount           int          `xml:"PartsCount"`
+	IsTruncated          bool         `xml:"IsTruncated"`
+}
+
+// ObjectPart is one Part of an ObjectParts element (API_ObjectPart),
+// without the checksums, which are not stored.
+type ObjectPart struct {
+	PartNumber int   `xml:"PartNumber"`
+	Size       int64 `xml:"Size"`
+}

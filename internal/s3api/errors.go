@@ -176,6 +176,12 @@ var sentinelErrors = []struct {
 			"Try again.")},
 	{contracts.ErrNoSuchBucketPolicy, NewError(http.StatusNotFound, "NoSuchBucketPolicy",
 		"The specified bucket does not have a bucket policy.")},
+	{contracts.ErrInvalidCopyRange, ErrInvalidArgument(
+		"The x-amz-copy-source-range value is not within the source object.")},
+	{contracts.ErrRangeCopySourceTooSmall, ErrInvalidRequest(
+		"The specified copy source is not supported as a byte-range copy source.")},
+	{contracts.ErrEntityTooLarge, NewError(http.StatusBadRequest, "EntityTooLarge",
+		"Your proposed upload exceeds the maximum allowed object size.")},
 }
 
 func toS3Error(err error) *Error {

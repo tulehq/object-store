@@ -37,13 +37,15 @@ const defaultCacheSize = 1024
 // middleware never lets reach a handler.
 var errNoPrincipal = errors.New("authz: the request has no verified principal")
 
-// PolicySource reads the bucket policies requests are evaluated with and
-// the Block Public Access settings that restrict them, and pins the
-// buckets an operation acts on to the generation evaluated:
-// contracts.StorageProvider's GetBucketPolicy, GetBucketConfig and Pin.
+// PolicySource reads the bucket policies requests are evaluated with, the
+// Block Public Access settings that restrict them and the tags of the
+// objects they act on, and pins the buckets an operation acts on to the
+// generation evaluated: contracts.StorageProvider's GetBucketPolicy,
+// GetBucketConfig, GetObjectTagging and Pin.
 type PolicySource interface {
 	GetBucketPolicy(ctx context.Context, bucket string) (string, []byte, error)
 	GetBucketConfig(ctx context.Context, bucket string, kind contracts.BucketConfig) ([]byte, error)
+	GetObjectTagging(ctx context.Context, bucket, key string) ([]contracts.Tag, error)
 	Pin(ctx context.Context, refs ...contracts.BucketRef) (context.Context, func(), error)
 }
 
@@ -96,7 +98,17 @@ type Caller struct {
 	// unknown are the condition keys whose values could not be told, which
 	// policy.Authorize resolves against the caller.
 	unknown []string
-	root    bool
+	// existingTags are the tags of the objects read for
+	// s3:ExistingObjectTag, by target, so each is read once per request.
+	existingTags map[s3api.Target][]contracts.Tag
+	// requestTags are the tags the operation evaluated sets, for
+	// s3:RequestObjectTag and s3:RequestObjectTagKeys (see requestTagsOf).
+	requestTags []contracts.Tag
+	// bodyTags are the tags SetRequestTags gave, the tags of a request
+	// document, and bodyTagsSet whether it was called.
+	bodyTags    []contracts.Tag
+	bodyTagsSet bool
+	root        bool
 }
 
 // Caller returns the caller of r, a request Verify passed. Its policies are
@@ -253,6 +265,11 @@ func (c *Caller) Authorize(op Operation, targets ...s3api.Target) error {
 // header checks on targets[0].
 func (c *Caller) evaluateChecks(op Operation, checks []check, targets []s3api.Target) error {
 	extra := operationKeys(op, targets)
+	tags, err := c.requestTagsOf(op)
+	if err != nil {
+		return err
+	}
+	c.requestTags = tags
 	for i, t := range targets {
 		if err := c.evaluate(checks[i], t, extra); err != nil {
 			return err
@@ -306,13 +323,15 @@ const (
 	creationKey = "s3:ObjectCreationOperation"
 )
 
-// objectCreation is s3:ObjectCreationOperation by operation.
+// objectCreation is s3:ObjectCreationOperation by operation. UploadPartCopy
+// is a multipart step, as UploadPart is; S3 documents no value for it.
 var objectCreation = map[Operation]string{
 	PutObject:               "true",
 	CopyObject:              "true",
 	CompleteMultipartUpload: "true",
 	CreateMultipartUpload:   "false",
 	UploadPart:              "false",
+	UploadPartCopy:          "false",
 }
 
 // operationKeys are the condition keys that come from what op acts on
@@ -323,7 +342,7 @@ func operationKeys(op Operation, targets []s3api.Target) map[string]map[string]s
 	if v, ok := objectCreation[op]; ok {
 		put[creationKey] = v
 	}
-	if op == CopyObject {
+	if op == CopyObject || op == UploadPartCopy {
 		src := targets[1]
 		put[copySourceKey] = src.Bucket + "/" + src.Key
 	}
@@ -331,6 +350,29 @@ func operationKeys(op Operation, targets []s3api.Target) map[string]map[string]s
 		return nil
 	}
 	return map[string]map[string]string{"s3:PutObject": put}
+}
+
+// Allows reports whether the caller may perform op on t, which must have
+// one check, without failing the request when it may not: the root
+// principal may do everything. An error is one the evaluation itself
+// failed with, such as a bucket policy that cannot be read. It is for an
+// answer that depends on a permission, such as GetObject's tag count,
+// which S3 answers "when you have the relevant permission to read object
+// tags" (GetObject API reference).
+func (c *Caller) Allows(op Operation, t s3api.Target) (bool, error) {
+	checks := operations[op]
+	if len(checks) != 1 {
+		return false, fmt.Errorf("authz: Allows takes an operation of one check, not %s", op)
+	}
+	if c.root {
+		return true, nil
+	}
+	err := c.evaluate(checks[0], t, nil)
+	var s3Err *s3api.Error
+	if errors.As(err, &s3Err) && s3Err.Code == "AccessDenied" {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 // NotFound is the error to answer a GetObject, HeadObject or CopyObject
@@ -366,6 +408,9 @@ func (c *Caller) evaluate(ch check, t s3api.Target, extra map[string]map[string]
 	resource := resourceARN(ch.kind, t)
 	keys, err := c.context(ch, extra[ch.action])
 	if err != nil {
+		return err
+	}
+	if err = c.addTagKeys(keys, ch, t); err != nil {
 		return err
 	}
 	owner := c.a.account
@@ -515,7 +560,7 @@ func (c *Caller) Pin(
 }
 
 // The headers that name the account a request expects to own its bucket,
-// and, for CopyObject, its source bucket (the S3 API Reference, each
+// and, for CopyObject and UploadPartCopy, its source bucket (the S3 API Reference, each
 // operation's ExpectedBucketOwner and ExpectedSourceBucketOwner).
 const (
 	expectedOwnerHeader       = "X-Amz-Expected-Bucket-Owner"
@@ -523,7 +568,7 @@ const (
 )
 
 // CheckExpectedOwner refuses a request that expects its bucket, or
-// CopyObject's source bucket, to belong to an account other than the
+// CopyObject's or UploadPartCopy's source bucket, to belong to an account other than the
 // server's, which owns every bucket: "If the account ID that you provide
 // does not match the actual owner of the bucket, the request fails with the
 // HTTP status code 403 Forbidden (access denied)." It applies to every
@@ -534,7 +579,7 @@ func (c *Caller) CheckExpectedOwner(op Operation) error {
 		return nil
 	}
 	headers := []string{expectedOwnerHeader}
-	if op == CopyObject {
+	if op == CopyObject || op == UploadPartCopy {
 		headers = append(headers, expectedSourceOwnerHeader)
 	}
 	for _, h := range headers {

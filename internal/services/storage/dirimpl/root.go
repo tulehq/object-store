@@ -37,6 +37,10 @@ var (
 	// aclDir holds the ACLs objects were given, one directory per bucket
 	// with one file per object, named by keyHash.
 	aclDir = filepath.Join(stateDir, "acls")
+
+	// tagDir holds the tags objects were given, one directory per bucket
+	// with one file per object, named by keyHash, as aclDir does.
+	tagDir = filepath.Join(stateDir, "tags")
 )
 
 func (s *Service) openRoot() (*os.Root, error) {
@@ -48,7 +52,7 @@ func (s *Service) openRoot() (*os.Root, error) {
 		return nil, fmt.Errorf("failed to open storage root: %w", err)
 	}
 	for _, d := range []string{
-		bucketsDir, indexDir, multipartDir, policiesDir, configDir, aclDir,
+		bucketsDir, indexDir, multipartDir, policiesDir, configDir, aclDir, tagDir,
 	} {
 		if err = root.MkdirAll(d, 0o750); err != nil {
 			return nil, errors.Join(

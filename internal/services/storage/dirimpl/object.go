@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"time"
 	"unicode/utf8"
 
 	"github.com/gasmod/gas/storage"
@@ -84,14 +85,22 @@ func (s *Service) statObject(
 	return &obj.ObjectInfo, nil
 }
 
-// GetObject opens an object for reading. The caller must close its Body. The
-// info and body come from the same read, so they match even when the object
-// is overwritten meanwhile. ctx must be pinned to bucket.
+// GetObject opens an object for reading, with its tags. The caller must
+// close its Body. The info and body come from the same read, so they match
+// even when the object is overwritten meanwhile, and the tags are those
+// stored for that object. ctx must be pinned to bucket.
 func (s *Service) GetObject(ctx context.Context, bucket, key string) (*contracts.Object, error) {
 	if _, err := requirePin(ctx, bucket); err != nil {
 		return nil, err
 	}
-	return s.openObject(ctx, "get", bucket, key)
+	obj, err := s.openObject(ctx, "get", bucket, key)
+	if err != nil {
+		return nil, err
+	}
+	if obj.Tags, err = s.readObjectTags(bucket, &obj.ObjectInfo); err != nil {
+		return nil, errors.Join(err, obj.Body.Close())
+	}
+	return obj, nil
 }
 
 // openObject opens an object and reads its trailer. A missing object is an
@@ -166,17 +175,21 @@ func (s *Service) DeleteObject(ctx context.Context, bucket, key string) error {
 		return fmt.Errorf("%s: delete %q: %w", s.Name(), key, err)
 	}
 	// The object is gone, so its index entry goes whether or not its ACL
-	// file could be removed.
-	var aclErr error
+	// and tag files could be removed.
+	var aclErr, tagErr error
 	if rmErr := s.removeIfExists(aclFile(bucket, key)); rmErr != nil {
 		aclErr = fmt.Errorf("%s: delete the ACL of %q: %w", s.Name(), key, rmErr)
 	}
-	return errors.Join(aclErr, s.removeFromIndex(bucket, key))
+	if rmErr := s.removeIfExists(tagFile(bucket, key)); rmErr != nil {
+		tagErr = fmt.Errorf("%s: delete the tags of %q: %w", s.Name(), key, rmErr)
+	}
+	return errors.Join(aclErr, tagErr, s.removeFromIndex(bucket, key))
 }
 
 // PutObject stores body with the content type, user metadata and system
-// headers in in, and in's ACL, if any, as its ACL, replacing or removing
-// the one it had, and returns the stored object's info. The write only happens
+// headers in in, and in's ACL and tags, if any, as its ACL and tags,
+// replacing or removing the ones it had, and returns the stored object's
+// info. The write only happens
 // if cond holds. ctx must be pinned to bucket.
 func (s *Service) PutObject(
 	ctx context.Context,
@@ -205,6 +218,9 @@ func (s *Service) PutObject(
 		return nil, err
 	}
 	if err = s.setObjectACL(bucket, info, in.ACL); err != nil {
+		return nil, err
+	}
+	if err = s.setObjectTags(bucket, info, in.Tags); err != nil {
 		return nil, err
 	}
 	return info, nil
@@ -263,7 +279,8 @@ func (s *Service) checkKey(key string) error {
 	return nil
 }
 
-// CopyObject copies an object within or across buckets. Copying an object
+// CopyObject copies an object within or across buckets, if
+// in.SourceCondition holds of the source as it is read. Copying an object
 // onto itself is safe: the backend writes the copy to a new data file, while
 // the source stays open for reading. ctx must be pinned to both buckets.
 func (s *Service) CopyObject(
@@ -279,6 +296,9 @@ func (s *Service) CopyObject(
 			err = errors.Join(err, fmt.Errorf("%s: copy %q: %w", s.Name(), in.SrcKey, cErr))
 		}
 	}()
+	if err = checkSourceCondition(in.SourceCondition, &src.ObjectInfo); err != nil {
+		return nil, err
+	}
 
 	put := contracts.PutObjectInput{
 		ContentType: src.ContentType,
@@ -303,6 +323,51 @@ func (s *Service) CopyObject(
 		put.Headers = headers
 	}
 	put.ACL = in.ACL
+	put.Tags = in.Tags
+	if in.CopyTags {
+		put.Tags = src.Tags
+	}
 
 	return s.PutObject(ctx, in.DstBucket, in.DstKey, src.Body, put, in.Precondition)
+}
+
+// checkSourceCondition returns contracts.ErrPreconditionFailed unless cond
+// holds of the source object info describes, as S3 evaluates the
+// x-amz-copy-source-if-* headers (CopyObject and UploadPartCopy API
+// references): x-amz-copy-source-if-match true and
+// x-amz-copy-source-if-unmodified-since false copies, and
+// x-amz-copy-source-if-none-match false and
+// x-amz-copy-source-if-modified-since true fails, which is RFC 7232's
+// order. The dates are compared to the second, as an HTTP date carries
+// them.
+func checkSourceCondition(cond contracts.SourceCondition, info *contracts.ObjectInfo) error {
+	modified := info.LastModified.Truncate(time.Second)
+	if !matchHolds(cond, info.ETag, modified) || !noneMatchHolds(cond, info.ETag, modified) {
+		return contracts.ErrPreconditionFailed
+	}
+	return nil
+}
+
+// matchHolds reports whether cond's IfMatch, or else its
+// IfUnmodifiedSince, holds of an object of etag last modified at modified.
+func matchHolds(cond contracts.SourceCondition, etag string, modified time.Time) bool {
+	switch {
+	case cond.IfMatch != "":
+		return cond.IfMatch == "*" || cond.IfMatch == etag
+	case cond.IfUnmodifiedSince != nil:
+		return !modified.After(*cond.IfUnmodifiedSince)
+	}
+	return true
+}
+
+// noneMatchHolds reports whether cond's IfNoneMatch, or else its
+// IfModifiedSince, holds of an object of etag last modified at modified.
+func noneMatchHolds(cond contracts.SourceCondition, etag string, modified time.Time) bool {
+	switch {
+	case cond.IfNoneMatch != "":
+		return cond.IfNoneMatch != "*" && cond.IfNoneMatch != etag
+	case cond.IfModifiedSince != nil:
+		return modified.After(*cond.IfModifiedSince)
+	}
+	return true
 }

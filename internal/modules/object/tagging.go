@@ -1,0 +1,110 @@
+package object
+
+import (
+	"net/http"
+	"strconv"
+
+	"github.com/gasmod/gas"
+
+	"tule.dev/object-store/internal/authz"
+	"tule.dev/object-store/internal/contracts"
+	"tule.dev/object-store/internal/s3api"
+)
+
+// maxTaggingDocument bounds a PutObjectTagging document. Ten tags of S3's
+// longest keys and values take a few kilobytes; S3 documents no limit,
+// and this one is a choice, the one the bucket configurations take.
+const maxTaggingDocument = 64 * 1024
+
+// putObjectTagging serves PutObjectTagging (PUT /<bucket>/<key>?tagging),
+// answering 200 with no body: the document's tag set replaces the
+// object's, and an empty one removes it ("If you send this request with
+// an empty tag set, Amazon S3 deletes the existing tag set on the object",
+// "Tagging your objects", S3 User Guide). The document is read and parsed
+// before the request is evaluated, since its tags are the request's
+// s3:RequestObjectTag and s3:RequestObjectTagKeys. A missing object is 404
+// NoSuchKey, as for PutObjectAcl.
+func (m *Module) putObjectTagging(ctx gas.Context, t s3api.Target) error {
+	r := ctx.Request()
+	caller, err := m.authz.Caller(r)
+	if err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
+	doc, err := s3api.ReadDocument(r, maxTaggingDocument, m.verifier.ReadBody)
+	if err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
+	tags, err := s3api.ParseObjectTagging(doc)
+	if err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
+	caller.SetRequestTags(tags)
+	if err = caller.Authorize(authz.PutObjectTagging, t); err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
+	pinned, release, err := caller.Pin(ctx, t.Bucket)
+	if err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
+	defer release()
+	if err = m.storage.PutObjectTagging(pinned, t.Bucket, t.Key, tags); err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
+	ctx.ResponseWriter().WriteHeader(http.StatusOK)
+	return nil
+}
+
+// getObjectTagging serves GetObjectTagging (GET /<bucket>/<key>?tagging):
+// the object's tag set, empty for an object without tags.
+func (m *Module) getObjectTagging(ctx gas.Context, t s3api.Target) error {
+	g, err := m.authz.AuthorizeAndPin(ctx, ctx.Request(), authz.GetObjectTagging, t)
+	if err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
+	defer g.Release()
+	tags, err := m.storage.GetObjectTagging(g.Context(), t.Bucket, t.Key)
+	if err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
+	return ctx.XML(http.StatusOK, s3api.NewTagging(tags))
+}
+
+// deleteObjectTagging serves DeleteObjectTagging (DELETE
+// /<bucket>/<key>?tagging), answering 204 No Content, also for an object
+// without tags.
+func (m *Module) deleteObjectTagging(ctx gas.Context, t s3api.Target) error {
+	g, err := m.authz.AuthorizeAndPin(ctx, ctx.Request(), authz.DeleteObjectTagging, t)
+	if err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
+	defer g.Release()
+	if err = m.storage.PutObjectTagging(g.Context(), t.Bucket, t.Key, nil); err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
+	return ctx.NoContent()
+}
+
+// setTagCount sets the x-amz-tagging-count header of a GetObject or
+// HeadObject of t, an object with tags, for a caller allowed
+// s3:GetObjectTagging on it: "The number of tags, if any, on the object,
+// when you have the relevant permission to read object tags." (GetObject
+// and HeadObject API references). An object without tags gets no header,
+// as "if any" reads.
+func setTagCount(
+	w http.ResponseWriter,
+	caller *authz.Caller,
+	t s3api.Target,
+	tags []contracts.Tag,
+) error {
+	if len(tags) == 0 {
+		return nil
+	}
+	ok, err := caller.Allows(authz.GetObjectTagging, t)
+	if err != nil {
+		return err //nolint:wrapcheck // an S3 or evaluation error, answered as is
+	}
+	if ok {
+		w.Header().Set(s3api.HeaderTaggingCount, strconv.Itoa(len(tags)))
+	}
+	return nil
+}

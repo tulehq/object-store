@@ -54,6 +54,28 @@ func (b buckets) GetBucketConfig(
 	return nil, contracts.ErrNoSuchBucketConfig
 }
 
+// testTags are the tags of the objects of every bucket, by key; any other
+// key holds no object.
+var testTags = map[string][]contracts.Tag{
+	"k":      nil,
+	"tagged": {{Key: "env", Value: "prod"}, {Key: "team", Value: "storage"}},
+	"locked": {{Key: "locked", Value: "true"}},
+}
+
+func (b buckets) GetObjectTagging(
+	_ context.Context,
+	bucket, key string,
+) ([]contracts.Tag, error) {
+	if _, ok := b[bucket]; !ok {
+		return nil, storage.ErrBucketNotFound
+	}
+	tags, ok := testTags[key]
+	if !ok {
+		return nil, storage.ErrObjectNotFound
+	}
+	return tags, nil
+}
+
 func (b buckets) Pin(
 	ctx context.Context,
 	refs ...contracts.BucketRef,

@@ -51,6 +51,18 @@ var (
 	// that has no configuration of the kind asked for, and by GetObjectACL
 	// for an object that has no ACL of its own.
 	ErrNoSuchBucketConfig = errors.New("storage: the bucket has no such configuration")
+
+	// ErrInvalidCopyRange is returned by UploadPartCopy for a CopyRange
+	// that is not within its source object.
+	ErrInvalidCopyRange = errors.New("storage: the copy range is not within the source")
+
+	// ErrRangeCopySourceTooSmall is returned by UploadPartCopy for a
+	// CopyRange of a source object no larger than MinRangeCopySource.
+	ErrRangeCopySourceTooSmall = errors.New("storage: the source is too small for a range copy")
+
+	// ErrEntityTooLarge is returned by UploadPartCopy for a copy larger
+	// than MaxCopyPartSize.
+	ErrEntityTooLarge = errors.New("storage: part too large")
 )
 
 // BucketConfig names a kind of bucket configuration, each kept as one
@@ -79,6 +91,15 @@ const MinPartSize = 5 << 20
 
 // MaxPartNumber is the highest part number S3 allows.
 const MaxPartNumber = 10000
+
+// MaxCopyPartSize is the largest part UploadPartCopy copies, S3's 5 GiB
+// maximum part size ("Amazon S3 multipart upload limits", S3 User Guide).
+const MaxCopyPartSize = 5 << 30
+
+// MinRangeCopySource is the size a source object must exceed for
+// UploadPartCopy to copy a range of it: "You can copy a range only if the
+// source object is greater than 5 MB." (UploadPartCopy API reference).
+const MinRangeCopySource = 5 << 20
 
 // StorageProvider is the object store the S3 API is served from: the bucket,
 // object, listing, conditional write and multipart operations S3 needs.
@@ -176,6 +197,27 @@ type StorageProvider interface {
 	// PutObjectACL stores doc as the ACL of the object at key as it now
 	// is: storage.ErrObjectNotFound when there is none.
 	PutObjectACL(ctx context.Context, bucket, key string, doc []byte) error
+
+	// GetObjectTagging returns the tags stored for the object at key as it
+	// now is, none for an object written over, or deleted and written
+	// again, since they were stored: storage.ErrObjectNotFound when there
+	// is no object. ctx need not be pinned; one pinned to bucket reads
+	// them under the pin.
+	GetObjectTagging(ctx context.Context, bucket, key string) ([]Tag, error)
+	// PutObjectTagging stores tags as the tags of the object at key as it
+	// now is, replacing any it had; no tags removes them:
+	// storage.ErrObjectNotFound when there is no object.
+	PutObjectTagging(ctx context.Context, bucket, key string, tags []Tag) error
+
+	// UploadPartCopy stores as part in.PartNumber of an upload the bytes of
+	// its source object in in.Range, or all of them, if in.Condition holds
+	// of the source, and returns the part as stored and the system headers
+	// the upload's object will be stored with, as UploadPart does. ctx must
+	// be pinned to both buckets.
+	UploadPartCopy(
+		ctx context.Context,
+		in UploadPartCopyInput,
+	) (*PartInfo, map[string]string, error)
 }
 
 // BucketRef names a bucket of one generation. A bucket deleted and created
@@ -196,7 +238,9 @@ type BucketInfo struct {
 // unquoted; it is empty for objects stored before ETags were recorded.
 // Metadata is the user metadata and Headers the stored system headers, as
 // described on PutObjectInput. PartSizes lists the part sizes of an object
-// assembled by a multipart upload, and is empty for other objects.
+// assembled by a multipart upload, and is empty for other objects. Tags
+// are the object's tags, as GetObjectTagging returns them; only GetObject
+// reads them, and every other operation leaves them nil.
 type ObjectInfo struct {
 	LastModified time.Time
 	Metadata     map[string]string
@@ -205,7 +249,14 @@ type ObjectInfo struct {
 	ContentType  string
 	ETag         string
 	PartSizes    []int64
+	Tags         []Tag
 	Size         int64
+}
+
+// Tag is one tag of an object's tag set.
+type Tag struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
 }
 
 // Object is an object opened for reading. The caller must close Body.
@@ -240,12 +291,15 @@ type ListObjectsOutput struct {
 // Content-Disposition and the like), keyed by canonical header name. ACL,
 // when set, is stored as the object's ACL (see GetObjectACL) once it is
 // written, replacing any the object had, and an object written without one
-// has none; it is not part of what a copy of the object copies.
+// has none; it is not part of what a copy of the object copies. Tags are
+// stored as the object's tags in the same way, and are copied only as
+// CopyObjectInput's CopyTags says.
 type PutObjectInput struct {
 	Metadata    map[string]string
 	Headers     map[string]string
 	ContentType string
 	ACL         []byte `json:",omitempty"`
+	Tags        []Tag  `json:",omitempty"`
 }
 
 // Precondition guards a write, following S3 conditional writes. IfNoneMatch
@@ -262,17 +316,53 @@ type Precondition struct {
 // gets Replace's instead. Headers, when set, are set on the copy over
 // either, such as the encryption headers a copy gets from its own request;
 // an empty value removes the header.
-// ACL is the copy's ACL, as PutObjectInput's. Precondition applies to the
-// destination.
+// ACL is the copy's ACL, as PutObjectInput's. Tags are the copy's tags,
+// unless CopyTags is set, which gives it its source's instead, as S3's
+// COPY tagging directive does. Precondition applies to the destination,
+// and SourceCondition to the source as it is read.
 type CopyObjectInput struct {
-	Replace      *PutObjectInput
-	Headers      map[string]string
-	ACL          []byte
-	SrcBucket    string
-	SrcKey       string
-	DstBucket    string
-	DstKey       string
-	Precondition Precondition
+	Replace         *PutObjectInput
+	Headers         map[string]string
+	SourceCondition SourceCondition
+	ACL             []byte
+	Tags            []Tag
+	SrcBucket       string
+	SrcKey          string
+	DstBucket       string
+	DstKey          string
+	Precondition    Precondition
+	CopyTags        bool
+}
+
+// SourceCondition guards a copy's source, following S3's
+// x-amz-copy-source-if-* headers and RFC 7232's order of evaluation: a set
+// IfMatch, an unquoted ETag or "*", replaces IfUnmodifiedSince, and a set
+// IfNoneMatch replaces IfModifiedSince. The zero value always holds.
+type SourceCondition struct {
+	IfModifiedSince   *time.Time
+	IfUnmodifiedSince *time.Time
+	IfMatch           string
+	IfNoneMatch       string
+}
+
+// UploadPartCopyInput copies SrcBucket/SrcKey, or its Range, into part
+// PartNumber of upload UploadID of Bucket/Key.
+type UploadPartCopyInput struct {
+	Range           *CopyRange
+	SourceCondition SourceCondition
+	Bucket          string
+	Key             string
+	UploadID        string
+	SrcBucket       string
+	SrcKey          string
+	PartNumber      int
+}
+
+// CopyRange is the bytes First to Last of a source object, both included
+// and counted from 0.
+type CopyRange struct {
+	First int64
+	Last  int64
 }
 
 // CompletedPart names one uploaded part in a CompleteMultipartUpload request.

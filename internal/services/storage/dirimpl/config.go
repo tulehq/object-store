@@ -83,9 +83,10 @@ func (s *Service) DeleteBucketConfig(
 	return nil
 }
 
-// resetConfigs removes the policy, configuration and object ACLs bucket
-// has, which an interrupted DeleteBucket can leave, and stores configs as
-// its configuration, for CreateBucket, which holds the bucket's write lock.
+// resetConfigs removes the policy, configuration, object ACLs and object
+// tags bucket has, which an interrupted DeleteBucket can leave, and stores
+// configs as its configuration, for CreateBucket, which holds the bucket's
+// write lock.
 func (s *Service) resetConfigs(bucket string, configs map[contracts.BucketConfig][]byte) error {
 	if err := s.removePolicy(bucket); err != nil {
 		return err
@@ -102,8 +103,8 @@ func (s *Service) resetConfigs(bucket string, configs map[contracts.BucketConfig
 	return nil
 }
 
-// removeConfigs removes every configuration and object ACL of bucket. The
-// caller holds the bucket's write lock.
+// removeConfigs removes every configuration, object ACL and object tag
+// set of bucket. The caller holds the bucket's write lock.
 func (s *Service) removeConfigs(bucket string) error {
 	for _, kind := range contracts.BucketConfigs {
 		if err := s.removeIfExists(configFile(kind, bucket)); err != nil {
@@ -113,6 +114,10 @@ func (s *Service) removeConfigs(bucket string) error {
 	}
 	if err := s.root.RemoveAll(filepath.Join(aclDir, bucket)); err != nil {
 		return fmt.Errorf("%s: failed to delete the object ACLs of bucket %s: %w",
+			s.Name(), bucket, err)
+	}
+	if err := s.root.RemoveAll(filepath.Join(tagDir, bucket)); err != nil {
+		return fmt.Errorf("%s: failed to delete the object tags of bucket %s: %w",
 			s.Name(), bucket, err)
 	}
 	return nil

@@ -157,14 +157,23 @@ func (s *Service) UploadPart(
 	if err != nil {
 		return "", nil, err
 	}
+	etag, err := s.storePart(uploadID, partNumber, body)
+	if err != nil {
+		return "", nil, err
+	}
+	return etag, m.Put.Headers, nil
+}
 
+// storePart streams body into part partNumber of upload uploadID,
+// replacing any earlier upload of the part, and returns its ETag.
+func (s *Service) storePart(uploadID string, partNumber int, body io.Reader) (string, error) {
 	tmp := filepath.Join(uploadDir(uploadID), "tmp-"+rand.Text())
 	etag, err := s.writePart(tmp, body)
 	if err != nil {
 		if rmErr := s.root.Remove(tmp); rmErr != nil && !errors.Is(rmErr, fs.ErrNotExist) {
 			err = errors.Join(err, rmErr)
 		}
-		return "", nil, fmt.Errorf(
+		return "", fmt.Errorf(
 			"%s: upload part %d of %s: %w",
 			s.Name(),
 			partNumber,
@@ -174,7 +183,7 @@ func (s *Service) UploadPart(
 	}
 
 	if err = s.root.Rename(tmp, partFile(uploadID, partNumber)); err != nil {
-		return "", nil, fmt.Errorf(
+		return "", fmt.Errorf(
 			"%s: upload part %d of %s: %w",
 			s.Name(),
 			partNumber,
@@ -183,7 +192,7 @@ func (s *Service) UploadPart(
 		)
 	}
 	if err = s.root.WriteFile(partETagFile(uploadID, partNumber), []byte(etag), 0o644); err != nil {
-		return "", nil, fmt.Errorf(
+		return "", fmt.Errorf(
 			"%s: upload part %d of %s: %w",
 			s.Name(),
 			partNumber,
@@ -191,8 +200,115 @@ func (s *Service) UploadPart(
 			err,
 		)
 	}
+	return etag, nil
+}
 
-	return etag, m.Put.Headers, nil
+// UploadPartCopy stores the bytes of in's source object in in.Range, or
+// all of them, as part in.PartNumber of an upload, replacing any earlier
+// upload of the part, if in.SourceCondition holds of the source as it is
+// read. The bytes are streamed from the source as it was opened, so a
+// source written over meanwhile is copied whole as it was. A range must be
+// within the source, which must be larger than MinRangeCopySource, and
+// the copy at most MaxCopyPartSize. ctx must be pinned to both buckets.
+func (s *Service) UploadPartCopy(
+	ctx context.Context,
+	in contracts.UploadPartCopyInput,
+) (_ *contracts.PartInfo, _ map[string]string, err error) {
+	m, err := s.loadUpload(ctx, in.Bucket, in.Key, in.UploadID)
+	if err != nil {
+		return nil, nil, err
+	}
+	src, err := s.GetObject(ctx, in.SrcBucket, in.SrcKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() {
+		if cErr := src.Body.Close(); cErr != nil {
+			err = errors.Join(err, fmt.Errorf("%s: copy %q: %w", s.Name(), in.SrcKey, cErr))
+		}
+	}()
+	if err = checkSourceCondition(in.SourceCondition, &src.ObjectInfo); err != nil {
+		return nil, nil, err
+	}
+	first, length, err := copySpan(in.Range, src.Size)
+	if err != nil {
+		return nil, nil, err
+	}
+	// The object body seeks within the object bytes (see objectBody).
+	rs, ok := src.Body.(io.Seeker)
+	if !ok {
+		return nil, nil, fmt.Errorf("%s: copy %q: body %T is not seekable",
+			s.Name(), in.SrcKey, src.Body)
+	}
+	if _, err = rs.Seek(first, io.SeekStart); err != nil {
+		return nil, nil, fmt.Errorf("%s: copy %q: %w", s.Name(), in.SrcKey, err)
+	}
+	part, err := s.copyPart(in, io.LimitReader(src.Body, length), length)
+	if err != nil {
+		return nil, nil, err
+	}
+	return part, m.Put.Headers, nil
+}
+
+// copyPart stores the length bytes body yields as part in.PartNumber of
+// upload in.UploadID, failing if body ends early.
+func (s *Service) copyPart(
+	in contracts.UploadPartCopyInput,
+	body io.Reader,
+	length int64,
+) (*contracts.PartInfo, error) {
+	cr := &countingReader{r: body}
+	etag, err := s.storePart(in.UploadID, in.PartNumber, cr)
+	if err != nil {
+		return nil, err
+	}
+	if cr.n != length {
+		return nil, fmt.Errorf("%s: copy %q: read %d of %d bytes: %w",
+			s.Name(), in.SrcKey, cr.n, length, io.ErrUnexpectedEOF)
+	}
+	stat, err := s.root.Stat(partFile(in.UploadID, in.PartNumber))
+	if err != nil {
+		return nil, fmt.Errorf("%s: stat part %d of %s: %w",
+			s.Name(), in.PartNumber, in.UploadID, err)
+	}
+	return &contracts.PartInfo{
+		PartNumber: in.PartNumber, ETag: etag, Size: length, LastModified: stat.ModTime(),
+	}, nil
+}
+
+// copySpan returns the offset and length of the bytes of a source of size
+// bytes that rng selects, all of them when it is nil:
+// contracts.ErrRangeCopySourceTooSmall for a range of a source no larger
+// than MinRangeCopySource, contracts.ErrInvalidCopyRange for one that does
+// not end within the source, and contracts.ErrEntityTooLarge for more than
+// MaxCopyPartSize bytes.
+func copySpan(rng *contracts.CopyRange, size int64) (int64, int64, error) {
+	first, length := int64(0), size
+	if rng != nil {
+		if size <= contracts.MinRangeCopySource {
+			return 0, 0, contracts.ErrRangeCopySourceTooSmall
+		}
+		if rng.First < 0 || rng.Last < rng.First || rng.Last >= size {
+			return 0, 0, contracts.ErrInvalidCopyRange
+		}
+		first, length = rng.First, rng.Last-rng.First+1
+	}
+	if length > contracts.MaxCopyPartSize {
+		return 0, 0, contracts.ErrEntityTooLarge
+	}
+	return first, length, nil
+}
+
+// countingReader counts the bytes read through it.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err //nolint:wrapcheck // io.Reader contract: EOF must pass through unwrapped
 }
 
 // writePart streams body into name and returns the hex MD5 of what it wrote.
@@ -262,6 +378,9 @@ func (s *Service) CompleteMultipartUpload(
 	}
 
 	if err = s.setObjectACL(bucket, info, m.Put.ACL); err != nil {
+		return nil, err
+	}
+	if err = s.setObjectTags(bucket, info, m.Put.Tags); err != nil {
 		return nil, err
 	}
 

@@ -20,21 +20,26 @@ const maxACLDocument = 64 * 1024
 
 // writeSettings is what a write needs from its bucket's configuration and
 // its request beyond the object: the ACL to store with the object, nil for
-// none, and the encryption headers it is stored and answered with.
+// none, the encryption headers it is stored and answered with, and the
+// tags of its x-amz-tagging header.
 type writeSettings struct {
 	encryption map[string]string
 	acl        []byte
+	tags       []contracts.Tag
 }
 
-// settings reads the ACL and encryption of a PutObject, CopyObject or
-// CreateMultipartUpload request r by caller to bucket, ctx being pinned to
-// it. The ACL is checked as writeACL describes; the encryption is r's or
-// the bucket's default (s3api.EncryptionHeaders).
+// settings reads the ACL, encryption and, with readTags, tags of a
+// PutObject, CopyObject or CreateMultipartUpload request r by caller to
+// bucket, ctx being pinned to it. The ACL is checked as writeACL
+// describes; the encryption is r's or the bucket's default
+// (s3api.EncryptionHeaders); the tags are s3api.RequestTags', and none
+// without readTags.
 func (m *Module) settings(
 	ctx context.Context,
 	r *http.Request,
 	caller *authz.Caller,
 	bucket string,
+	readTags bool,
 ) (*writeSettings, error) {
 	acl, err := m.writeACL(ctx, r, caller, bucket)
 	if err != nil {
@@ -48,7 +53,13 @@ func (m *Module) settings(
 	if err != nil {
 		return nil, err //nolint:wrapcheck // an S3 error, answered as is
 	}
-	return &writeSettings{encryption: enc, acl: acl}, nil
+	ws := &writeSettings{encryption: enc, acl: acl}
+	if readTags {
+		if ws.tags, err = s3api.RequestTags(r); err != nil {
+			return nil, err //nolint:wrapcheck // an S3 error, answered as is
+		}
+	}
+	return ws, nil
 }
 
 // setEncryptionHeaders sets the encryption headers of a write's response.

@@ -38,8 +38,13 @@ func (m *Module) getObject(ctx gas.Context) error {
 		return m.listParts(ctx, t)
 	}
 
-	if s3api.Subresource(r) == "acl" {
+	switch s3api.Subresource(r) {
+	case "acl":
 		return m.getObjectACL(ctx, t)
+	case "tagging":
+		return m.getObjectTagging(ctx, t)
+	case "attributes":
+		return m.getObjectAttributes(ctx, t)
 	}
 	if err := s3api.CheckSubresource(r, "partNumber"); err != nil {
 		return s3api.WriteError(ctx, t, err)
@@ -65,15 +70,23 @@ func (m *Module) getObject(ctx gas.Context) error {
 			m.logger.Warn("failed to close object body").Err("error", cErr).Send()
 		}
 	}()
-	return m.serveObject(ctx, t, obj)
+	return m.serveObject(ctx, g.Caller(), t, obj)
 }
 
-// serveObject answers a GetObject of t with obj, open.
-func (m *Module) serveObject(ctx gas.Context, t s3api.Target, obj *contracts.Object) error {
+// serveObject answers caller's GetObject of t with obj, open.
+func (m *Module) serveObject(
+	ctx gas.Context,
+	caller *authz.Caller,
+	t s3api.Target,
+	obj *contracts.Object,
+) error {
 	r := ctx.Request()
 	w := ctx.ResponseWriter()
 	info := &obj.ObjectInfo
 	if err := checkReadEncryption(r, info); err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
+	if err := setTagCount(w, caller, t, info.Tags); err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
 
@@ -108,16 +121,24 @@ func (m *Module) headObject(ctx gas.Context) error {
 	}
 	defer g.Release()
 
-	info, err := m.storage.StatObject(g.Context(), t.Bucket, t.Key)
+	// The object is opened, rather than stated, to read its tags with it.
+	obj, err := m.storage.GetObject(g.Context(), t.Bucket, t.Key)
 	if err != nil {
 		// A HEAD's error has no body; the status alone tells 403 from 404.
 		return s3api.WriteError(ctx, t, g.NotFound(t.Bucket, err))
 	}
+	if err = obj.Body.Close(); err != nil {
+		return s3api.WriteError(ctx, t, fmt.Errorf("close object %q: %w", t.Key, err))
+	}
+	info := &obj.ObjectInfo
 	if err = checkReadEncryption(r, info); err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
 
 	w := ctx.ResponseWriter()
+	if err = setTagCount(w, g.Caller(), t, info.Tags); err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
 	setObjectHeaders(w, info)
 
 	if v := r.URL.Query().Get("partNumber"); v != "" {
@@ -188,8 +209,11 @@ func (m *Module) putObject(ctx gas.Context) error {
 		return m.uploadPart(ctx, t)
 	}
 
-	if s3api.Subresource(r) == "acl" {
+	switch s3api.Subresource(r) {
+	case "acl":
 		return m.putObjectACL(ctx, t)
+	case "tagging":
+		return m.putObjectTagging(ctx, t)
 	}
 	if err := s3api.CheckSubresource(r); err != nil {
 		return s3api.WriteError(ctx, t, err)
@@ -215,7 +239,7 @@ func (m *Module) uploadObject(ctx gas.Context, t s3api.Target) error {
 		return s3api.WriteError(ctx, t, err)
 	}
 
-	ws, err := m.settings(g.Context(), r, g.Caller(), t.Bucket)
+	ws, err := m.settings(g.Context(), r, g.Caller(), t.Bucket, true)
 	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
@@ -253,7 +277,8 @@ func (m *Module) copyObject(ctx gas.Context, t s3api.Target) error {
 
 	// The copy is encrypted and given an ACL as its own request says, or
 	// its bucket's default, not as its source was.
-	ws, err := m.settings(g.Context(), ctx.Request(), g.Caller(), t.Bucket)
+	ws, err := m.settings(g.Context(), ctx.Request(), g.Caller(), t.Bucket,
+		replacesTags(ctx.Request()))
 	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
@@ -267,6 +292,9 @@ func (m *Module) copyObject(ctx gas.Context, t s3api.Target) error {
 		in.Headers[k] = v
 	}
 	in.ACL = ws.acl
+	// Under COPY, the default, the copy takes its source's tags and the
+	// request's x-amz-tagging is not read.
+	in.CopyTags, in.Tags = !replacesTags(ctx.Request()), ws.tags
 
 	info, err := m.storage.CopyObject(g.Context(), in)
 	if err != nil {
@@ -291,6 +319,14 @@ func (m *Module) copyNotFound(g *authz.Grant, in contracts.CopyObjectInput, err 
 		bucket = in.SrcBucket
 	}
 	return g.NotFound(bucket, err)
+}
+
+// replacesTags reports whether r, a CopyObject, gives the copy its own
+// tags, x-amz-tagging-directive REPLACE, rather than its source's, COPY,
+// the default (CopyObject API reference). copyInput refuses any other
+// directive.
+func replacesTags(r *http.Request) bool {
+	return r.Header.Get(s3api.HeaderTaggingDirective) == "REPLACE"
 }
 
 // precondition reads the If-Match and If-None-Match headers of a write. S3
@@ -346,6 +382,9 @@ func (m *Module) deleteObject(ctx gas.Context) error {
 		return m.abortMultipartUpload(ctx, t)
 	}
 
+	if s3api.Subresource(r) == "tagging" {
+		return m.deleteObjectTagging(ctx, t)
+	}
 	if err := s3api.CheckSubresource(r); err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
