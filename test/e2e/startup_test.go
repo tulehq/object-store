@@ -20,11 +20,11 @@ func TestStartupBuckets(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	c := clientFor(startServer(t, false, env))
+	c := clientFor(startLive(t, env))
 	put(t, c, "uploads", "kept.txt", []byte("kept"))
 
 	// A restart on the same root finds the buckets already there.
-	c = clientFor(startServer(t, false, env))
+	c = clientFor(startLive(t, env))
 	list, err := c.ListBuckets(ctx, &s3.ListBucketsInput{})
 	requireNoErr(t, err, "list buckets")
 	names := make([]string, 0, len(list.Buckets))
@@ -40,7 +40,7 @@ func TestStartupBuckets(t *testing.T) {
 }
 
 func TestProbes(t *testing.T) {
-	srv := startServer(t, false, nil)
+	srv := startLive(t, nil)
 
 	for _, path := range []string{"/_health", "/_ready"} {
 		status, _ := getWith(t, srv.Client(), srv.URL+path)

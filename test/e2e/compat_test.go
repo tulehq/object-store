@@ -242,8 +242,8 @@ func TestListMultipartUploads(t *testing.T) {
 }
 
 func TestVirtualHostedStyle(t *testing.T) {
-	srv := startServer(t, false, nil)
-	addr := srv.Listener.Addr().String()
+	srv := startLive(t, nil)
+	addr := srv.Addr
 	_, port, _ := net.SplitHostPort(addr)
 
 	// Send every <bucket>.localhost request to the test server, whatever the
@@ -342,7 +342,7 @@ func TestBrowserCORS(t *testing.T) {
 }
 
 func TestSignatureVerification(t *testing.T) {
-	srv := startServer(t, true, map[string]string{
+	srv := startLiveTLS(t, map[string]string{
 		"TULE_Auth_AccessKeyID":     "AKIDTEST",
 		"TULE_Auth_SecretAccessKey": "s3cr3t",
 	})

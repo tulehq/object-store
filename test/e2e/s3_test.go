@@ -9,7 +9,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
-	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -18,13 +17,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
-	"github.com/gasmod/gas/config"
-
-	"tule.dev/object-store/internal/app"
 )
 
-// newClient starts the app in-process on a fresh storage root and returns an
-// SDK client pointed at it.
+// newClient starts the app on a fresh storage root and returns an SDK client
+// pointed at it.
 func newClient(t *testing.T) *s3.Client {
 	t.Helper()
 	return startClient(t, false)
@@ -34,58 +30,15 @@ func newClient(t *testing.T) *s3.Client {
 // streams unseekable bodies with aws-chunked trailing checksums over TLS.
 func startClient(t *testing.T, useTLS bool) *s3.Client {
 	t.Helper()
-	return clientFor(startServer(t, useTLS, nil))
-}
-
-// startServer starts the app in-process on a fresh storage root, with env
-// setting extra TULE_ variables. It accepts the test/test credentials
-// clientFor signs with unless env changes them.
-func startServer(t *testing.T, useTLS bool, env map[string]string) *httptest.Server {
-	t.Helper()
-
-	t.Setenv("TULE_GasEnv", "testing")
-	t.Setenv("TULE_Storage_RootDir", t.TempDir())
-	t.Setenv("TULE_Auth_AccessKeyID", "test")
-	t.Setenv("TULE_Auth_SecretAccessKey", "test")
-	for k, v := range env {
-		t.Setenv(k, v)
-	}
-
-	cfg, err := app.LoadConfigFrom(config.NewEnvProvider(
-		config.WithEnvSeparator("_"),
-		config.WithEnvPrefix("TULE_"),
-	))
-	if err != nil {
-		t.Fatalf("load config: %v", err)
-	}
-
-	a, err := app.New(cfg)
-	if err != nil {
-		t.Fatalf("new app: %v", err)
-	}
-	if err = a.Start(context.Background()); err != nil {
-		t.Fatalf("start app: %v", err)
-	}
-
-	srv := httptest.NewUnstartedServer(a.Handler())
 	if useTLS {
-		srv.StartTLS()
-	} else {
-		srv.Start()
+		return clientFor(startLiveTLS(t, nil))
 	}
-	t.Cleanup(func() {
-		srv.Close()
-		if sErr := a.Shutdown(context.Background()); sErr != nil {
-			t.Errorf("shutdown: %v", sErr)
-		}
-	})
-
-	return srv
+	return clientFor(startLive(t, nil))
 }
 
 // clientFor returns a path-style SDK client for srv, with the test/test
 // credentials unless opts change them.
-func clientFor(srv *httptest.Server, opts ...func(*s3.Options)) *s3.Client {
+func clientFor(srv *liveServer, opts ...func(*s3.Options)) *s3.Client {
 	return s3.New(s3.Options{
 		Region:       "us-east-1",
 		BaseEndpoint: aws.String(srv.URL),

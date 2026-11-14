@@ -20,11 +20,19 @@ import (
 
 // liveServer is object-store run as the binary runs it: the app's own
 // HTTP server (App.Serve) listening on a free port, called over the
-// network, rather than its handler served by httptest.
+// network.
 type liveServer struct {
+	httpClient *http.Client
+
 	// URL is the server's base URL.
 	URL string
+	// Addr is the host:port URL points at.
+	Addr string
 }
+
+// Client returns an HTTP client for l, which trusts its certificate when
+// it serves TLS. Its idle connections are closed when the test ends.
+func (l *liveServer) Client() *http.Client { return l.httpClient }
 
 // startLive starts the app on a fresh storage root and a free port, with
 // env setting extra TULE_ variables over the test/test credentials, waits
@@ -62,7 +70,10 @@ func startLive(t *testing.T, env map[string]string) *liveServer {
 		}
 	})
 
-	l := &liveServer{URL: "http://127.0.0.1:" + strconv.Itoa(port)}
+	addr := "127.0.0.1:" + strconv.Itoa(port)
+	tr := &http.Transport{}
+	t.Cleanup(tr.CloseIdleConnections)
+	l := &liveServer{URL: "http://" + addr, Addr: addr, httpClient: &http.Client{Transport: tr}}
 	l.waitReady(t, served)
 	return l
 }
