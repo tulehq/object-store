@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"tule.dev/object-store/internal/contracts"
 	"tule.dev/object-store/internal/s3api"
@@ -21,6 +22,13 @@ func copyInput(r *http.Request, dst s3api.Target) (contracts.CopyObjectInput, er
 
 	if in.Precondition, err = precondition(r); err != nil {
 		return in, err
+	}
+	in.SourceCondition = sourceCondition(r)
+
+	switch d := r.Header.Get(s3api.HeaderTaggingDirective); d {
+	case "", "COPY", "REPLACE":
+	default:
+		return in, s3api.ErrInvalidArgument("Unknown tagging directive " + d)
 	}
 
 	switch d := r.Header.Get("X-Amz-Metadata-Directive"); d {
@@ -63,4 +71,28 @@ func parseCopySource(v string) (bucket, key string, err error) {
 	}
 
 	return bucket, key, nil
+}
+
+// sourceCondition reads the x-amz-copy-source-if-* headers of a CopyObject
+// or UploadPartCopy. An ETag is compared without its quotes. A date that
+// is not an HTTP date is ignored, as RFC 7232 has a recipient ignore an
+// invalid If-Modified-Since and If-Unmodified-Since; S3 documents neither
+// case.
+func sourceCondition(r *http.Request) contracts.SourceCondition {
+	date := func(h string) *time.Time {
+		t, err := http.ParseTime(r.Header.Get(h))
+		if err != nil {
+			return nil
+		}
+		return &t
+	}
+	etag := func(h string) string {
+		return strings.Trim(strings.TrimSpace(r.Header.Get(h)), `"`)
+	}
+	return contracts.SourceCondition{
+		IfMatch:           etag("X-Amz-Copy-Source-If-Match"),
+		IfNoneMatch:       etag("X-Amz-Copy-Source-If-None-Match"),
+		IfModifiedSince:   date("X-Amz-Copy-Source-If-Modified-Since"),
+		IfUnmodifiedSince: date("X-Amz-Copy-Source-If-Unmodified-Since"),
+	}
 }

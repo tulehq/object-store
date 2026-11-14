@@ -226,22 +226,22 @@ func TestUnsupportedSubresources(t *testing.T) {
 	bucket, key := aws.String("guard"), aws.String("k")
 	put(t, c, "guard", "k", []byte("original"))
 
-	_, err := c.PutObjectTagging(ctx, &s3.PutObjectTaggingInput{
+	_, err := c.PutObjectRetention(ctx, &s3.PutObjectRetentionInput{
 		Bucket: bucket,
 		Key:    key,
-		Tagging: &types.Tagging{
-			TagSet: []types.Tag{{Key: aws.String("a"), Value: aws.String("b")}},
+		Retention: &types.ObjectLockRetention{
+			Mode: types.ObjectLockRetentionModeGovernance,
 		},
 	})
 	requireCode(t, err, "NotImplemented")
 	_, body := get(t, c, &s3.GetObjectInput{Bucket: bucket, Key: key})
-	requireEqual(t, string(body), "original", "object untouched by tagging request")
+	requireEqual(t, string(body), "original", "object untouched by retention request")
 
 	_, err = c.DeleteBucketLifecycle(ctx, &s3.DeleteBucketLifecycleInput{Bucket: bucket})
 	requireCode(t, err, "NotImplemented")
 	_, err = c.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: bucket})
 	requireNoErr(t, err, "bucket survives delete-lifecycle request")
 
-	_, err = c.GetObjectTagging(ctx, &s3.GetObjectTaggingInput{Bucket: bucket, Key: key})
+	_, err = c.GetObjectLegalHold(ctx, &s3.GetObjectLegalHoldInput{Bucket: bucket, Key: key})
 	requireCode(t, err, "NotImplemented")
 }

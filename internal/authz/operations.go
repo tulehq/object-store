@@ -59,6 +59,12 @@ const (
 	PutBucketEncryption           Operation = "PutBucketEncryption"
 	GetBucketEncryption           Operation = "GetBucketEncryption"
 	DeleteBucketEncryption        Operation = "DeleteBucketEncryption"
+
+	PutObjectTagging    Operation = "PutObjectTagging"
+	GetObjectTagging    Operation = "GetObjectTagging"
+	DeleteObjectTagging Operation = "DeleteObjectTagging"
+	UploadPartCopy      Operation = "UploadPartCopy"
+	GetObjectAttributes Operation = "GetObjectAttributes"
 )
 
 // resourceKind is the S3 resource type an action is evaluated on, in the
@@ -89,6 +95,12 @@ type check struct {
 	// operations, which answer another account's allowed principal with
 	// 405 MethodNotAllowed.
 	ownerOnly bool
+	// onWrite marks a check a write's headers add on the object it
+	// replaces, which takes no s3:ExistingObjectTag keys, as the write
+	// itself takes none: "When granting permissions for the PUT Object and
+	// DELETE Object operations, this condition key is not supported."
+	// ("Tagging and access control policies", S3 User Guide).
+	onWrite bool
 }
 
 // operations maps every routed operation to the evaluations it needs, in
@@ -102,8 +114,11 @@ type check struct {
 // s3:ListMultipartUploadParts, and the multipart writes as s3:PutObject.
 //
 // An operation on several resources has one check per resource, made in
-// turn: CopyObject needs s3:PutObject on the destination and s3:GetObject on
-// the source. DeleteObjects is checked once per key it names, each key
+// turn: CopyObject and UploadPartCopy need s3:PutObject on the destination
+// and s3:GetObject on the source ("You must have the s3:GetObject
+// permission to read the source object that is being copied" and "the
+// s3:PutObject permission to write the object copy", their API
+// references). DeleteObjects is checked once per key it names, each key
 // answered on its own. The Delete operations of the bucket configurations
 // are evaluated as the configuration's Put action, as the reference lists
 // them (DeleteBucketTagging as s3:PutBucketTagging, DeleteBucketCors as
@@ -111,15 +126,20 @@ type check struct {
 // Delete as s3:PutEncryptionConfiguration and
 // s3:GetEncryptionConfiguration.
 //
-// A write that sets an ACL or an Object Ownership needs more actions,
-// which headerChecks adds. The actions the reference lists for features
-// this server does not implement (object tagging, object lock, versions)
-// are not checked. Requests for their subresources (?tagging on an object,
-// ?versionId and the like) are refused with NotImplemented before they are
-// evaluated, but the tagging and object lock headers of a write
-// (x-amz-tagging, x-amz-object-lock-*) are accepted and ignored, so a
-// write carrying them needs only s3:PutObject here, where S3 would also
-// need s3:PutObjectTagging and the like.
+// GetObjectAttributes needs both s3:GetObject and s3:GetObjectAttributes:
+// "If you do not pass a version ID in your request, you need the
+// s3:GetObject and s3:GetObjectAttributes permissions." (its API
+// reference), where the reference's operation entry lists only
+// s3:GetObject and s3:GetObjectVersion.
+//
+// A write that sets an ACL, tags or an Object Ownership needs more
+// actions, which headerChecks adds. The actions the reference lists for
+// features this server does not implement (object lock, versions) are not
+// checked. Requests for their subresources (?versionId, ?retention and the
+// like) are refused with NotImplemented before they are evaluated, but the
+// object lock headers of a write (x-amz-object-lock-*) are accepted and
+// ignored, so a write carrying them needs only s3:PutObject here, where S3
+// would also need s3:PutObjectRetention and the like.
 //
 // operations_test.go holds every entry to the reference, and the app's
 // tests drive every operation through its handler.
@@ -194,6 +214,17 @@ var operations = map[Operation][]check{
 	DeleteBucketEncryption: {
 		{action: "s3:PutEncryptionConfiguration", kind: bucketResource},
 	},
+	PutObjectTagging:    {{action: "s3:PutObjectTagging", kind: objectResource}},
+	GetObjectTagging:    {{action: "s3:GetObjectTagging", kind: objectResource}},
+	DeleteObjectTagging: {{action: "s3:DeleteObjectTagging", kind: objectResource}},
+	UploadPartCopy: {
+		{action: "s3:PutObject", kind: objectResource},
+		{action: "s3:GetObject", kind: objectResource},
+	},
+	GetObjectAttributes: {
+		{action: "s3:GetObject", kind: objectResource},
+		{action: "s3:GetObjectAttributes", kind: objectResource},
+	},
 }
 
 // headerChecks are the checks a write needs on top of its entry for the
@@ -223,7 +254,16 @@ var operations = map[Operation][]check{
 //     bucket policies") grants only s3:PutObject, conditioned on
 //     s3:x-amz-acl being bucket-owner-full-control. A grant header always
 //     needs s3:PutObjectAcl, even one that names the owner alone; that is
-//     a choice.
+//     a choice;
+//   - PutObject, CreateMultipartUpload and CopyObject with a non-empty
+//     x-amz-tagging need s3:PutObjectTagging ("To successfully set the
+//     tag-set with your PutObject request, you must have the
+//     s3:PutObjectTagging", PutObject API reference; the reference lists
+//     it for all three), a copy only under the REPLACE tagging directive,
+//     as under COPY the header is not read. A copy that takes its source's
+//     tags needs only s3:PutObject, a choice S3 does not document. The
+//     check takes no s3:ExistingObjectTag keys, nor does the
+//     s3:PutObjectAcl above (see onWrite).
 func headerChecks(op Operation, r *http.Request) []check {
 	switch op {
 	case CreateBucket:
@@ -237,11 +277,30 @@ func headerChecks(op Operation, r *http.Request) []check {
 		}
 		return checks
 	case PutObject, CopyObject, CreateMultipartUpload:
-		if s3api.HasACLHeaders(r) && !ownerCannedACL(r) {
-			return []check{{action: "s3:PutObjectAcl", kind: objectResource}}
-		}
+		return objectWriteChecks(op, r)
 	}
 	return nil
+}
+
+// objectWriteChecks are the header checks of op, an object write, with r:
+// s3:PutObjectAcl and s3:PutObjectTagging, as headerChecks describes.
+func objectWriteChecks(op Operation, r *http.Request) []check {
+	var checks []check
+	if s3api.HasACLHeaders(r) && !ownerCannedACL(r) {
+		checks = append(checks,
+			check{action: "s3:PutObjectAcl", kind: objectResource, onWrite: true})
+	}
+	if r.Header.Get(s3api.HeaderTagging) != "" && (op != CopyObject || replacesTags(r)) {
+		checks = append(checks,
+			check{action: "s3:PutObjectTagging", kind: objectResource, onWrite: true})
+	}
+	return checks
+}
+
+// replacesTags reports whether r, a CopyObject, gives the copy its own
+// tags rather than its source's: under x-amz-tagging-directive REPLACE.
+func replacesTags(r *http.Request) bool {
+	return r.Header.Get(s3api.HeaderTaggingDirective) == "REPLACE"
 }
 
 // onlyPrivate reports whether r's only ACL header is x-amz-acl: private.
@@ -273,6 +332,8 @@ func HeaderActions(op Operation) []string {
 	r := &http.Request{Header: http.Header{}}
 	r.Header.Set("X-Amz-Acl", "public-read")
 	r.Header.Set("X-Amz-Object-Ownership", "ObjectWriter")
+	r.Header.Set(s3api.HeaderTagging, "k=v")
+	r.Header.Set(s3api.HeaderTaggingDirective, "REPLACE")
 	checks := headerChecks(op, r)
 	actions := make([]string, len(checks))
 	for i, c := range checks {

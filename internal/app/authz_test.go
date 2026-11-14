@@ -434,6 +434,38 @@ var calls = map[authz.Operation]call{
 	authz.DeleteBucketEncryption: func(ctx context.Context, c *s3.Client) error {
 		return sdkErr(c.DeleteBucketEncryption(ctx, &s3.DeleteBucketEncryptionInput{Bucket: cfg}))
 	},
+	authz.PutObjectTagging: func(ctx context.Context, c *s3.Client) error {
+		return sdkErr(c.PutObjectTagging(ctx, &s3.PutObjectTaggingInput{
+			Bucket: b, Key: key, Tagging: &s3types.Tagging{TagSet: []s3types.Tag{
+				{Key: aws.String("team"), Value: aws.String("dev")},
+			}},
+		}))
+	},
+	authz.GetObjectTagging: func(ctx context.Context, c *s3.Client) error {
+		return sdkErr(c.GetObjectTagging(ctx, &s3.GetObjectTaggingInput{Bucket: b, Key: key}))
+	},
+	authz.DeleteObjectTagging: func(ctx context.Context, c *s3.Client) error {
+		return sdkErr(c.DeleteObjectTagging(ctx,
+			&s3.DeleteObjectTaggingInput{Bucket: b, Key: key}))
+	},
+	authz.UploadPartCopy: func(ctx context.Context, c *s3.Client) error {
+		_, err := c.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
+			Bucket: b, Key: key, UploadId: aws.String("none"), PartNumber: aws.Int32(1),
+			CopySource: aws.String("bkt/k"),
+		})
+		var apiErr smithy.APIError
+		if errors.As(err, &apiErr) && apiErr.ErrorCode() == "NoSuchUpload" {
+			return nil
+		}
+		return sdkErr(nil, err)
+	},
+	authz.GetObjectAttributes: func(ctx context.Context, c *s3.Client) error {
+		return sdkErr(c.GetObjectAttributes(ctx, &s3.GetObjectAttributesInput{
+			Bucket: b, Key: key, ObjectAttributes: []s3types.ObjectAttributes{
+				s3types.ObjectAttributesEtag,
+			},
+		}))
+	},
 }
 
 // sdkErr returns an SDK call's error, wrapped; errors.As still finds its

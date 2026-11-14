@@ -55,7 +55,7 @@ func (m *Module) createMultipartUpload(ctx gas.Context, t s3api.Target) error {
 
 	// The upload's object is encrypted and given an ACL as this request
 	// says, when it completes.
-	ws, err := m.settings(g.Context(), ctx.Request(), g.Caller(), t.Bucket)
+	ws, err := m.settings(g.Context(), ctx.Request(), g.Caller(), t.Bucket, true)
 	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
@@ -77,7 +77,7 @@ func (m *Module) uploadPart(ctx gas.Context, t s3api.Target) error {
 	r := ctx.Request()
 
 	if r.Header.Get("X-Amz-Copy-Source") != "" {
-		return s3api.WriteError(ctx, t, s3api.ErrNotImplemented("UploadPartCopy is not supported."))
+		return m.uploadPartCopy(ctx, t)
 	}
 	g, err := m.authz.AuthorizeAndPin(ctx, r, authz.UploadPart, t)
 	if err != nil {
@@ -114,6 +114,89 @@ func (m *Module) uploadPart(ctx gas.Context, t s3api.Target) error {
 	setEncryptionHeaders(ctx.ResponseWriter(), encryptionOf(headers))
 	ctx.ResponseWriter().WriteHeader(http.StatusOK)
 	return nil
+}
+
+// uploadPartCopy serves UploadPartCopy: UploadPart with x-amz-copy-source,
+// which copies the source, or its x-amz-copy-source-range, into the part,
+// streamed from the source as it was opened, if the
+// x-amz-copy-source-if-* conditions hold of it. It answers a
+// CopyPartResult and, as UploadPart does, the encryption headers of the
+// upload's object.
+func (m *Module) uploadPartCopy(ctx gas.Context, t s3api.Target) error {
+	r := ctx.Request()
+	srcBucket, srcKey, err := parseCopySource(r.Header.Get("X-Amz-Copy-Source"))
+	if err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
+	src := s3api.Target{Bucket: srcBucket, Key: srcKey}
+	// s3:PutObject on the destination, then s3:GetObject on the source.
+	g, err := m.authz.AuthorizeAndPin(ctx, r, authz.UploadPartCopy, t, src)
+	if err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
+	defer g.Release()
+
+	q := r.URL.Query()
+	in := contracts.UploadPartCopyInput{
+		Bucket: t.Bucket, Key: t.Key, UploadID: q.Get("uploadId"),
+		SrcBucket: srcBucket, SrcKey: srcKey, SourceCondition: sourceCondition(r),
+	}
+	if in.UploadID == "" {
+		return s3api.WriteError(ctx, t,
+			s3api.ErrInvalidArgument("uploadId is required with partNumber"))
+	}
+	if in.PartNumber, err = parsePartNumber(q.Get("partNumber")); err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
+	if in.Range, err = parseCopyRange(r.Header.Values("X-Amz-Copy-Source-Range")); err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
+
+	part, headers, err := m.storage.UploadPartCopy(g.Context(), in)
+	if err != nil {
+		return s3api.WriteError(ctx, t, g.NotFound(srcBucket, err))
+	}
+	setEncryptionHeaders(ctx.ResponseWriter(), encryptionOf(headers))
+	return ctx.XML(http.StatusOK, s3api.NewCopyPartResult(part.ETag, part.LastModified))
+}
+
+// parseCopyRange reads an x-amz-copy-source-range, given as its values:
+// nil for none, and otherwise "bytes=first-last, where the first and last
+// are the zero-based byte offsets to copy" (UploadPartCopy API reference),
+// both decimal and first at most last. Anything else, an open range or a
+// repeated header included, is 400 InvalidArgument, whose message is a
+// choice: S3 documents none.
+func parseCopyRange(values []string) (*contracts.CopyRange, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	invalid := s3api.ErrInvalidArgument("The x-amz-copy-source-range value must be of the " +
+		"form bytes=first-last where first and last are the zero-based offsets of the first " +
+		"and last bytes to copy")
+	spec, ok := strings.CutPrefix(values[0], "bytes=")
+	first, last, dash := strings.Cut(spec, "-")
+	if len(values) > 1 || !ok || !dash || !isDecimal(first) || !isDecimal(last) {
+		return nil, invalid
+	}
+	f, fErr := strconv.ParseInt(first, 10, 64)
+	l, lErr := strconv.ParseInt(last, 10, 64)
+	if fErr != nil || lErr != nil || f > l {
+		return nil, invalid
+	}
+	return &contracts.CopyRange{First: f, Last: l}, nil
+}
+
+// isDecimal reports whether s is one or more ASCII digits.
+func isDecimal(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func (m *Module) completeMultipartUpload(ctx gas.Context, t s3api.Target, uploadID string) error {

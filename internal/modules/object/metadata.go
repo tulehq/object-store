@@ -104,13 +104,15 @@ func applyResponseOverrides(w http.ResponseWriter, r *http.Request) {
 }
 
 // putInput is putInput(r) with ws's encryption headers among its headers,
-// so they are stored with the object and replayed on reads, and ws's ACL.
+// so they are stored with the object and replayed on reads, and ws's ACL
+// and tags.
 func (ws *writeSettings) putInput(r *http.Request) contracts.PutObjectInput {
 	in := putInput(r)
 	for k, v := range ws.encryption {
 		in.Headers[k] = v
 	}
 	in.ACL = ws.acl
+	in.Tags = ws.tags
 	return in
 }
 
