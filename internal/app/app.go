@@ -6,11 +6,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
 
 	"github.com/gasmod/gas"
 	"github.com/go-chi/chi/v5/middleware"
-	"github.com/go-chi/cors"
 	"tule.dev/sigv4"
 
 	"tule.dev/object-store/internal/authz"
@@ -19,6 +17,7 @@ import (
 	"tule.dev/object-store/internal/modules/bucket"
 	"tule.dev/object-store/internal/modules/health"
 	"tule.dev/object-store/internal/modules/object"
+	"tule.dev/object-store/internal/s3api"
 	"tule.dev/object-store/internal/services/storage/dirimpl"
 )
 
@@ -40,7 +39,8 @@ func New(cfg *Config, extra ...gas.Option) (*gas.App, error) {
 
 	// S3 requests are authenticated by signature, not cookies, so the
 	// cross-origin protection meant for browser sessions only gets in the way
-	// of browser uploads to presigned URLs.
+	// of browser uploads to presigned URLs, which bucketCORS answers as S3
+	// does.
 	//
 	// A request the protection still rejects, one whose path is not in the
 	// canonical form the bypass pattern matches, such as a key holding "//",
@@ -93,19 +93,24 @@ func registerAppModules(app *gas.App, _ *Config) {
 }
 
 // createBuckets returns a ready hook that creates each of names that does not
-// exist yet. Ready hooks run before the server listens, so clients never see
-// the store without them.
+// exist yet, with a new bucket's configuration (bucket.DefaultConfigs). Ready
+// hooks run before the server listens, so clients never see the store
+// without them.
 func createBuckets(names []string) func(*gas.ServiceContainer) error {
 	return func(sc *gas.ServiceContainer) error {
 		storage, err := sc.Resolve[contracts.StorageProvider]()
 		if err != nil {
 			return fmt.Errorf("app: failed to resolve storage: %w", err)
 		}
+		configs, err := bucket.DefaultConfigs(s3api.OwnershipBucketOwnerEnforced, nil)
+		if err != nil {
+			return fmt.Errorf("app: failed to build the new bucket configuration: %w", err)
+		}
 		for _, name := range names {
 			if name == "" {
 				continue
 			}
-			_, cErr := storage.CreateBucket(context.Background(), name)
+			_, cErr := storage.CreateBucket(context.Background(), name, configs)
 			if cErr != nil && !errors.Is(cErr, contracts.ErrBucketExists) {
 				return fmt.Errorf("app: failed to create bucket %q: %w", name, cErr)
 			}
@@ -115,23 +120,6 @@ func createBuckets(names []string) func(*gas.ServiceContainer) error {
 }
 
 func installMiddleware(r *gas.Router, cfg *Config, logger gas.Logger, verifier *sigv4.Verifier) {
-	r.UseMiddlewareFunc(nil, cors.Handler(cors.Options{
-		// Echo any origin back, which unlike "*" also works for credentialed
-		// requests.
-		AllowOriginFunc: func(*http.Request, string) bool { return true },
-		AllowedMethods: []string{
-			http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost, http.MethodDelete,
-		},
-		AllowedHeaders: []string{"*"},
-		ExposedHeaders: []string{
-			"ETag", "Content-Length", "Content-Range", "Content-Disposition",
-			"Content-Encoding", "Content-Language", "Expires", "Last-Modified",
-			"Accept-Ranges", "Cache-Control", "X-Amz-Mp-Parts-Count",
-		},
-		AllowCredentials: true,
-		MaxAge:           300,
-	}))
-
 	r.UseMiddlewareFunc(nil, httpx.RequestID(cfg.Env))
 
 	r.UseMiddlewareFunc(nil, middleware.ClientIPFromXFFTrustedProxies(1))
@@ -139,6 +127,10 @@ func installMiddleware(r *gas.Router, cfg *Config, logger gas.Logger, verifier *
 	r.UseMiddlewareFunc(nil, withRequestLogger(logger))
 
 	r.UseMiddlewareFunc(nil, gas.RequestLogger[httpx.RequestLogger]())
+
+	// Before the signature check, so preflights, which carry none, are
+	// answered, and so the CORS headers reach a page on its errors too.
+	r.UseMiddlewareFunc(nil, bucketCORS(cfg.Server.Domain))
 
 	r.UseMiddlewareFunc(nil, verifySignature(verifier, cfg.Server.Domain))
 	if cfg.Server.Domain != "" {

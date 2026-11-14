@@ -30,20 +30,8 @@ func (m *Module) putBucketPolicy(ctx gas.Context) error {
 	if err != nil {
 		return s3api.WriteError(ctx, target, err)
 	}
-	doc, err := s3api.ReadDocument(r, authz.MaxBucketPolicySize, m.verifier.ReadBody)
+	doc, err := m.readBucketPolicy(r, bucket)
 	if err != nil {
-		var s3Err *s3api.Error
-		if errors.As(err, &s3Err) && s3Err.Code == "MaxMessageLengthExceeded" {
-			err = authz.ErrPolicyTooLarge()
-		}
-		return s3api.WriteError(ctx, target, err)
-	}
-	if len(doc) == 0 {
-		// The error S3 lists for an empty request document.
-		return s3api.WriteError(ctx, target, s3api.NewError(http.StatusBadRequest,
-			"MissingRequestBodyError", "Request body is empty."))
-	}
-	if err = authz.ValidateBucketPolicy(bucket, doc); err != nil {
 		return s3api.WriteError(ctx, target, err)
 	}
 	bound, err := m.bind(r.Context(), doc)
@@ -58,10 +46,58 @@ func (m *Module) putBucketPolicy(ctx gas.Context) error {
 		return s3api.WriteError(ctx, target, err)
 	}
 	defer release()
+	if err = m.checkBlockPublicPolicy(pinned, bucket, doc); err != nil {
+		return s3api.WriteError(ctx, target, err)
+	}
 	if err = m.storage.PutBucketPolicy(pinned, bucket, bound); err != nil {
 		return s3api.WriteError(ctx, target, err)
 	}
 	return ctx.NoContent()
+}
+
+// readBucketPolicy reads and validates a PutBucketPolicy document for
+// bucket.
+func (m *Module) readBucketPolicy(r *http.Request, bucket string) ([]byte, error) {
+	doc, err := s3api.ReadDocument(r, authz.MaxBucketPolicySize, m.verifier.ReadBody)
+	if err != nil {
+		var s3Err *s3api.Error
+		if errors.As(err, &s3Err) && s3Err.Code == "MaxMessageLengthExceeded" {
+			err = authz.ErrPolicyTooLarge()
+		}
+		return nil, err
+	}
+	if len(doc) == 0 {
+		// The error S3 lists for an empty request document.
+		return nil, s3api.NewError(http.StatusBadRequest,
+			"MissingRequestBodyError", "Request body is empty.")
+	}
+	if err = authz.ValidateBucketPolicy(bucket, doc); err != nil {
+		return nil, err //nolint:wrapcheck // an S3 error, answered as is
+	}
+	return doc, nil
+}
+
+// checkBlockPublicPolicy refuses doc, a valid policy for bucket, when the
+// bucket's BlockPublicPolicy setting is on and doc is public
+// (authz.PublicPolicy): "Setting this option to TRUE for a bucket causes
+// Amazon S3 to reject calls to PutBucketPolicy if the specified bucket
+// policy allows public access." ("Blocking public access to your Amazon S3
+// storage", S3 User Guide). It applies to every caller, the root key
+// included. S3 documents no error for it; 403 AccessDenied, "Access
+// Denied", is what S3 is reported to answer. ctx is pinned to bucket.
+func (m *Module) checkBlockPublicPolicy(ctx context.Context, bucket string, doc []byte) error {
+	block, err := s3api.PublicAccessBlock(ctx, m.storage, bucket)
+	if err != nil || block == nil || !block.BlockPublicPolicy {
+		return err //nolint:wrapcheck // an S3 or storage error, answered as is
+	}
+	public, err := authz.PublicPolicy(doc)
+	if err != nil {
+		return fmt.Errorf("bucket: decide whether a policy of bucket %s is public: %w", bucket, err)
+	}
+	if public {
+		return s3api.NewError(http.StatusForbidden, "AccessDenied", "Access Denied")
+	}
+	return nil
 }
 
 // getBucketPolicy serves GetBucketPolicy (GET /<bucket>?policy): the

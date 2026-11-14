@@ -92,7 +92,7 @@ func TestABucketsPolicyGoesWithIt(t *testing.T) {
 	if err := s.root.WriteFile(policyFile("left"), []byte(`{}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.CreateBucket(context.Background(), "left"); err != nil {
+	if _, err := s.CreateBucket(context.Background(), "left", nil); err != nil {
 		t.Fatal(err)
 	}
 	_, _, err := s.GetBucketPolicy(context.Background(), "left")
@@ -110,7 +110,14 @@ func TestARecreatedBucketIsANewGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = s.UploadPart(ctx, "bucket", "k", id, 1, bytes.NewReader([]byte("x"))); err != nil {
+	if _, _, err = s.UploadPart(
+		ctx,
+		"bucket",
+		"k",
+		id,
+		1,
+		bytes.NewReader([]byte("x")),
+	); err != nil {
 		t.Fatal(err)
 	}
 	release()
@@ -118,7 +125,7 @@ func TestARecreatedBucketIsANewGeneration(t *testing.T) {
 	if err = s.DeleteBucket(bg, old); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = s.CreateBucket(bg, "bucket"); err != nil {
+	if _, err = s.CreateBucket(bg, "bucket", nil); err != nil {
 		t.Fatal(err)
 	}
 	if now := ref(t, s, "bucket"); now.Generation == old.Generation {
@@ -178,7 +185,7 @@ func TestDeleteBucketGivesUpOnAnOperationInProgress(t *testing.T) {
 		t.Fatalf("pin while the delete waits: %v", err)
 	}
 	rel2()
-	_, err = s.CreateBucket(bg, "bucket")
+	_, err = s.CreateBucket(bg, "bucket", nil)
 	requireIs(t, "create of the existing bucket", err, contracts.ErrBucketExists)
 	requireIs(t, "delete past its wait", <-deleted, contracts.ErrOperationAborted)
 

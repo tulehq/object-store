@@ -115,7 +115,7 @@ func newTestService(t *testing.T) *Service {
 	}
 	t.Cleanup(func() { _ = s.Close(ctx) })
 
-	if _, err := s.CreateBucket(ctx, "bucket"); err != nil {
+	if _, err := s.CreateBucket(ctx, "bucket", nil); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
 	return s

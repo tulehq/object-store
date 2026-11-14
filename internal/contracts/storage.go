@@ -46,7 +46,32 @@ var (
 	// ErrNoSuchBucketPolicy is returned by GetBucketPolicy for a bucket that
 	// has no policy.
 	ErrNoSuchBucketPolicy = errors.New("storage: the bucket has no policy")
+
+	// ErrNoSuchBucketConfig is returned by GetBucketConfig for a bucket
+	// that has no configuration of the kind asked for, and by GetObjectACL
+	// for an object that has no ACL of its own.
+	ErrNoSuchBucketConfig = errors.New("storage: the bucket has no such configuration")
 )
+
+// BucketConfig names a kind of bucket configuration, each kept as one
+// document per bucket, as S3 keeps a bucket's subresources.
+type BucketConfig string
+
+// The bucket configurations the storage keeps.
+const (
+	ConfigTagging           BucketConfig = "tagging"
+	ConfigCORS              BucketConfig = "cors"
+	ConfigPublicAccessBlock BucketConfig = "publicAccessBlock"
+	ConfigOwnership         BucketConfig = "ownershipControls"
+	ConfigEncryption        BucketConfig = "encryption"
+	ConfigACL               BucketConfig = "acl"
+)
+
+// BucketConfigs lists every BucketConfig.
+var BucketConfigs = []BucketConfig{
+	ConfigTagging, ConfigCORS, ConfigPublicAccessBlock, ConfigOwnership, ConfigEncryption,
+	ConfigACL,
+}
 
 // MinPartSize is the smallest size S3 allows for every multipart part but the
 // last. It is enforced so uploads that work here also work against S3.
@@ -66,7 +91,14 @@ type StorageProvider interface {
 	ListBuckets(ctx context.Context) ([]BucketInfo, error)
 	ListObjects(ctx context.Context, bucket string, in ListObjectsInput) (*ListObjectsOutput, error)
 	HeadBucket(ctx context.Context, bucket string) (*BucketInfo, error)
-	CreateBucket(ctx context.Context, bucket string) (*BucketInfo, error)
+	// CreateBucket creates bucket with configs as its initial
+	// configuration, stored before the bucket exists, so it never exists
+	// without them.
+	CreateBucket(
+		ctx context.Context,
+		bucket string,
+		configs map[BucketConfig][]byte,
+	) (*BucketInfo, error)
 	DeleteBucket(ctx context.Context, ref BucketRef) error
 	StatObject(ctx context.Context, bucket, key string) (*ObjectInfo, error)
 	GetObject(ctx context.Context, bucket, key string) (*Object, error)
@@ -85,12 +117,15 @@ type StorageProvider interface {
 		bucket, key string,
 		in PutObjectInput,
 	) (string, error)
+	// UploadPart stores a part of an upload and returns its ETag and the
+	// system headers the upload's object will be stored with, which a
+	// part's response reports.
 	UploadPart(
 		ctx context.Context,
 		bucket, key, uploadID string,
 		partNumber int,
 		body io.Reader,
-	) (etag string, err error)
+	) (etag string, headers map[string]string, err error)
 	CompleteMultipartUpload(
 		ctx context.Context,
 		bucket, key, uploadID string,
@@ -119,6 +154,28 @@ type StorageProvider interface {
 	// DeleteBucketPolicy removes bucket's policy. A bucket without one is
 	// not an error.
 	DeleteBucketPolicy(ctx context.Context, bucket string) error
+
+	// GetBucketConfig returns bucket's configuration of kind as it was
+	// stored: storage.ErrBucketNotFound when there is no such bucket, and
+	// ErrNoSuchBucketConfig when it has none of that kind. ctx need not be
+	// pinned; one pinned to bucket reads it under the pin.
+	GetBucketConfig(ctx context.Context, bucket string, kind BucketConfig) ([]byte, error)
+	// PutBucketConfig stores doc as bucket's configuration of kind,
+	// replacing any it had.
+	PutBucketConfig(ctx context.Context, bucket string, kind BucketConfig, doc []byte) error
+	// DeleteBucketConfig removes bucket's configuration of kind. A bucket
+	// without one is not an error.
+	DeleteBucketConfig(ctx context.Context, bucket string, kind BucketConfig) error
+
+	// GetObjectACL returns the ACL document stored for the object at key
+	// as it now is: storage.ErrObjectNotFound when there is no object, and
+	// ErrNoSuchBucketConfig when the object has no ACL of its own, which
+	// includes one written over, or deleted and written again, since its
+	// ACL was stored.
+	GetObjectACL(ctx context.Context, bucket, key string) ([]byte, error)
+	// PutObjectACL stores doc as the ACL of the object at key as it now
+	// is: storage.ErrObjectNotFound when there is none.
+	PutObjectACL(ctx context.Context, bucket, key string, doc []byte) error
 }
 
 // BucketRef names a bucket of one generation. A bucket deleted and created
@@ -180,11 +237,15 @@ type ListObjectsOutput struct {
 // PutObjectInput is what is stored alongside an object body. Metadata holds
 // user metadata keyed by lowercase name, without the x-amz-meta- prefix.
 // Headers holds system headers replayed on reads (Cache-Control,
-// Content-Disposition and the like), keyed by canonical header name.
+// Content-Disposition and the like), keyed by canonical header name. ACL,
+// when set, is stored as the object's ACL (see GetObjectACL) once it is
+// written, replacing any the object had, and an object written without one
+// has none; it is not part of what a copy of the object copies.
 type PutObjectInput struct {
 	Metadata    map[string]string
 	Headers     map[string]string
 	ContentType string
+	ACL         []byte `json:",omitempty"`
 }
 
 // Precondition guards a write, following S3 conditional writes. IfNoneMatch
@@ -198,9 +259,15 @@ type Precondition struct {
 
 // CopyObjectInput copies SrcBucket/SrcKey to DstBucket/DstKey. A nil Replace
 // keeps the source's content type, metadata and headers; otherwise the copy
-// gets Replace's instead. Precondition applies to the destination.
+// gets Replace's instead. Headers, when set, are set on the copy over
+// either, such as the encryption headers a copy gets from its own request;
+// an empty value removes the header.
+// ACL is the copy's ACL, as PutObjectInput's. Precondition applies to the
+// destination.
 type CopyObjectInput struct {
 	Replace      *PutObjectInput
+	Headers      map[string]string
+	ACL          []byte
 	SrcBucket    string
 	SrcKey       string
 	DstBucket    string

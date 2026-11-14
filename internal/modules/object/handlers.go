@@ -30,7 +30,6 @@ func target(ctx gas.Context) s3api.Target {
 func (m *Module) getObject(ctx gas.Context) error {
 	t := target(ctx)
 	r := ctx.Request()
-	w := ctx.ResponseWriter()
 
 	if r.URL.Query().Has("uploadId") {
 		if err := s3api.CheckSubresource(r, "uploadId"); err != nil {
@@ -39,6 +38,9 @@ func (m *Module) getObject(ctx gas.Context) error {
 		return m.listParts(ctx, t)
 	}
 
+	if s3api.Subresource(r) == "acl" {
+		return m.getObjectACL(ctx, t)
+	}
 	if err := s3api.CheckSubresource(r, "partNumber"); err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
@@ -63,7 +65,17 @@ func (m *Module) getObject(ctx gas.Context) error {
 			m.logger.Warn("failed to close object body").Err("error", cErr).Send()
 		}
 	}()
+	return m.serveObject(ctx, t, obj)
+}
+
+// serveObject answers a GetObject of t with obj, open.
+func (m *Module) serveObject(ctx gas.Context, t s3api.Target, obj *contracts.Object) error {
+	r := ctx.Request()
+	w := ctx.ResponseWriter()
 	info := &obj.ObjectInfo
+	if err := checkReadEncryption(r, info); err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
 
 	serve, err := partRequest(w, r, info)
 	if err != nil {
@@ -101,6 +113,9 @@ func (m *Module) headObject(ctx gas.Context) error {
 		// A HEAD's error has no body; the status alone tells 403 from 404.
 		return s3api.WriteError(ctx, t, g.NotFound(t.Bucket, err))
 	}
+	if err = checkReadEncryption(r, info); err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
 
 	w := ctx.ResponseWriter()
 	setObjectHeaders(w, info)
@@ -112,6 +127,23 @@ func (m *Module) headObject(ctx gas.Context) error {
 	w.Header().Set("Content-Length", strconv.FormatInt(info.Size, 10))
 	w.WriteHeader(http.StatusOK)
 	return nil
+}
+
+// checkReadEncryption refuses a GET or HEAD carrying
+// x-amz-server-side-encryption for an object not stored with a
+// customer-provided key: "Encryption request headers, like
+// x-amz-server-side-encryption, should not be sent for the GetObject
+// requests, if your object uses" SSE-S3, SSE-KMS or DSSE-KMS; "you'll get
+// an HTTP 400 Bad Request error" (GetObject API reference, and HeadObject's
+// likewise). The reference gives no code; InvalidArgument is a choice. An
+// SSE-C object's read with the header, which S3 does not document, is
+// served.
+func checkReadEncryption(r *http.Request, info *contracts.ObjectInfo) error {
+	if r.Header.Get(s3api.HeaderSSE) == "" || info.Headers[s3api.HeaderSSECAlgorithm] != "" {
+		return nil
+	}
+	return s3api.ErrInvalidArgument("x-amz-server-side-encryption is not accepted on a read " +
+		"of an object stored with server-side encryption.")
 }
 
 // headPart answers a HEAD with ?partNumber. A plain object's part 1 is the
@@ -156,6 +188,9 @@ func (m *Module) putObject(ctx gas.Context) error {
 		return m.uploadPart(ctx, t)
 	}
 
+	if s3api.Subresource(r) == "acl" {
+		return m.putObjectACL(ctx, t)
+	}
 	if err := s3api.CheckSubresource(r); err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
@@ -180,12 +215,17 @@ func (m *Module) uploadObject(ctx gas.Context, t s3api.Target) error {
 		return s3api.WriteError(ctx, t, err)
 	}
 
+	ws, err := m.settings(g.Context(), r, g.Caller(), t.Bucket)
+	if err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
+
 	body, err := requestBody(r)
 	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
 
-	info, err := m.storage.PutObject(g.Context(), t.Bucket, t.Key, body, putInput(r), cond)
+	info, err := m.storage.PutObject(g.Context(), t.Bucket, t.Key, body, ws.putInput(r), cond)
 	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
@@ -193,6 +233,7 @@ func (m *Module) uploadObject(ctx gas.Context, t s3api.Target) error {
 	if etag := s3api.ETag(info.ETag); etag != "" {
 		ctx.SetHeader("ETag", etag)
 	}
+	setEncryptionHeaders(ctx.ResponseWriter(), ws.encryption)
 	ctx.ResponseWriter().WriteHeader(http.StatusOK)
 	return nil
 }
@@ -210,11 +251,29 @@ func (m *Module) copyObject(ctx gas.Context, t s3api.Target) error {
 	}
 	defer g.Release()
 
+	// The copy is encrypted and given an ACL as its own request says, or
+	// its bucket's default, not as its source was.
+	ws, err := m.settings(g.Context(), ctx.Request(), g.Caller(), t.Bucket)
+	if err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
+	// Every encryption header is named, so one the source had and the copy
+	// does not is removed.
+	in.Headers = map[string]string{}
+	for _, k := range s3api.EncryptionHeaderNames {
+		in.Headers[k] = ""
+	}
+	for k, v := range ws.encryption {
+		in.Headers[k] = v
+	}
+	in.ACL = ws.acl
+
 	info, err := m.storage.CopyObject(g.Context(), in)
 	if err != nil {
 		return s3api.WriteError(ctx, t, m.copyNotFound(g, in, err))
 	}
 
+	setEncryptionHeaders(ctx.ResponseWriter(), ws.encryption)
 	return ctx.XML(http.StatusOK, s3api.NewCopyObjectResult(info.ETag, info.LastModified))
 }
 

@@ -1,5 +1,12 @@
 package authz
 
+import (
+	"net/http"
+	"strings"
+
+	"tule.dev/object-store/internal/s3api"
+)
+
 // Operation is an S3 API operation this server routes, by its name in the
 // S3 API reference.
 type Operation string
@@ -31,6 +38,27 @@ const (
 	PutBucketPolicy         Operation = "PutBucketPolicy"
 	GetBucketPolicy         Operation = "GetBucketPolicy"
 	DeleteBucketPolicy      Operation = "DeleteBucketPolicy"
+
+	PutBucketTagging              Operation = "PutBucketTagging"
+	GetBucketTagging              Operation = "GetBucketTagging"
+	DeleteBucketTagging           Operation = "DeleteBucketTagging"
+	PutBucketCors                 Operation = "PutBucketCors"
+	GetBucketCors                 Operation = "GetBucketCors"
+	DeleteBucketCors              Operation = "DeleteBucketCors"
+	PutPublicAccessBlock          Operation = "PutPublicAccessBlock"
+	GetPublicAccessBlock          Operation = "GetPublicAccessBlock"
+	DeletePublicAccessBlock       Operation = "DeletePublicAccessBlock"
+	GetBucketPolicyStatus         Operation = "GetBucketPolicyStatus"
+	PutBucketOwnershipControls    Operation = "PutBucketOwnershipControls"
+	GetBucketOwnershipControls    Operation = "GetBucketOwnershipControls"
+	DeleteBucketOwnershipControls Operation = "DeleteBucketOwnershipControls"
+	PutBucketACL                  Operation = "PutBucketAcl"
+	GetBucketACL                  Operation = "GetBucketAcl"
+	PutObjectACL                  Operation = "PutObjectAcl"
+	GetObjectACL                  Operation = "GetObjectAcl"
+	PutBucketEncryption           Operation = "PutBucketEncryption"
+	GetBucketEncryption           Operation = "GetBucketEncryption"
+	DeleteBucketEncryption        Operation = "DeleteBucketEncryption"
 )
 
 // resourceKind is the S3 resource type an action is evaluated on, in the
@@ -76,14 +104,22 @@ type check struct {
 // An operation on several resources has one check per resource, made in
 // turn: CopyObject needs s3:PutObject on the destination and s3:GetObject on
 // the source. DeleteObjects is checked once per key it names, each key
-// answered on its own. The actions the reference lists for features this
-// server does not implement (ACLs, tagging, object lock, versions) are not
-// checked. Requests for their subresources (?acl, ?tagging, ?versionId and
-// the like) are refused with NotImplemented before they are evaluated, but
-// the ACL, tagging and object lock headers of a write (x-amz-acl,
-// x-amz-grant-*, x-amz-tagging, x-amz-object-lock-*) are accepted and
-// ignored, so a write carrying them needs only s3:PutObject here, where S3
-// would also need s3:PutObjectAcl, s3:PutObjectTagging and the like.
+// answered on its own. The Delete operations of the bucket configurations
+// are evaluated as the configuration's Put action, as the reference lists
+// them (DeleteBucketTagging as s3:PutBucketTagging, DeleteBucketCors as
+// s3:PutBucketCORS and so on), and PutBucketEncryption, its Get and its
+// Delete as s3:PutEncryptionConfiguration and
+// s3:GetEncryptionConfiguration.
+//
+// A write that sets an ACL or an Object Ownership needs more actions,
+// which headerChecks adds. The actions the reference lists for features
+// this server does not implement (object tagging, object lock, versions)
+// are not checked. Requests for their subresources (?tagging on an object,
+// ?versionId and the like) are refused with NotImplemented before they are
+// evaluated, but the tagging and object lock headers of a write
+// (x-amz-tagging, x-amz-object-lock-*) are accepted and ignored, so a
+// write carrying them needs only s3:PutObject here, where S3 would also
+// need s3:PutObjectTagging and the like.
 //
 // operations_test.go holds every entry to the reference, and the app's
 // tests drive every operation through its handler.
@@ -120,6 +156,129 @@ var operations = map[Operation][]check{
 	DeleteBucketPolicy: {
 		{action: "s3:DeleteBucketPolicy", kind: bucketResource, ownerOnly: true},
 	},
+	PutBucketTagging:    {{action: "s3:PutBucketTagging", kind: bucketResource}},
+	GetBucketTagging:    {{action: "s3:GetBucketTagging", kind: bucketResource}},
+	DeleteBucketTagging: {{action: "s3:PutBucketTagging", kind: bucketResource}},
+	PutBucketCors:       {{action: "s3:PutBucketCORS", kind: bucketResource}},
+	GetBucketCors:       {{action: "s3:GetBucketCORS", kind: bucketResource}},
+	DeleteBucketCors:    {{action: "s3:PutBucketCORS", kind: bucketResource}},
+	PutPublicAccessBlock: {
+		{action: "s3:PutBucketPublicAccessBlock", kind: bucketResource},
+	},
+	GetPublicAccessBlock: {
+		{action: "s3:GetBucketPublicAccessBlock", kind: bucketResource},
+	},
+	DeletePublicAccessBlock: {
+		{action: "s3:PutBucketPublicAccessBlock", kind: bucketResource},
+	},
+	GetBucketPolicyStatus: {{action: "s3:GetBucketPolicyStatus", kind: bucketResource}},
+	PutBucketOwnershipControls: {
+		{action: "s3:PutBucketOwnershipControls", kind: bucketResource},
+	},
+	GetBucketOwnershipControls: {
+		{action: "s3:GetBucketOwnershipControls", kind: bucketResource},
+	},
+	DeleteBucketOwnershipControls: {
+		{action: "s3:PutBucketOwnershipControls", kind: bucketResource},
+	},
+	PutBucketACL: {{action: "s3:PutBucketAcl", kind: bucketResource}},
+	GetBucketACL: {{action: "s3:GetBucketAcl", kind: bucketResource}},
+	PutObjectACL: {{action: "s3:PutObjectAcl", kind: objectResource}},
+	GetObjectACL: {{action: "s3:GetObjectAcl", kind: objectResource}},
+	PutBucketEncryption: {
+		{action: "s3:PutEncryptionConfiguration", kind: bucketResource},
+	},
+	GetBucketEncryption: {
+		{action: "s3:GetEncryptionConfiguration", kind: bucketResource},
+	},
+	DeleteBucketEncryption: {
+		{action: "s3:PutEncryptionConfiguration", kind: bucketResource},
+	},
+}
+
+// headerChecks are the checks a write needs on top of its entry for the
+// ACL and Object Ownership headers r carries, each on the operation's first
+// target:
+//
+//   - CreateBucket with an ACL other than private needs s3:PutBucketAcl:
+//     "if you specify an access control list (ACL) and set it to
+//     public-read, public-read-write, authenticated-read, or if you
+//     explicitly specify any other custom ACLs, both s3:CreateBucket and
+//     s3:PutBucketAcl permissions are required" (CreateBucket API
+//     reference, Permissions);
+//   - CreateBucket with x-amz-object-ownership needs
+//     s3:PutBucketOwnershipControls ("If your CreateBucket request includes
+//     the x-amz-object-ownership header, then the
+//     s3:PutBucketOwnershipControls permission is required.");
+//   - PutObject, CopyObject and CreateMultipartUpload with an ACL that
+//     changes the object's need s3:PutObjectAcl ("To successfully change
+//     the objects ACL of your PutObject request, you must have the
+//     s3:PutObjectAcl", PutObject API reference; the reference also lists
+//     s3:PutObjectAcl for CopyObject and CreateMultipartUpload, whose API
+//     references say nothing of it). The canned private and
+//     bucket-owner-full-control need only the write's own action: they are
+//     the ACLs a bucket with ACLs disabled accepts, and the S3 User Guide's
+//     "Grant cross-account permissions to upload objects while ensuring
+//     that the bucket owner has full control" ("Examples of Amazon S3
+//     bucket policies") grants only s3:PutObject, conditioned on
+//     s3:x-amz-acl being bucket-owner-full-control. A grant header always
+//     needs s3:PutObjectAcl, even one that names the owner alone; that is
+//     a choice.
+func headerChecks(op Operation, r *http.Request) []check {
+	switch op {
+	case CreateBucket:
+		var checks []check
+		if s3api.HasACLHeaders(r) && !onlyPrivate(r) {
+			checks = append(checks, check{action: "s3:PutBucketAcl", kind: bucketResource})
+		}
+		if len(r.Header.Values("X-Amz-Object-Ownership")) > 0 {
+			checks = append(checks,
+				check{action: "s3:PutBucketOwnershipControls", kind: bucketResource})
+		}
+		return checks
+	case PutObject, CopyObject, CreateMultipartUpload:
+		if s3api.HasACLHeaders(r) && !ownerCannedACL(r) {
+			return []check{{action: "s3:PutObjectAcl", kind: objectResource}}
+		}
+	}
+	return nil
+}
+
+// onlyPrivate reports whether r's only ACL header is x-amz-acl: private.
+func onlyPrivate(r *http.Request) bool {
+	acl := r.Header.Values("X-Amz-Acl")
+	return len(acl) == 1 && acl[0] == "private" && !hasGrantHeaders(r)
+}
+
+// ownerCannedACL reports whether r's only ACL header is x-amz-acl: private
+// or bucket-owner-full-control.
+func ownerCannedACL(r *http.Request) bool {
+	acl := r.Header.Values("X-Amz-Acl")
+	return len(acl) == 1 && (acl[0] == "private" || acl[0] == "bucket-owner-full-control") &&
+		!hasGrantHeaders(r)
+}
+
+func hasGrantHeaders(r *http.Request) bool {
+	for name := range r.Header {
+		if strings.HasPrefix(name, "X-Amz-Grant-") {
+			return true
+		}
+	}
+	return false
+}
+
+// HeaderActions returns the actions headerChecks can add to op, for tests
+// that hold them to the reference.
+func HeaderActions(op Operation) []string {
+	r := &http.Request{Header: http.Header{}}
+	r.Header.Set("X-Amz-Acl", "public-read")
+	r.Header.Set("X-Amz-Object-Ownership", "ObjectWriter")
+	checks := headerChecks(op, r)
+	actions := make([]string, len(checks))
+	for i, c := range checks {
+		actions[i] = c.action
+	}
+	return actions
 }
 
 // Operations returns every routed operation, for tests that drive each one.

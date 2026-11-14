@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"tule.dev/object-store/internal/contracts"
+	"tule.dev/object-store/internal/s3api"
 )
 
 const metaHeaderPrefix = "X-Amz-Meta-"
@@ -71,13 +72,14 @@ func stripAWSChunked(v string) string {
 }
 
 // setObjectHeaders writes the headers GET and HEAD share: the object's system
-// headers, its user metadata, and its content type, ETag and modification
-// time.
+// headers, its encryption headers (encryptionOf), its user metadata, and its
+// content type, ETag and modification time.
 func setObjectHeaders(w http.ResponseWriter, info *contracts.ObjectInfo) {
 	h := w.Header()
 	for name, v := range info.Headers {
 		h.Set(name, v)
 	}
+	setEncryptionHeaders(w, encryptionOf(info.Headers))
 	for k, v := range info.Metadata {
 		h.Set(metaHeaderPrefix+k, v)
 	}
@@ -99,4 +101,35 @@ func applyResponseOverrides(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set(header, v)
 		}
 	}
+}
+
+// putInput is putInput(r) with ws's encryption headers among its headers,
+// so they are stored with the object and replayed on reads, and ws's ACL.
+func (ws *writeSettings) putInput(r *http.Request) contracts.PutObjectInput {
+	in := putInput(r)
+	for k, v := range ws.encryption {
+		in.Headers[k] = v
+	}
+	in.ACL = ws.acl
+	return in
+}
+
+// encryptionOf returns the encryption headers among stored, the headers an
+// object or upload was stored with. One stored with neither form, by an
+// earlier version, reports SSE-S3, as S3 reports every object it stored
+// since "Starting January 5, 2023, all new object uploads to Amazon S3 are
+// automatically encrypted" ("Setting default server-side encryption
+// behavior for Amazon S3 buckets", S3 User Guide); that is a choice for
+// this server's older objects.
+func encryptionOf(stored map[string]string) map[string]string {
+	headers := map[string]string{}
+	for _, k := range s3api.EncryptionHeaderNames {
+		if v := stored[k]; v != "" {
+			headers[k] = v
+		}
+	}
+	if headers[s3api.HeaderSSE] == "" && headers[s3api.HeaderSSECAlgorithm] == "" {
+		headers[s3api.HeaderSSE] = s3api.SSEAES256
+	}
+	return headers
 }
