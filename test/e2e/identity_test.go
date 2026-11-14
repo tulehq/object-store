@@ -7,7 +7,6 @@ import (
 	"context"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -221,24 +220,13 @@ func (s *sibling) stop(t *testing.T) {
 	}
 }
 
-// startWithIdentity starts object-store with the root key, accepting the keys
-// the identity service at identityURL issued.
-func startWithIdentity(t *testing.T, identityURL string) *httptest.Server {
-	t.Helper()
-	return startServer(t, false, map[string]string{
-		"TULE_Auth_AccessKeyID":      rootKeyID,
-		"TULE_Auth_SecretAccessKey":  rootSecret,
-		"TULE_Auth_IdentityEndpoint": identityURL,
-	})
-}
-
 func rootCreds() aws.Credentials {
 	return aws.Credentials{AccessKeyID: rootKeyID, SecretAccessKey: rootSecret}
 }
 
 // s3As returns an S3 client for srv signing with creds. It does not retry,
 // so a refusal or failure is seen as the server answered it.
-func s3As(srv *httptest.Server, creds aws.Credentials) *s3.Client {
+func s3As(srv *liveServer, creds aws.Credentials) *s3.Client {
 	return clientFor(srv, func(o *s3.Options) {
 		o.Credentials = credentials.StaticCredentialsProvider{Value: creds}
 		o.RetryMaxAttempts = 1
@@ -289,7 +277,7 @@ func putUserPolicy(t *testing.T, ic *iam.Client, user, name, doc string) {
 
 // requireWorks checks that c can write, read and presign a read of an
 // object in bucket, which it creates.
-func requireWorks(t *testing.T, srv *httptest.Server, c *s3.Client, bucket string) {
+func requireWorks(t *testing.T, srv *liveServer, c *s3.Client, bucket string) {
 	t.Helper()
 	createBucket(t, c, bucket)
 	put(t, c, bucket, "k.txt", []byte("from "+bucket))
@@ -306,7 +294,7 @@ func requireWorks(t *testing.T, srv *httptest.Server, c *s3.Client, bucket strin
 }
 
 // requireRootWorks checks that the root key still lists the buckets.
-func requireRootWorks(t *testing.T, srv *httptest.Server) {
+func requireRootWorks(t *testing.T, srv *liveServer) {
 	t.Helper()
 	_, err := s3As(srv, rootCreds()).ListBuckets(t.Context(), &s3.ListBucketsInput{})
 	requireNoErr(t, err, "list buckets with the root key")
@@ -317,7 +305,7 @@ func requireRootWorks(t *testing.T, srv *httptest.Server) {
 // does not know once it is made inactive or deleted.
 func TestIdentityUserKeys(t *testing.T) {
 	identity := startSibling(t, "identity", identityDirEnv)
-	srv := startWithIdentity(t, identity.URL)
+	srv := startLiveWithIdentity(t, identity.URL)
 	ic := iamClient(identity.URL)
 	ctx := t.Context()
 
@@ -395,7 +383,7 @@ func startMemberAccount(t *testing.T) (string, string) {
 // evaluated, it was refused every request, ListBuckets included.)
 func TestIdentitySessionKeys(t *testing.T) {
 	account, identityURL := startMemberAccount(t)
-	srv := startWithIdentity(t, identityURL)
+	srv := startLiveWithIdentity(t, identityURL)
 	ctx := t.Context()
 
 	sc := sts.New(sts.Options{
@@ -460,7 +448,7 @@ func flipLast(s string) string {
 // a valid one, while the root key keeps working.
 func TestIdentityDown(t *testing.T) {
 	identity := startSibling(t, "identity", identityDirEnv)
-	srv := startWithIdentity(t, identity.URL)
+	srv := startLiveWithIdentity(t, identity.URL)
 	ic := iamClient(identity.URL)
 	key := createUserKey(t, ic, "dev")
 	putUserPolicy(t, ic, "dev", "s3", s3FullAccess)

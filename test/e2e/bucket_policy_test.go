@@ -69,7 +69,7 @@ type crossAccountEnv struct {
 func startCrossAccountEnv(t *testing.T) *crossAccountEnv {
 	t.Helper()
 	account, identityURL := startMemberAccount(t)
-	srv := startWithIdentity(t, identityURL)
+	srv := startLiveWithIdentity(t, identityURL)
 	e := &policyEnv{
 		srv: srv, ic: iamClient(identityURL), root: s3As(srv, rootCreds()), identity: identityURL,
 	}

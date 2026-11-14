@@ -223,7 +223,7 @@ const orgWaitLimit = 45 * time.Second
 func TestBucketPolicyOrganizationKeys(t *testing.T) {
 	o := startOrganization(t)
 	ctx := t.Context()
-	srv := startWithIdentity(t, o.identity)
+	srv := startLiveWithIdentity(t, o.identity)
 	root := s3As(srv, rootCreds())
 	createBucket(t, root, "bkt")
 	put(t, root, "bkt", "public/a", []byte("a"))

@@ -13,7 +13,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"net/url"
 	"strconv"
 	"strings"
@@ -49,7 +48,7 @@ func (tr tamper) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 // tampered returns a client option that edits every request after signing.
-func tampered(t *testing.T, srv *httptest.Server, edit func(*testing.T, *http.Request)) func(
+func tampered(t *testing.T, srv *liveServer, edit func(*testing.T, *http.Request)) func(
 	*s3.Options,
 ) {
 	return func(o *s3.Options) {
@@ -121,7 +120,7 @@ func requireAPIError(t *testing.T, err error, code, message string) {
 // signedRequest builds a request signed with the SDK's signer for service
 // and region at, with X-Amz-Content-Sha256 set to payloadHash.
 func signedRequest(
-	t *testing.T, srv *httptest.Server, method, path string, body []byte,
+	t *testing.T, srv *liveServer, method, path string, body []byte,
 	payloadHash, service, region string, at time.Time,
 ) *http.Request {
 	t.Helper()
@@ -137,7 +136,7 @@ func signedRequest(
 
 // signListBuckets signs a ListBuckets request by hand, with SignedHeaders
 // exactly as listed, so a test can send a list the SDK never writes.
-func signListBuckets(t *testing.T, srv *httptest.Server, signedHeaders []string) *http.Request {
+func signListBuckets(t *testing.T, srv *liveServer, signedHeaders []string) *http.Request {
 	t.Helper()
 	return signGet(t, srv, "", "/", signedHeaders)
 }
@@ -145,7 +144,7 @@ func signListBuckets(t *testing.T, srv *httptest.Server, signedHeaders []string)
 // signGet signs a GET of path by hand, with SignedHeaders exactly as
 // listed, sent with host as its Host, or the server's when empty. host is
 // read from the request's Host; every other name from its headers.
-func signGet(t *testing.T, srv *httptest.Server, host, path string, signedHeaders []string,
+func signGet(t *testing.T, srv *liveServer, host, path string, signedHeaders []string,
 ) *http.Request {
 	t.Helper()
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+path, nil)
@@ -212,7 +211,7 @@ func requireBody(t *testing.T, c *s3.Client, bucket, key, want string) {
 // TestUnsignedAmzHeader checks that an x-amz-* header added after signing is
 // refused, so it cannot change what a signed request does.
 func TestUnsignedAmzHeader(t *testing.T) {
-	srv := startServer(t, false, nil)
+	srv := startLive(t, nil)
 	c := clientFor(srv)
 	ctx := context.Background()
 	createBucket(t, c, "unsigned")
@@ -244,7 +243,7 @@ func TestUnsignedAmzHeader(t *testing.T) {
 // TestPresignedNotYetValid checks that a presigned URL dated beyond the
 // clock skew is refused, as S3 refuses it.
 func TestPresignedNotYetValid(t *testing.T) {
-	srv := startServer(t, false, nil)
+	srv := startLive(t, nil)
 	c := clientFor(srv)
 	createBucket(t, c, "future")
 	put(t, c, "future", "k", []byte("v"))
@@ -272,7 +271,7 @@ func TestPresignedNotYetValid(t *testing.T) {
 // signed payload hash stores nothing: no partial object for a new key, and
 // the old object for an existing one.
 func TestTamperedPutObject(t *testing.T) {
-	srv := startServer(t, false, nil)
+	srv := startLive(t, nil)
 	c := clientFor(srv)
 	ctx := context.Background()
 	createBucket(t, c, "tamper")
@@ -293,7 +292,7 @@ func TestTamperedPutObject(t *testing.T) {
 // TestTamperedUploadPart checks that a part whose body does not match its
 // signed payload hash is not stored.
 func TestTamperedUploadPart(t *testing.T) {
-	srv := startServer(t, false, nil)
+	srv := startLive(t, nil)
 	c := clientFor(srv)
 	ctx := context.Background()
 	createBucket(t, c, "tamper")
@@ -320,7 +319,7 @@ func TestTamperedUploadPart(t *testing.T) {
 // TestTamperedDeleteObjects checks that a DeleteObjects document forged to
 // the signed one's length is refused before anything is deleted.
 func TestTamperedDeleteObjects(t *testing.T) {
-	srv := startServer(t, false, nil)
+	srv := startLive(t, nil)
 	c := clientFor(srv)
 	createBucket(t, c, "tamper")
 	put(t, c, "tamper", "keep", []byte("keep"))
@@ -336,7 +335,7 @@ func TestTamperedDeleteObjects(t *testing.T) {
 // TestTamperedCompleteMultipartUpload checks that a completion document
 // forged to the signed one's length is refused before the upload completes.
 func TestTamperedCompleteMultipartUpload(t *testing.T) {
-	srv := startServer(t, false, nil)
+	srv := startLive(t, nil)
 	c := clientFor(srv)
 	createBucket(t, c, "tamper")
 	up := startUpload(t, c, "tamper", "mp")
@@ -362,7 +361,7 @@ func TestTamperedCompleteMultipartUpload(t *testing.T) {
 // TestStrictSignedHeaders checks that a SignedHeaders list that is not
 // lowercase, sorted and unique is refused, even when signed as listed.
 func TestStrictSignedHeaders(t *testing.T) {
-	srv := startServer(t, false, nil)
+	srv := startLive(t, nil)
 
 	status, _ := send(t, srv.Client(), signListBuckets(t, srv,
 		[]string{"host", "x-amz-content-sha256", "x-amz-date"}))
@@ -381,7 +380,7 @@ func TestStrictSignedHeaders(t *testing.T) {
 // TestRepeatedSignedHeaders checks that a large header named many times in
 // SignedHeaders is refused before it is canonicalized once per name.
 func TestRepeatedSignedHeaders(t *testing.T) {
-	srv := startServer(t, false, nil)
+	srv := startLive(t, nil)
 	req := signedRequest(t, srv, http.MethodGet, "/", nil, emptyHash, "s3", "us-east-1",
 		time.Now())
 	req.Header.Set("X-Amz-Meta-Pad", strings.Repeat("p", 128<<10))
@@ -403,7 +402,7 @@ func TestRepeatedSignedHeaders(t *testing.T) {
 // TestNonHexPayloadHash checks that an X-Amz-Content-Sha256 that is neither
 // a hex SHA-256, UNSIGNED-PAYLOAD nor STREAMING-* is refused, as S3 does.
 func TestNonHexPayloadHash(t *testing.T) {
-	srv := startServer(t, false, nil)
+	srv := startLive(t, nil)
 	c := clientFor(srv)
 	createBucket(t, c, "hash")
 
@@ -431,7 +430,7 @@ func hexSHA256(s string) string {
 // TestSignedForAnotherService checks that a request signed for another
 // service is refused, while any region is accepted.
 func TestSignedForAnotherService(t *testing.T) {
-	srv := startServer(t, false, nil)
+	srv := startLive(t, nil)
 
 	req := signedRequest(t, srv, http.MethodGet, "/", nil, emptyHash, "s3", "local-1",
 		time.Now())
@@ -466,7 +465,7 @@ func TestSignedForAnotherService(t *testing.T) {
 // TestSessionTokenRefused checks that the static key refuses any session
 // token, as S3 refuses an invalid one.
 func TestSessionTokenRefused(t *testing.T) {
-	srv := startServer(t, false, nil)
+	srv := startLive(t, nil)
 	c := clientFor(srv, func(o *s3.Options) {
 		o.Credentials = credentials.NewStaticCredentialsProvider("test", "test", "a-token")
 	})
@@ -487,13 +486,13 @@ func TestSessionTokenRefused(t *testing.T) {
 // the bucket of a virtual-hosted request, so a relayed request cannot be
 // pointed at another bucket.
 func TestHostMustBeSigned(t *testing.T) {
-	srv := startServer(t, false, nil)
+	srv := startLive(t, nil)
 	c := clientFor(srv)
 	createBucket(t, c, "public")
 	createBucket(t, c, "private")
 	put(t, c, "public", "k", []byte("public"))
 	put(t, c, "private", "k", []byte("private"))
-	_, port, err := net.SplitHostPort(srv.Listener.Addr().String())
+	_, port, err := net.SplitHostPort(srv.Addr)
 	requireNoErr(t, err, "split server address")
 	public, private := "public.localhost:"+port, "private.localhost:"+port
 
@@ -514,7 +513,7 @@ func TestHostMustBeSigned(t *testing.T) {
 	requireEqual(t, string(body), "public", "presigned get body")
 
 	// SDK-signed and presigned virtual-hosted requests sign their Host.
-	addr := srv.Listener.Addr().String()
+	addr := srv.Addr
 	vhost := &http.Client{Transport: &http.Transport{
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			var d net.Dialer
@@ -539,7 +538,7 @@ func TestHostMustBeSigned(t *testing.T) {
 // documents the client chose not to sign, as UNSIGNED-PAYLOAD or STREAMING-*,
 // are read and acted on, as S3 does.
 func TestUnsignedDocuments(t *testing.T) {
-	srv := startServer(t, false, nil)
+	srv := startLive(t, nil)
 	c := clientFor(srv)
 	createBucket(t, c, "docs")
 	put(t, c, "docs", "unsigned", []byte("v"))
@@ -583,7 +582,7 @@ func TestUnsignedDocuments(t *testing.T) {
 // CompleteMultipartUpload documents sent with signed chunks are refused
 // before they are acted on, since chunk signatures are not verified.
 func TestSignedChunkDocuments(t *testing.T) {
-	srv := startServer(t, false, nil)
+	srv := startLive(t, nil)
 	c := clientFor(srv)
 	createBucket(t, c, "docs")
 	put(t, c, "docs", "k", []byte("v"))
@@ -625,7 +624,7 @@ func TestSignedChunkDocuments(t *testing.T) {
 // TestPresignedDeleteObjects checks that a presigned DeleteObjects URL,
 // which declares no payload hash, has its document read as unsigned.
 func TestPresignedDeleteObjects(t *testing.T) {
-	srv := startServer(t, false, nil)
+	srv := startLive(t, nil)
 	c := clientFor(srv)
 	createBucket(t, c, "docs")
 	put(t, c, "docs", "presigned", []byte("v"))
@@ -656,7 +655,7 @@ func chunkedForgery(n int) string {
 // aws-chunked cannot make an upload signed with a hex hash decode to a
 // forged body that ends before the hash is checked.
 func TestUnsignedAWSChunkedEncoding(t *testing.T) {
-	srv := startServer(t, false, nil)
+	srv := startLive(t, nil)
 	c := clientFor(srv)
 	createBucket(t, c, "chunk")
 	up := startUpload(t, c, "chunk", "mp")

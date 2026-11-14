@@ -4,7 +4,6 @@ package e2e
 
 import (
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -26,7 +25,7 @@ const devARN = "arn:aws:iam::000000000000:user/dev"
 // with the root key, and the bucket "bkt" holding "public/a",
 // "private/a" and "keep/a", made with the root key.
 type policyEnv struct {
-	srv      *httptest.Server
+	srv      *liveServer
 	ic       *iam.Client
 	root     *s3.Client
 	identity string
@@ -35,7 +34,7 @@ type policyEnv struct {
 func startPolicyEnv(t *testing.T) *policyEnv {
 	t.Helper()
 	identity := startSibling(t, "identity", identityDirEnv)
-	srv := startWithIdentity(t, identity.URL)
+	srv := startLiveWithIdentity(t, identity.URL)
 	root := s3As(srv, rootCreds())
 	createBucket(t, root, "bkt")
 	for _, k := range []string{"public/a", "private/a", "keep/a"} {
