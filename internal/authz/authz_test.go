@@ -42,6 +42,18 @@ func (b buckets) GetBucketPolicy(_ context.Context, bucket string) (string, []by
 	return "g1", []byte(doc), nil
 }
 
+// No bucket has a configuration.
+func (b buckets) GetBucketConfig(
+	_ context.Context,
+	bucket string,
+	_ contracts.BucketConfig,
+) ([]byte, error) {
+	if _, ok := b[bucket]; !ok {
+		return nil, storage.ErrBucketNotFound
+	}
+	return nil, contracts.ErrNoSuchBucketConfig
+}
+
 func (b buckets) Pin(
 	ctx context.Context,
 	refs ...contracts.BucketRef,
@@ -176,7 +188,7 @@ func TestCopyObjectChecksBothResources(t *testing.T) {
 func TestAHandlerMistakeFailsClosed(t *testing.T) {
 	a := newAuthorizer(nil)
 	root := request(rootOf("000000000000"), "/")
-	if err := a.check(root, Operation("PutBucketAcl"), obj); err == nil {
+	if err := a.check(root, Operation("PutBucketLogging"), obj); err == nil {
 		t.Error("an operation without an entry was allowed")
 	}
 	if err := a.check(root, CopyObject, obj); err == nil {

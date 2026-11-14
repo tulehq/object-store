@@ -116,6 +116,7 @@ func TestBucketPolicyNamesARoleByItsUniqueID(t *testing.T) {
 // refuses it, and the stored policy is kept.
 func TestBucketPolicyRefusesAPrincipalThatDoesNotExist(t *testing.T) {
 	e := startPolicyEnv(t)
+	e.allowPublicPolicies(t)
 	e.putBucketPolicy(t, statement("Allow", `"*"`, "s3:GetObject", "arn:aws:s3:::bkt/*", ""))
 	before := e.getPolicy(t)
 	for _, arn := range []string{

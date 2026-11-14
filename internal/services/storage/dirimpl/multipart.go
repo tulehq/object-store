@@ -30,15 +30,15 @@ var uploadIDRe = regexp.MustCompile(`^[A-Z2-7]{26}$`)
 
 // uploadManifest is what CreateMultipartUpload records for CompleteMultipartUpload.
 type uploadManifest struct {
-	Initiated time.Time                `json:"initiated"`
-	Put       contracts.PutObjectInput `json:"put"`
-	Bucket    string                   `json:"bucket"`
-	Key       string                   `json:"key"`
+	Initiated time.Time `json:"initiated"`
+	Bucket    string    `json:"bucket"`
+	Key       string    `json:"key"`
 	// Generation is the bucket's generation when the upload started, so it
 	// completes only into that bucket, not one created again under its
 	// name. Empty in a manifest written before generations were recorded,
 	// which stands for legacyGeneration.
-	Generation string `json:"generation,omitempty"`
+	Generation string                   `json:"generation,omitempty"`
+	Put        contracts.PutObjectInput `json:"put"`
 }
 
 // generation is the generation of the bucket the upload started in.
@@ -152,9 +152,10 @@ func (s *Service) UploadPart(
 	bucket, key, uploadID string,
 	partNumber int,
 	body io.Reader,
-) (string, error) {
-	if _, err := s.loadUpload(ctx, bucket, key, uploadID); err != nil {
-		return "", err
+) (string, map[string]string, error) {
+	m, err := s.loadUpload(ctx, bucket, key, uploadID)
+	if err != nil {
+		return "", nil, err
 	}
 
 	tmp := filepath.Join(uploadDir(uploadID), "tmp-"+rand.Text())
@@ -163,17 +164,35 @@ func (s *Service) UploadPart(
 		if rmErr := s.root.Remove(tmp); rmErr != nil && !errors.Is(rmErr, fs.ErrNotExist) {
 			err = errors.Join(err, rmErr)
 		}
-		return "", fmt.Errorf("%s: upload part %d of %s: %w", s.Name(), partNumber, uploadID, err)
+		return "", nil, fmt.Errorf(
+			"%s: upload part %d of %s: %w",
+			s.Name(),
+			partNumber,
+			uploadID,
+			err,
+		)
 	}
 
 	if err = s.root.Rename(tmp, partFile(uploadID, partNumber)); err != nil {
-		return "", fmt.Errorf("%s: upload part %d of %s: %w", s.Name(), partNumber, uploadID, err)
+		return "", nil, fmt.Errorf(
+			"%s: upload part %d of %s: %w",
+			s.Name(),
+			partNumber,
+			uploadID,
+			err,
+		)
 	}
 	if err = s.root.WriteFile(partETagFile(uploadID, partNumber), []byte(etag), 0o644); err != nil {
-		return "", fmt.Errorf("%s: upload part %d of %s: %w", s.Name(), partNumber, uploadID, err)
+		return "", nil, fmt.Errorf(
+			"%s: upload part %d of %s: %w",
+			s.Name(),
+			partNumber,
+			uploadID,
+			err,
+		)
 	}
 
-	return etag, nil
+	return etag, m.Put.Headers, nil
 }
 
 // writePart streams body into name and returns the hex MD5 of what it wrote.
@@ -240,6 +259,10 @@ func (s *Service) CompleteMultipartUpload(
 	}
 	if err != nil {
 		return nil, fmt.Errorf("%s: complete upload %s: %w", s.Name(), uploadID, err)
+	}
+
+	if err = s.setObjectACL(bucket, info, m.Put.ACL); err != nil {
+		return nil, err
 	}
 
 	if err = s.root.RemoveAll(uploadDir(uploadID)); err != nil {

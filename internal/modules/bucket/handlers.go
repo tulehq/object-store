@@ -57,21 +57,18 @@ func (m *Module) listBuckets(ctx gas.Context) error {
 
 // getBucket serves the GET bucket operations: ListObjects, ListObjectsV2
 // (list-type=2), GetBucketLocation, GetBucketVersioning,
-// ListMultipartUploads and GetBucketPolicy.
+// ListMultipartUploads, GetBucketPolicy, GetBucketPolicyStatus,
+// GetBucketAcl, GetBucketOwnershipControls and the configuration reads of
+// configKinds.
 func (m *Module) getBucket(ctx gas.Context) error {
 	bucket := ctx.Param("bucket")
 	target := s3api.Target{Bucket: bucket}
 	r := ctx.Request()
 
-	switch sub := s3api.Subresource(r); sub {
-	case "location", "versioning":
-		return m.getBucketConfig(ctx, sub)
-	case "uploads":
-		return m.listMultipartUploads(ctx)
-	case "policy":
-		return m.getBucketPolicy(ctx)
-	case "":
-	default:
+	if sub := s3api.Subresource(r); sub != "" {
+		if serve, ok := m.getSubresource(sub); ok {
+			return serve(ctx)
+		}
 		return s3api.WriteError(ctx, target, s3api.CheckSubresource(r))
 	}
 
@@ -85,6 +82,29 @@ func (m *Module) getBucket(ctx gas.Context) error {
 	}
 	defer g.Release()
 	return list(ctx, g)
+}
+
+// getSubresource returns the handler of the GET bucket operation sub
+// names, false for a subresource not served.
+func (m *Module) getSubresource(sub string) (func(gas.Context) error, bool) {
+	if ck, ok := configKinds[sub]; ok {
+		return func(ctx gas.Context) error { return m.getConfig(ctx, ck) }, true
+	}
+	switch sub {
+	case "location", "versioning":
+		return func(ctx gas.Context) error { return m.getBucketConfig(ctx, sub) }, true
+	case "uploads":
+		return m.listMultipartUploads, true
+	case "policy":
+		return m.getBucketPolicy, true
+	case "policyStatus":
+		return m.getBucketPolicyStatus, true
+	case "acl":
+		return m.getBucketACL, true
+	case "ownershipControls":
+		return m.getBucketOwnershipControls, true
+	}
+	return nil, false
 }
 
 // getBucketConfig serves GetBucketLocation (sub "location") and
@@ -306,16 +326,19 @@ func (m *Module) headBucket(ctx gas.Context) error {
 	return nil
 }
 
-// putBucket serves CreateBucket and PutBucketPolicy (?policy).
+// putBucket serves CreateBucket, PutBucketPolicy (?policy), PutBucketAcl
+// (?acl), PutBucketOwnershipControls (?ownershipControls) and the
+// configuration writes of configKinds.
 //
 // CreateBucket of an existing bucket answers a principal of the owner's
 // account with BucketAlreadyOwnedByYou, and any other with
-// BucketAlreadyExists, as S3 answers a name another account owns.
+// BucketAlreadyExists, as S3 answers a name another account owns. A new
+// bucket gets DefaultConfigs.
 func (m *Module) putBucket(ctx gas.Context) error {
 	bucket := ctx.Param("bucket")
 
-	if s3api.Subresource(ctx.Request()) == "policy" {
-		return m.putBucketPolicy(ctx)
+	if serve, ok := m.putSubresource(s3api.Subresource(ctx.Request())); ok {
+		return serve(ctx)
 	}
 	if err := s3api.CheckSubresource(ctx.Request()); err != nil {
 		return s3api.WriteError(ctx, s3api.Target{Bucket: bucket}, err)
@@ -325,8 +348,12 @@ func (m *Module) putBucket(ctx gas.Context) error {
 	if err != nil {
 		return s3api.WriteError(ctx, s3api.Target{Bucket: bucket}, err)
 	}
+	configs, err := m.newBucketConfigs(ctx.Request())
+	if err != nil {
+		return s3api.WriteError(ctx, s3api.Target{Bucket: bucket}, err)
+	}
 
-	if _, err = m.storage.CreateBucket(ctx, bucket); err != nil {
+	if _, err = m.storage.CreateBucket(ctx, bucket, configs); err != nil {
 		if errors.Is(err, contracts.ErrBucketExists) && !caller.InAccount() {
 			err = errBucketAlreadyExists
 		}
@@ -338,12 +365,38 @@ func (m *Module) putBucket(ctx gas.Context) error {
 	return nil
 }
 
-// deleteBucket serves DeleteBucket and DeleteBucketPolicy (?policy).
+// putSubresource returns the handler of the PUT bucket operation sub
+// names, false for none.
+func (m *Module) putSubresource(sub string) (func(gas.Context) error, bool) {
+	if ck, ok := configKinds[sub]; ok {
+		return func(ctx gas.Context) error { return m.putConfig(ctx, ck) }, true
+	}
+	switch sub {
+	case "policy":
+		return m.putBucketPolicy, true
+	case "acl":
+		return m.putBucketACL, true
+	case "ownershipControls":
+		return m.putBucketOwnershipControls, true
+	}
+	return nil, false
+}
+
+// deleteBucket serves DeleteBucket, DeleteBucketPolicy (?policy),
+// DeleteBucketOwnershipControls (?ownershipControls) and the
+// configuration deletes of configKinds.
 func (m *Module) deleteBucket(ctx gas.Context) error {
 	bucket := ctx.Param("bucket")
 
-	if s3api.Subresource(ctx.Request()) == "policy" {
+	sub := s3api.Subresource(ctx.Request())
+	if ck, ok := configKinds[sub]; ok {
+		return m.deleteConfig(ctx, ck)
+	}
+	switch sub {
+	case "policy":
 		return m.deleteBucketPolicy(ctx)
+	case "ownershipControls":
+		return m.deleteBucketOwnershipControls(ctx)
 	}
 	if err := s3api.CheckSubresource(ctx.Request()); err != nil {
 		return s3api.WriteError(ctx, s3api.Target{Bucket: bucket}, err)
@@ -364,4 +417,53 @@ func (m *Module) deleteBucket(ctx gas.Context) error {
 	}
 
 	return ctx.NoContent()
+}
+
+// newBucketConfigs returns the configuration a CreateBucket request's
+// bucket is created with (DefaultConfigs): the Object Ownership of its
+// x-amz-object-ownership header, BucketOwnerEnforced without one, and the
+// ACL of its x-amz-acl or x-amz-grant-* headers, if any.
+//
+// An ACL that grants anyone but the owner is refused under
+// BucketOwnerEnforced with InvalidBucketAclWithObjectOwnership: "if your
+// CreateBucket request sets Bucket owner enforced and specifies a bucket
+// ACL that provides access to an external AWS account, your request fails
+// with a 400 error and returns the InvalidBucketAclWithObjectOwnership
+// error code" ("Troubleshooting", Object Ownership, S3 User Guide). A
+// public ACL is refused under the other settings, since the new bucket
+// blocks public ACLs: "If you try to create a bucket with a public ACL,
+// the request will fail." (CreateBucket API reference). The 400 and its
+// message are what S3 is reported to answer; the code
+// InvalidBucketAclWithBlockPublicAccess is a choice. An ownership value S3
+// does not know is refused with InvalidArgument, also a choice.
+func (m *Module) newBucketConfigs(r *http.Request) (map[contracts.BucketConfig][]byte, error) {
+	ownership := s3api.OwnershipBucketOwnerEnforced
+	if vs := r.Header.Values("X-Amz-Object-Ownership"); len(vs) > 0 {
+		if !s3api.ValidOwnership(vs[0]) {
+			return nil, s3api.ErrInvalidArgument("Invalid x-amz-object-ownership header: " +
+				vs[0])
+		}
+		ownership = vs[0]
+	}
+	owner := m.ownerID()
+	grants, set, err := s3api.HeaderGrants(r, s3api.ACLOwners{Owner: owner, BucketOwner: owner},
+		false)
+	if err != nil {
+		return nil, err //nolint:wrapcheck // an S3 error, answered as is
+	}
+	var acl []byte
+	if set {
+		switch {
+		case ownership == s3api.OwnershipBucketOwnerEnforced && s3api.GrantsOthers(grants, owner):
+			return nil, s3api.ErrInvalidBucketACLWithObjectOwnership()
+		case s3api.PublicGrants(grants):
+			return nil, s3api.NewError(http.StatusBadRequest,
+				"InvalidBucketAclWithBlockPublicAccess",
+				"Bucket cannot have public ACLs set with BlockPublicAccess enabled")
+		}
+		if acl, err = s3api.Encode(s3api.NewAccessControlPolicy(owner, grants)); err != nil {
+			return nil, err //nolint:wrapcheck // s3api's own error
+		}
+	}
+	return DefaultConfigs(ownership, acl)
 }

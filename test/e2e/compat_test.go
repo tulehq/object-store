@@ -296,12 +296,23 @@ func TestBrowserCORS(t *testing.T) {
 	ctx := context.Background()
 	createBucket(t, c, "web")
 	presigner := s3.NewPresignClient(c)
+	_, err := c.PutBucketCors(ctx, &s3.PutBucketCorsInput{
+		Bucket: aws.String("web"),
+		CORSConfiguration: &types.CORSConfiguration{CORSRules: []types.CORSRule{{
+			AllowedOrigins: []string{"http://app.example.test"},
+			AllowedMethods: []string{http.MethodGet, http.MethodPut},
+			AllowedHeaders: []string{"*"},
+			ExposeHeaders:  []string{"ETag"},
+		}}},
+	})
+	requireNoErr(t, err, "put bucket cors")
 
 	putReq, err := presigner.PresignPutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String("web"), Key: aws.String("upload.txt"),
 	})
 	requireNoErr(t, err, "presign put")
 
+	// The bucket's CORS configuration allows this origin.
 	const origin = "http://app.example.test"
 	pre, err := http.NewRequestWithContext(ctx, http.MethodOptions, putReq.URL, nil)
 	requireNoErr(t, err, "build preflight")
@@ -326,7 +337,7 @@ func TestBrowserCORS(t *testing.T) {
 	_ = res.Body.Close()
 	requireEqual(t, res.StatusCode, http.StatusOK, "cross-site put status")
 	requireEqual(t, res.Header.Get("Access-Control-Allow-Origin"), origin, "put allow-origin")
-	requireEqual(t, strings.Contains(res.Header.Get("Access-Control-Expose-Headers"), "Etag"), true,
+	requireEqual(t, strings.Contains(res.Header.Get("Access-Control-Expose-Headers"), "ETag"), true,
 		"ETag exposed")
 }
 

@@ -29,6 +29,14 @@ var (
 	// policiesDir holds the bucket policies, one file per bucket that has
 	// one, named after it.
 	policiesDir = filepath.Join(stateDir, "policies")
+
+	// configDir holds the bucket configurations, one directory per kind
+	// with one file per bucket that has one, named after it.
+	configDir = filepath.Join(stateDir, "config")
+
+	// aclDir holds the ACLs objects were given, one directory per bucket
+	// with one file per object, named by keyHash.
+	aclDir = filepath.Join(stateDir, "acls")
 )
 
 func (s *Service) openRoot() (*os.Root, error) {
@@ -39,7 +47,9 @@ func (s *Service) openRoot() (*os.Root, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to open storage root: %w", err)
 	}
-	for _, d := range []string{bucketsDir, indexDir, multipartDir, policiesDir} {
+	for _, d := range []string{
+		bucketsDir, indexDir, multipartDir, policiesDir, configDir, aclDir,
+	} {
 		if err = root.MkdirAll(d, 0o750); err != nil {
 			return nil, errors.Join(
 				fmt.Errorf("failed to create %s in storage root: %w", d, err), root.Close())

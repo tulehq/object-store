@@ -210,6 +210,7 @@ type call func(ctx context.Context, c *s3.Client) error
 
 var (
 	b   = aws.String("bkt")
+	cfg = aws.String("cfg-bkt")
 	key = aws.String("k")
 )
 
@@ -334,6 +335,105 @@ var calls = map[authz.Operation]call{
 		return sdkErr(c.DeleteBucketPolicy(ctx,
 			&s3.DeleteBucketPolicyInput{Bucket: aws.String("pol-bkt")}))
 	},
+	// The configuration operations act on cfg-bkt, so what they change
+	// applies to no other operation's request. A read of a configuration
+	// the bucket does not have answers 404, which is past authorization.
+	authz.PutBucketTagging: func(ctx context.Context, c *s3.Client) error {
+		return sdkErr(c.PutBucketTagging(ctx, &s3.PutBucketTaggingInput{
+			Bucket: cfg, Tagging: &s3types.Tagging{TagSet: []s3types.Tag{
+				{Key: aws.String("team"), Value: aws.String("dev")},
+			}},
+		}))
+	},
+	authz.GetBucketTagging: func(ctx context.Context, c *s3.Client) error {
+		return sdkErr(c.GetBucketTagging(ctx, &s3.GetBucketTaggingInput{Bucket: cfg}))
+	},
+	authz.DeleteBucketTagging: func(ctx context.Context, c *s3.Client) error {
+		return sdkErr(c.DeleteBucketTagging(ctx, &s3.DeleteBucketTaggingInput{Bucket: cfg}))
+	},
+	authz.PutBucketCors: func(ctx context.Context, c *s3.Client) error {
+		return sdkErr(c.PutBucketCors(ctx, &s3.PutBucketCorsInput{
+			Bucket: cfg, CORSConfiguration: &s3types.CORSConfiguration{
+				CORSRules: []s3types.CORSRule{{
+					AllowedMethods: []string{"GET"}, AllowedOrigins: []string{"*"},
+				}},
+			},
+		}))
+	},
+	authz.GetBucketCors: func(ctx context.Context, c *s3.Client) error {
+		return sdkErr(c.GetBucketCors(ctx, &s3.GetBucketCorsInput{Bucket: cfg}))
+	},
+	authz.DeleteBucketCors: func(ctx context.Context, c *s3.Client) error {
+		return sdkErr(c.DeleteBucketCors(ctx, &s3.DeleteBucketCorsInput{Bucket: cfg}))
+	},
+	authz.PutPublicAccessBlock: func(ctx context.Context, c *s3.Client) error {
+		return sdkErr(c.PutPublicAccessBlock(ctx, &s3.PutPublicAccessBlockInput{
+			Bucket: cfg, PublicAccessBlockConfiguration: &s3types.PublicAccessBlockConfiguration{
+				BlockPublicPolicy: aws.Bool(true),
+			},
+		}))
+	},
+	authz.GetPublicAccessBlock: func(ctx context.Context, c *s3.Client) error {
+		return sdkErr(c.GetPublicAccessBlock(ctx, &s3.GetPublicAccessBlockInput{Bucket: cfg}))
+	},
+	authz.DeletePublicAccessBlock: func(ctx context.Context, c *s3.Client) error {
+		return sdkErr(c.DeletePublicAccessBlock(ctx,
+			&s3.DeletePublicAccessBlockInput{Bucket: cfg}))
+	},
+	authz.GetBucketPolicyStatus: func(ctx context.Context, c *s3.Client) error {
+		return sdkErr(c.GetBucketPolicyStatus(ctx, &s3.GetBucketPolicyStatusInput{Bucket: cfg}))
+	},
+	authz.PutBucketOwnershipControls: func(ctx context.Context, c *s3.Client) error {
+		return sdkErr(c.PutBucketOwnershipControls(ctx, &s3.PutBucketOwnershipControlsInput{
+			Bucket: cfg, OwnershipControls: &s3types.OwnershipControls{
+				Rules: []s3types.OwnershipControlsRule{
+					{ObjectOwnership: s3types.ObjectOwnershipBucketOwnerEnforced},
+				},
+			},
+		}))
+	},
+	authz.GetBucketOwnershipControls: func(ctx context.Context, c *s3.Client) error {
+		return sdkErr(c.GetBucketOwnershipControls(ctx,
+			&s3.GetBucketOwnershipControlsInput{Bucket: cfg}))
+	},
+	authz.DeleteBucketOwnershipControls: func(ctx context.Context, c *s3.Client) error {
+		return sdkErr(c.DeleteBucketOwnershipControls(ctx,
+			&s3.DeleteBucketOwnershipControlsInput{Bucket: cfg}))
+	},
+	authz.PutBucketACL: func(ctx context.Context, c *s3.Client) error {
+		return sdkErr(c.PutBucketAcl(ctx, &s3.PutBucketAclInput{
+			Bucket: cfg, ACL: s3types.BucketCannedACLPrivate,
+		}))
+	},
+	authz.GetBucketACL: func(ctx context.Context, c *s3.Client) error {
+		return sdkErr(c.GetBucketAcl(ctx, &s3.GetBucketAclInput{Bucket: cfg}))
+	},
+	authz.PutObjectACL: func(ctx context.Context, c *s3.Client) error {
+		return sdkErr(c.PutObjectAcl(ctx, &s3.PutObjectAclInput{
+			Bucket: b, Key: key, ACL: s3types.ObjectCannedACLPrivate,
+		}))
+	},
+	authz.GetObjectACL: func(ctx context.Context, c *s3.Client) error {
+		return sdkErr(c.GetObjectAcl(ctx, &s3.GetObjectAclInput{Bucket: b, Key: key}))
+	},
+	authz.PutBucketEncryption: func(ctx context.Context, c *s3.Client) error {
+		return sdkErr(c.PutBucketEncryption(ctx, &s3.PutBucketEncryptionInput{
+			Bucket: cfg,
+			ServerSideEncryptionConfiguration: &s3types.ServerSideEncryptionConfiguration{
+				Rules: []s3types.ServerSideEncryptionRule{{
+					ApplyServerSideEncryptionByDefault: &s3types.ServerSideEncryptionByDefault{
+						SSEAlgorithm: s3types.ServerSideEncryptionAes256,
+					},
+				}},
+			},
+		}))
+	},
+	authz.GetBucketEncryption: func(ctx context.Context, c *s3.Client) error {
+		return sdkErr(c.GetBucketEncryption(ctx, &s3.GetBucketEncryptionInput{Bucket: cfg}))
+	},
+	authz.DeleteBucketEncryption: func(ctx context.Context, c *s3.Client) error {
+		return sdkErr(c.DeleteBucketEncryption(ctx, &s3.DeleteBucketEncryptionInput{Bucket: cfg}))
+	},
 }
 
 // sdkErr returns an SDK call's error, wrapped; errors.As still finds its
@@ -348,7 +448,7 @@ func sdkErr(_ any, err error) error {
 func setup(t *testing.T, root *s3.Client) {
 	t.Helper()
 	ctx := t.Context()
-	for _, name := range []string{"bkt", "gone-bkt", "pol-bkt"} {
+	for _, name := range []string{"bkt", "gone-bkt", "pol-bkt", "cfg-bkt"} {
 		if _, err := root.CreateBucket(
 			ctx,
 			&s3.CreateBucketInput{Bucket: aws.String(name)},

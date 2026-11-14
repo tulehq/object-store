@@ -37,11 +37,13 @@ const defaultCacheSize = 1024
 // middleware never lets reach a handler.
 var errNoPrincipal = errors.New("authz: the request has no verified principal")
 
-// PolicySource reads the bucket policies requests are evaluated with, and
-// pins the buckets an operation acts on to the generation evaluated:
-// contracts.StorageProvider's GetBucketPolicy and Pin.
+// PolicySource reads the bucket policies requests are evaluated with and
+// the Block Public Access settings that restrict them, and pins the
+// buckets an operation acts on to the generation evaluated:
+// contracts.StorageProvider's GetBucketPolicy, GetBucketConfig and Pin.
 type PolicySource interface {
 	GetBucketPolicy(ctx context.Context, bucket string) (string, []byte, error)
+	GetBucketConfig(ctx context.Context, bucket string, kind contracts.BucketConfig) ([]byte, error)
 	Pin(ctx context.Context, refs ...contracts.BucketRef) (context.Context, func(), error)
 }
 
@@ -154,6 +156,16 @@ func (c *Caller) InAccount() bool {
 	return c.principal.AccountID == c.a.account
 }
 
+// AccountID is the account of the caller.
+func (c *Caller) AccountID() string {
+	return c.principal.AccountID
+}
+
+// Account is the server's account, which owns every bucket.
+func (a *Authorizer) Account() string {
+	return a.account
+}
+
 // Authorize is Caller(r) and its Authorize.
 func (a *Authorizer) Authorize(
 	r *http.Request,
@@ -202,8 +214,9 @@ func (a *Authorizer) parse(doc []byte, resource bool) (*policy.Policy, error) {
 	return p, nil
 }
 
-// Authorize evaluates op's checks in order, the n-th on targets[n]: the
-// root principal is allowed everything; any other principal gets S3's
+// Authorize evaluates op's checks in order, the n-th on targets[n], then
+// the checks the request's ACL and Object Ownership headers add (see
+// headerChecks) on targets[0]: the root principal is allowed everything; any other principal gets S3's
 // AccessDenied for the first check its policies and the target bucket's
 // policy do not allow together. An operation with no entry, or with a
 // different number of targets than checks, is an internal error, so a
@@ -233,9 +246,20 @@ func (c *Caller) Authorize(op Operation, targets ...s3api.Target) error {
 	if c.root {
 		return nil
 	}
+	return c.evaluateChecks(op, checks, targets)
+}
+
+// evaluateChecks evaluates checks, the n-th on targets[n], then op's
+// header checks on targets[0].
+func (c *Caller) evaluateChecks(op Operation, checks []check, targets []s3api.Target) error {
 	extra := operationKeys(op, targets)
 	for i, t := range targets {
 		if err := c.evaluate(checks[i], t, extra); err != nil {
+			return err
+		}
+	}
+	for _, ch := range headerChecks(op, c.req) {
+		if err := c.evaluate(ch, targets[0], extra); err != nil {
 			return err
 		}
 	}
@@ -408,8 +432,52 @@ func (c *Caller) bucketPolicy(bucket string) (*policy.Policy, error) {
 			err,
 		)
 	}
+	restricted, err := c.restricted(bucket, doc)
+	if err != nil {
+		return nil, err
+	}
+	if restricted {
+		p = nil
+	}
 	c.buckets[bucket], c.generations[bucket] = p, gen
 	return p, nil
+}
+
+// restricted reports whether bucket's RestrictPublicBuckets setting takes
+// the bucket policy doc away from the caller: when the policy is public
+// (PublicPolicy), "RestrictPublicBuckets ... allows only AWS service
+// principals and authorized users of the bucket owner's account to access
+// the bucket", and "Amazon S3 blocks public and cross-account access
+// derived from any public access point or bucket policy, including
+// non-public delegation to specific accounts" ("Blocking public access to
+// your Amazon S3 storage", S3 User Guide). A principal of another account
+// is then evaluated as if the bucket had no policy, which denies it, since
+// it needs the bucket policy's Allow; service principals match no caller
+// here. The owner's account is evaluated with the policy as written. A
+// setting that cannot be read fails the request; it is never treated as
+// off.
+func (c *Caller) restricted(bucket string, doc []byte) (bool, error) {
+	if c.InAccount() {
+		return false, nil
+	}
+	raw, err := c.a.policies.GetBucketConfig(c.req.Context(), bucket,
+		contracts.ConfigPublicAccessBlock)
+	switch {
+	case errors.Is(err, contracts.ErrNoSuchBucketConfig), errors.Is(err, storage.ErrBucketNotFound):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("authz: read the public access block of bucket %s: %w",
+			bucket, err)
+	}
+	block, err := s3api.ParsePublicAccessBlock(raw)
+	if err != nil {
+		return false, fmt.Errorf("authz: the stored public access block of bucket %s "+
+			"does not parse: %w", bucket, err)
+	}
+	if !block.RestrictPublicBuckets {
+		return false, nil
+	}
+	return PublicPolicy(doc)
 }
 
 // Ref returns bucket as of the generation this request read it in, reading
@@ -588,6 +656,9 @@ func (g *Grant) Release() { g.once.Do(g.release) }
 
 // NotFound is the caller's NotFound.
 func (g *Grant) NotFound(bucket string, err error) error { return g.caller.NotFound(bucket, err) }
+
+// Caller is the caller the operation was authorized for.
+func (g *Grant) Caller() *Caller { return g.caller }
 
 // AuthorizeAndPin authorizes op on targets for r's caller, as Authorize
 // does, and pins the targets' buckets to the generations evaluated (see

@@ -30,6 +30,15 @@ func (e *policyEnv) putBucketPolicy(t *testing.T, statements ...string) {
 	requireNoErr(t, err, "put bucket policy")
 }
 
+// allowPublicPolicies deletes the Block Public Access settings bkt was
+// created with, which refuse a public policy, for the tests that put one.
+func (e *policyEnv) allowPublicPolicies(t *testing.T) {
+	t.Helper()
+	_, err := e.root.DeletePublicAccessBlock(t.Context(),
+		&s3.DeletePublicAccessBlockInput{Bucket: aws.String("bkt")})
+	requireNoErr(t, err, "delete public access block")
+}
+
 // statement is one bucket policy statement.
 func statement(effect, principal, action, resource, condition string) string {
 	s := `{"Effect":"` + effect + `","Principal":` + principal + `,"Action":"` + action +
@@ -233,6 +242,7 @@ func TestBucketPolicyRoleWithPath(t *testing.T) {
 func TestBucketPolicyPrincipalTag(t *testing.T) {
 	e := startPolicyEnv(t)
 	dev := e.user(t)
+	e.allowPublicPolicies(t)
 	e.putBucketPolicy(t, statement("Allow", `"*"`, "s3:GetObject", "arn:aws:s3:::bkt/*",
 		`{"StringEquals":{"aws:PrincipalTag/team":"storage"}}`))
 	requireDenied(t, getObject(t, dev, "public/a"), notAllowed(devARN, "s3:GetObject",

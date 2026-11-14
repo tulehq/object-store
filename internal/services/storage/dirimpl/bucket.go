@@ -194,14 +194,16 @@ func (s *Service) HeadBucket(_ context.Context, bucket string) (*contracts.Bucke
 	return &contracts.BucketInfo{Name: bucket, CreationDate: info.ModTime()}, nil
 }
 
-// CreateBucket creates bucket. It returns contracts.ErrInvalidBucketName for a
-// name S3 would reject and contracts.ErrBucketExists when it already exists.
+// CreateBucket creates bucket with configs as its configuration. It returns
+// contracts.ErrInvalidBucketName for a name S3 would reject and
+// contracts.ErrBucketExists when it already exists.
 //
 // The bucket is created in the backend and given an index directory before
 // it is added to the registry, which is what makes it exist, so an
-// interrupted create is completed by the next one. A policy left by an
-// interrupted DeleteBucket of the same name is removed first, so the new
-// bucket has none. Its registry entry is made under a temporary name with
+// interrupted create is completed by the next one. A policy,
+// configuration or object ACL left by an interrupted DeleteBucket of the
+// same name is removed first, so the new bucket has only configs. Its
+// registry entry is made under a temporary name with
 // a new generation and renamed into place, so the bucket exists only with
 // its generation.
 //
@@ -209,7 +211,11 @@ func (s *Service) HeadBucket(_ context.Context, bucket string) (*contracts.Bucke
 // that exists, as an "ensure bucket" call does, never queues the bucket's
 // requests behind a writer. Only an absent bucket takes the write lock,
 // and is checked again under it.
-func (s *Service) CreateBucket(ctx context.Context, bucket string) (*contracts.BucketInfo, error) {
+func (s *Service) CreateBucket(
+	ctx context.Context,
+	bucket string,
+	configs map[contracts.BucketConfig][]byte,
+) (*contracts.BucketInfo, error) {
 	if !bucketNameRe.MatchString(bucket) || isReservedBucketName(bucket) {
 		return nil, contracts.ErrInvalidBucketName
 	}
@@ -231,7 +237,7 @@ func (s *Service) CreateBucket(ctx context.Context, bucket string) (*contracts.B
 	if err := s.root.MkdirAll(filepath.Join(indexDir, bucket), 0o750); err != nil {
 		return nil, fmt.Errorf("%s: failed to create bucket: %s: %w", s.Name(), bucket, err)
 	}
-	if err := s.removePolicy(bucket); err != nil {
+	if err := s.resetConfigs(bucket, configs); err != nil {
 		return nil, err
 	}
 	if err := s.registerBucket(bucket); err != nil {
@@ -317,8 +323,8 @@ func (s *Service) registerBucket(bucket string) error {
 // the bucket that outlasts it fails the delete with
 // contracts.ErrOperationAborted. Under the write lock both are checked
 // again, the uploads of this generation are removed, and the registry entry
-// is renamed away, which makes the bucket not exist; then the policy and
-// the index are removed. The bucket is left in the backend, empty.
+// is renamed away, which makes the bucket not exist; then the policy, the
+// configurations, the object ACLs and the index are removed. The bucket is left in the backend, empty.
 // Creating the bucket again reuses it, with a new generation.
 func (s *Service) DeleteBucket(ctx context.Context, ref contracts.BucketRef) error {
 	bucket := ref.Name
@@ -348,6 +354,9 @@ func (s *Service) DeleteBucket(ctx context.Context, ref contracts.BucketRef) err
 		return fmt.Errorf("%s: failed to delete bucket: %s: %w", s.Name(), bucket, err)
 	}
 	if err = s.removePolicy(bucket); err != nil {
+		return err
+	}
+	if err = s.removeConfigs(bucket); err != nil {
 		return err
 	}
 	if err = s.root.RemoveAll(filepath.Join(indexDir, bucket)); err != nil {

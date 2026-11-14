@@ -37,9 +37,26 @@ var serviceKeys = []serviceKey{
 	{name: "s3:delimiter", actions: []string{"s3:ListBucket"}, value: query("delimiter")},
 	{name: "s3:max-keys", actions: []string{"s3:ListBucket"}, value: query("max-keys")},
 	{
-		name:    "s3:x-amz-acl",
-		actions: []string{"s3:CreateBucket", "s3:PutObject"},
-		value:   header("X-Amz-Acl"),
+		name: "s3:x-amz-acl",
+		actions: []string{
+			"s3:CreateBucket", "s3:PutObject", "s3:PutBucketAcl", "s3:PutObjectAcl",
+		},
+		value: header("X-Amz-Acl"),
+	},
+	grantKey("s3:x-amz-grant-full-control", "X-Amz-Grant-Full-Control"),
+	grantKey("s3:x-amz-grant-read", "X-Amz-Grant-Read"),
+	grantKey("s3:x-amz-grant-read-acp", "X-Amz-Grant-Read-Acp"),
+	grantKey("s3:x-amz-grant-write", "X-Amz-Grant-Write"),
+	grantKey("s3:x-amz-grant-write-acp", "X-Amz-Grant-Write-Acp"),
+	{
+		name:    "s3:x-amz-object-ownership",
+		actions: []string{"s3:CreateBucket"},
+		value:   header("X-Amz-Object-Ownership"),
+	},
+	{
+		name:    "s3:x-amz-server-side-encryption-aws-kms-key-id",
+		actions: []string{"s3:PutObject"},
+		value:   header("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id"),
 	},
 	{
 		name:    "s3:x-amz-server-side-encryption",
@@ -64,6 +81,18 @@ var serviceKeys = []serviceKey{
 	{name: "s3:signatureversion", value: func(*http.Request) (string, bool) {
 		return "AWS4-HMAC-SHA256", true
 	}},
+}
+
+// grantKey is the condition key name for the grant header h, which the
+// reference lists for the actions that set ACLs.
+func grantKey(name, h string) serviceKey {
+	return serviceKey{
+		name: name,
+		actions: []string{
+			"s3:CreateBucket", "s3:PutObject", "s3:PutBucketAcl", "s3:PutObjectAcl",
+		},
+		value: header(h),
+	}
 }
 
 func query(name string) func(*http.Request) (string, bool) {

@@ -2,6 +2,7 @@ package authz
 
 import (
 	"encoding/json"
+	"net/http"
 	"os"
 	"slices"
 	"strings"
@@ -90,17 +91,24 @@ func checkMatchesReference(
 }
 
 // Every operation the reference authorizes with one action the server
-// does not check is one whose extra actions belong to features the server
-// refuses (ACLs, tagging, object lock, versions, Object Lambda).
+// does not check, in its entry or for its headers, is one whose extra
+// actions belong to features the server refuses (object tagging, object
+// lock, versions, Object Lambda), or the listings' s3:GetObjectAcl, which
+// the reference lists for the object owners a listing can return and the
+// server never returns.
 func TestNoAuthorizedActionIsLeftOutUnexplained(t *testing.T) {
 	ref := loadReference(t)
 	unimplemented := []string{
-		"Acl", "Tagging", "LegalHold", "Retention", "Version", "ObjectLockConfiguration",
-		"OwnershipControls", "BypassGovernanceRetention",
+		"ObjectTagging", "LegalHold", "Retention", "Version", "ObjectLockConfiguration",
+		"BypassGovernanceRetention",
 	}
 	for op := range operations {
 		for _, a := range ref.Operations[string(op)] {
-			if slices.Contains(Actions(op), "s3:"+a) {
+			if slices.Contains(Actions(op), "s3:"+a) ||
+				slices.Contains(HeaderActions(op), "s3:"+a) {
+				continue
+			}
+			if a == "GetObjectAcl" && (op == ListObjects || op == ListObjectsV2) {
 				continue
 			}
 			if !slices.ContainsFunc(unimplemented, func(s string) bool {
@@ -163,5 +171,42 @@ func TestOperationKeysMatchTheReference(t *testing.T) {
 	keys := operationKeys(CopyObject, []s3api.Target{{}, {Bucket: "b", Key: "k"}})
 	if keys["s3:PutObject"][copySourceKey] != "b/k" {
 		t.Errorf("copy source = %q", keys["s3:PutObject"][copySourceKey])
+	}
+}
+
+// Every action a write's ACL or Object Ownership headers add is one the
+// reference authorizes the operation with, on a resource type it lists for
+// that action.
+func TestEveryHeaderCheckMatchesTheReference(t *testing.T) {
+	ref := loadReference(t)
+	r := &http.Request{Header: http.Header{}}
+	r.Header.Set("X-Amz-Acl", "public-read")
+	r.Header.Set("X-Amz-Object-Ownership", "ObjectWriter")
+	added := 0
+	for op := range operations {
+		for _, c := range headerChecks(op, r) {
+			added++
+			checkMatchesReference(t, ref, op, c, ref.Operations[string(op)])
+		}
+	}
+	if added != 5 {
+		t.Errorf("%d header checks, want CreateBucket's two and one for each object write", added)
+	}
+
+	private := &http.Request{Header: http.Header{"X-Amz-Acl": {"private"}}}
+	if checks := headerChecks(CreateBucket, private); len(checks) != 0 {
+		t.Errorf("CreateBucket with the private ACL adds %v", checks)
+	}
+	full := &http.Request{Header: http.Header{"X-Amz-Acl": {"bucket-owner-full-control"}}}
+	for _, r := range []*http.Request{private, full} {
+		for _, op := range []Operation{PutObject, CopyObject, CreateMultipartUpload} {
+			if checks := headerChecks(op, r); len(checks) != 0 {
+				t.Errorf("%s with %v adds %v", op, r.Header, checks)
+			}
+		}
+	}
+	grant := &http.Request{Header: http.Header{"X-Amz-Grant-Read": {`id="x"`}}}
+	if checks := headerChecks(PutObject, grant); len(checks) != 1 {
+		t.Errorf("PutObject with a grant header adds %v", checks)
 	}
 }

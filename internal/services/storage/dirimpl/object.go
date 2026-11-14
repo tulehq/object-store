@@ -165,11 +165,18 @@ func (s *Service) DeleteObject(ctx context.Context, bucket, key string) error {
 	); err != nil {
 		return fmt.Errorf("%s: delete %q: %w", s.Name(), key, err)
 	}
-	return s.removeFromIndex(bucket, key)
+	// The object is gone, so its index entry goes whether or not its ACL
+	// file could be removed.
+	var aclErr error
+	if rmErr := s.removeIfExists(aclFile(bucket, key)); rmErr != nil {
+		aclErr = fmt.Errorf("%s: delete the ACL of %q: %w", s.Name(), key, rmErr)
+	}
+	return errors.Join(aclErr, s.removeFromIndex(bucket, key))
 }
 
 // PutObject stores body with the content type, user metadata and system
-// headers in in, and returns the stored object's info. The write only happens
+// headers in in, and in's ACL, if any, as its ACL, replacing or removing
+// the one it had, and returns the stored object's info. The write only happens
 // if cond holds. ctx must be pinned to bucket.
 func (s *Service) PutObject(
 	ctx context.Context,
@@ -193,7 +200,14 @@ func (s *Service) PutObject(
 	}
 
 	er := newETagReader(body, joinMetadata(in.Metadata, in.Headers))
-	return s.putObject(ctx, bucket, key, er, in.ContentType, er.meta)
+	info, err := s.putObject(ctx, bucket, key, er, in.ContentType, er.meta)
+	if err != nil {
+		return nil, err
+	}
+	if err = s.setObjectACL(bucket, info, in.ACL); err != nil {
+		return nil, err
+	}
+	return info, nil
 }
 
 // putObject indexes key and writes the object, with meta as the metadata
@@ -274,6 +288,21 @@ func (s *Service) CopyObject(
 	if in.Replace != nil {
 		put = *in.Replace
 	}
+	if len(in.Headers) > 0 {
+		headers := make(map[string]string, len(put.Headers)+len(in.Headers))
+		for k, v := range put.Headers {
+			headers[k] = v
+		}
+		for k, v := range in.Headers {
+			if v == "" {
+				delete(headers, k)
+				continue
+			}
+			headers[k] = v
+		}
+		put.Headers = headers
+	}
+	put.ACL = in.ACL
 
 	return s.PutObject(ctx, in.DstBucket, in.DstKey, src.Body, put, in.Precondition)
 }

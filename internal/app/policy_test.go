@@ -108,7 +108,8 @@ func TestABucketCreatedAgainHasNoPolicy(t *testing.T) {
 	if _, err := root.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{
 		Bucket: name,
 		Policy: aws.String(`{"Version":"2012-10-17","Statement":{"Effect":"Allow",` +
-			`"Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::again/*"}}`),
+			`"Principal":{"AWS":"111111111111"},"Action":"s3:GetObject",` +
+			`"Resource":"arn:aws:s3:::again/*"}}`),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -147,6 +148,9 @@ var policyPaths = map[authz.Operation]string{
 	authz.PutBucketPolicy:    "bind",
 	authz.GetBucketPolicy:    "show",
 	authz.DeleteBucketPolicy: "",
+	// GetBucketPolicyStatus reads the stored policy but returns only
+	// whether it is public, which binding does not change.
+	authz.GetBucketPolicyStatus: "",
 }
 
 // Every operation named for policies is classified in policyPaths.

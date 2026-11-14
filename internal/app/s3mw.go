@@ -156,6 +156,9 @@ func s3AuthError(e *sigv4.Error) error {
 //
 // The health probes are exempt, so health checks need no credentials. On a
 // <bucket>.<domain> host the same path is an object key, which stays signed.
+// CORS preflights, which browsers send without credentials, never reach
+// it: bucketCORS, which runs before, answers every one, so a middleware
+// order that let one through would fail closed here.
 func verifySignature(v *sigv4.Verifier, domain string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -53,16 +53,23 @@ func (m *Module) createMultipartUpload(ctx gas.Context, t s3api.Target) error {
 	}
 	defer g.Release()
 
+	// The upload's object is encrypted and given an ACL as this request
+	// says, when it completes.
+	ws, err := m.settings(g.Context(), ctx.Request(), g.Caller(), t.Bucket)
+	if err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
 	id, err := m.storage.CreateMultipartUpload(
 		g.Context(),
 		t.Bucket,
 		t.Key,
-		putInput(ctx.Request()),
+		ws.putInput(ctx.Request()),
 	)
 	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
 
+	setEncryptionHeaders(ctx.ResponseWriter(), ws.encryption)
 	return ctx.XML(http.StatusOK, s3api.NewInitiateMultipartUploadResult(t.Bucket, t.Key, id))
 }
 
@@ -97,12 +104,14 @@ func (m *Module) uploadPart(ctx gas.Context, t s3api.Target) error {
 		return s3api.WriteError(ctx, t, err)
 	}
 
-	etag, err := m.storage.UploadPart(g.Context(), t.Bucket, t.Key, uploadID, n, body)
+	etag, headers, err := m.storage.UploadPart(g.Context(), t.Bucket, t.Key, uploadID, n, body)
 	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
 
 	ctx.SetHeader("ETag", s3api.ETag(etag))
+	// The part is reported as encrypted as its upload's object will be.
+	setEncryptionHeaders(ctx.ResponseWriter(), encryptionOf(headers))
 	ctx.ResponseWriter().WriteHeader(http.StatusOK)
 	return nil
 }
@@ -149,6 +158,7 @@ func (m *Module) completeMultipartUpload(ctx gas.Context, t s3api.Target, upload
 	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
+	setEncryptionHeaders(ctx.ResponseWriter(), encryptionOf(info.Headers))
 
 	return ctx.XML(http.StatusOK, s3api.NewCompleteMultipartUploadResult(
 		objectURL(r, t), t.Bucket, t.Key, info.ETag))

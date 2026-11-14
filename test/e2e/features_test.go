@@ -237,11 +237,11 @@ func TestUnsupportedSubresources(t *testing.T) {
 	_, body := get(t, c, &s3.GetObjectInput{Bucket: bucket, Key: key})
 	requireEqual(t, string(body), "original", "object untouched by tagging request")
 
-	_, err = c.DeleteBucketCors(ctx, &s3.DeleteBucketCorsInput{Bucket: bucket})
+	_, err = c.DeleteBucketLifecycle(ctx, &s3.DeleteBucketLifecycleInput{Bucket: bucket})
 	requireCode(t, err, "NotImplemented")
 	_, err = c.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: bucket})
-	requireNoErr(t, err, "bucket survives delete-cors request")
+	requireNoErr(t, err, "bucket survives delete-lifecycle request")
 
-	_, err = c.GetObjectAcl(ctx, &s3.GetObjectAclInput{Bucket: bucket, Key: key})
+	_, err = c.GetObjectTagging(ctx, &s3.GetObjectTaggingInput{Bucket: bucket, Key: key})
 	requireCode(t, err, "NotImplemented")
 }
