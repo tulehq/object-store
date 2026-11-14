@@ -47,7 +47,8 @@ func (m *Module) putObjectTagging(ctx gas.Context, t s3api.Target) error {
 		return s3api.WriteError(ctx, t, err)
 	}
 	defer release()
-	if err = m.storage.PutObjectTagging(pinned, t.Bucket, t.Key, tags); err != nil {
+	if err = m.storage.PutObjectTagging(pinned, t.Bucket, t.Key, tags,
+		caller.ObjectCheck(t)); err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
 	ctx.ResponseWriter().WriteHeader(http.StatusOK)
@@ -55,18 +56,22 @@ func (m *Module) putObjectTagging(ctx gas.Context, t s3api.Target) error {
 }
 
 // getObjectTagging serves GetObjectTagging (GET /<bucket>/<key>?tagging):
-// the object's tag set, empty for an object without tags.
+// the object's tag set, empty for an object without tags, answered only
+// for the object the request was evaluated for (authz.CheckObject).
 func (m *Module) getObjectTagging(ctx gas.Context, t s3api.Target) error {
 	g, err := m.authz.AuthorizeAndPin(ctx, ctx.Request(), authz.GetObjectTagging, t)
 	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
 	defer g.Release()
-	tags, err := m.storage.GetObjectTagging(g.Context(), t.Bucket, t.Key)
+	info, err := m.storage.StatObjectTagging(g.Context(), t.Bucket, t.Key)
 	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
-	return ctx.XML(http.StatusOK, s3api.NewTagging(tags))
+	if err = g.CheckObject(t, info); err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
+	return ctx.XML(http.StatusOK, s3api.NewTagging(info.Tags))
 }
 
 // deleteObjectTagging serves DeleteObjectTagging (DELETE
@@ -78,7 +83,8 @@ func (m *Module) deleteObjectTagging(ctx gas.Context, t s3api.Target) error {
 		return s3api.WriteError(ctx, t, err)
 	}
 	defer g.Release()
-	if err = m.storage.PutObjectTagging(g.Context(), t.Bucket, t.Key, nil); err != nil {
+	if err = m.storage.PutObjectTagging(g.Context(), t.Bucket, t.Key, nil,
+		g.ObjectCheck(t)); err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
 	return ctx.NoContent()

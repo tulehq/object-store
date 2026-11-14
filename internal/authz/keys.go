@@ -3,6 +3,7 @@ package authz
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
 	"slices"
@@ -226,13 +227,18 @@ func (c *Caller) SetRequestTags(tags []contracts.Tag) {
 	c.bodyTags, c.bodyTagsSet = tags, true
 }
 
-// requestTagsOf returns the tags op's request sets: the document's, given
-// by SetRequestTags, or the x-amz-tagging header's for PutObject,
-// CreateMultipartUpload and a CopyObject under the REPLACE tagging
-// directive (s3api.RequestTags), whose error, a header that does not
-// parse, refuses the request. A copy under COPY sets its source's tags,
-// which are not the request's, a choice. Any other operation sets none.
-func (c *Caller) requestTagsOf(op Operation) ([]contracts.Tag, error) {
+// requestTagsOf returns the tags op's request on targets sets: the
+// document's, given by SetRequestTags, or the x-amz-tagging header's for
+// PutObject, CreateMultipartUpload and a CopyObject under the REPLACE
+// tagging directive (s3api.RequestTags), whose error, a header that does
+// not parse, refuses the request. A CopyObject under the COPY tagging
+// directive, the default, sets its source's tags, targets[1]'s as stored
+// (see existing), so a policy's conditions on the tags a write sets apply
+// to the tags a copy copies; AWS does not document which keys copied tags
+// are evaluated as, and this is a choice, the one that lets no tag reach
+// an object unevaluated. The copy is bound to the source they were read
+// from (see CheckObject). Any other operation sets none.
+func (c *Caller) requestTagsOf(op Operation, targets []s3api.Target) ([]contracts.Tag, error) {
 	if c.bodyTagsSet {
 		return c.bodyTags, nil
 	}
@@ -240,7 +246,7 @@ func (c *Caller) requestTagsOf(op Operation) ([]contracts.Tag, error) {
 	case PutObject, CreateMultipartUpload:
 	case CopyObject:
 		if !replacesTags(c.req) {
-			return nil, nil
+			return c.existing(targets[1])
 		}
 	default:
 		return nil, nil
@@ -309,25 +315,91 @@ func setTagKey(keys map[string][]string, name, v string) error {
 	return nil
 }
 
+// evaluatedObject is the object a request's s3:ExistingObjectTag keys were
+// read from: whether there was one, and its ETag, modification time and
+// tags, as one read of it returned them (contracts.StorageProvider's
+// StatObjectTagging).
+type evaluatedObject struct {
+	lastModified time.Time
+	etag         string
+	tags         []contracts.Tag
+	found        bool
+}
+
 // existing returns the tags stored for the object t, read once per
-// request: none when there is no such object or bucket, or the key is not
-// one an object can have. A read that fails otherwise fails the request;
-// the tags are never treated as absent.
+// request, and records which object they are the tags of, which the
+// operation must then act on (see CheckObject): none when there is no
+// such object or bucket, or the key is not one an object can have. A read
+// that fails otherwise fails the request; the tags are never treated as
+// absent.
 func (c *Caller) existing(t s3api.Target) ([]contracts.Tag, error) {
-	if tags, ok := c.existingTags[t]; ok {
-		return tags, nil
+	if o, ok := c.evaluated[t]; ok {
+		return o.tags, nil
 	}
-	tags, err := c.a.policies.GetObjectTagging(c.req.Context(), t.Bucket, t.Key)
+	var o evaluatedObject
+	info, err := c.a.policies.StatObjectTagging(c.req.Context(), t.Bucket, t.Key)
 	switch {
 	case errors.Is(err, storage.ErrObjectNotFound), errors.Is(err, storage.ErrBucketNotFound),
 		errors.Is(err, storage.ErrInvalidKey):
-		tags = nil
 	case err != nil:
 		return nil, fmt.Errorf("authz: read the tags of %s/%s: %w", t.Bucket, t.Key, err)
+	default:
+		o = evaluatedObject{
+			lastModified: info.LastModified, etag: info.ETag, tags: info.Tags, found: true,
+		}
 	}
-	if c.existingTags == nil {
-		c.existingTags = map[s3api.Target][]contracts.Tag{}
+	if c.evaluated == nil {
+		c.evaluated = map[s3api.Target]evaluatedObject{}
 	}
-	c.existingTags[t] = tags
-	return tags, nil
+	c.evaluated[t] = o
+	return o.tags, nil
+}
+
+// CheckObject checks that info, the object t as the operation opened it,
+// with its Tags, is the object whose tags the request was evaluated with:
+// the same ETag, modification time and tags, so a decision made on the
+// tags of one object is never applied to another written at its key
+// meanwhile, or to the same object retagged meanwhile. The tags are
+// compared too, as a set (sameTagSet), since a retagging changes neither
+// of the other two. When
+// it is not, the operation fails with contracts.ErrOperationAborted,
+// S3's 409 OperationAborted, which asks the client to try again; it is
+// not evaluated again against the object opened, a choice, as simpler and
+// as safe. A target no s3:ExistingObjectTag key was read for, which
+// includes every target of the root principal, which is not evaluated, is
+// not checked.
+func (c *Caller) CheckObject(t s3api.Target, info *contracts.ObjectInfo) error {
+	o, ok := c.evaluated[t]
+	if !ok {
+		return nil
+	}
+	if o.found && o.etag == info.ETag && o.lastModified.Equal(info.LastModified) &&
+		sameTagSet(o.tags, info.Tags) {
+		return nil
+	}
+	return fmt.Errorf("authz: %s/%s changed after the request was evaluated: %w",
+		t.Bucket, t.Key, contracts.ErrOperationAborted)
+}
+
+// sameTagSet reports whether a and b are the same tag set, in any order:
+// the same keys, each with the same value. A tag set's keys are unique
+// (s3api's tag rules), so a retagging that only reorders the set is no
+// change.
+func sameTagSet(a, b []contracts.Tag) bool {
+	return len(a) == len(b) && maps.Equal(tagValues(a), tagValues(b))
+}
+
+// tagValues maps each key of tags to its value.
+func tagValues(tags []contracts.Tag) map[string]string {
+	values := make(map[string]string, len(tags))
+	for _, tag := range tags {
+		values[tag.Key] = tag.Value
+	}
+	return values
+}
+
+// ObjectCheck returns CheckObject for t, for a storage operation that
+// opens t itself.
+func (c *Caller) ObjectCheck(t s3api.Target) contracts.ObjectCheck {
+	return func(info *contracts.ObjectInfo) error { return c.CheckObject(t, info) }
 }

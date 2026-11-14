@@ -2,8 +2,10 @@ package authz
 
 import (
 	"net/http"
+	"slices"
 	"strings"
 
+	"tule.dev/object-store/internal/contracts"
 	"tule.dev/object-store/internal/s3api"
 )
 
@@ -101,6 +103,9 @@ type check struct {
 	// DELETE Object operations, this condition key is not supported."
 	// ("Tagging and access control policies", S3 User Guide).
 	onWrite bool
+	// onSource marks a check made on a copy's source, the operation's
+	// second target, rather than its first (see copyTagChecks).
+	onSource bool
 }
 
 // operations maps every routed operation to the evaluations it needs, in
@@ -114,7 +119,8 @@ type check struct {
 // s3:ListMultipartUploadParts, and the multipart writes as s3:PutObject.
 //
 // An operation on several resources has one check per resource, made in
-// turn: CopyObject and UploadPartCopy need s3:PutObject on the destination
+// turn, except CopyObject's, whose source is checked first (see
+// evaluateCopy): CopyObject and UploadPartCopy need s3:PutObject on the destination
 // and s3:GetObject on the source ("You must have the s3:GetObject
 // permission to read the source object that is being copied" and "the
 // s3:PutObject permission to write the object copy", their API
@@ -261,9 +267,9 @@ var operations = map[Operation][]check{
 //     s3:PutObjectTagging", PutObject API reference; the reference lists
 //     it for all three), a copy only under the REPLACE tagging directive,
 //     as under COPY the header is not read. A copy that takes its source's
-//     tags needs only s3:PutObject, a choice S3 does not document. The
-//     check takes no s3:ExistingObjectTag keys, nor does the
-//     s3:PutObjectAcl above (see onWrite).
+//     tags needs the checks copyTagChecks adds instead. The check takes no
+//     s3:ExistingObjectTag keys, nor does the s3:PutObjectAcl above (see
+//     onWrite).
 func headerChecks(op Operation, r *http.Request) []check {
 	switch op {
 	case CreateBucket:
@@ -295,6 +301,32 @@ func objectWriteChecks(op Operation, r *http.Request) []check {
 			check{action: "s3:PutObjectTagging", kind: objectResource, onWrite: true})
 	}
 	return checks
+}
+
+// copyTagChecks are the checks a CopyObject under the COPY tagging
+// directive, the default, needs when its source has tags, which the copy
+// then gets: s3:PutObjectTagging on the destination, which "Required
+// permissions for Amazon S3 API operations" (S3 User Guide) lists for
+// CopyObject as "Required if you want to put the copied object with object
+// tagging to the destination bucket", and which the reference authorizes
+// CopyObject with; and s3:GetObjectTagging on the source, which neither
+// the API reference, the User Guide nor the reference lists for
+// CopyObject. Without it a caller could read a source's tags it may not
+// read by copying it and reading the copy's, so it is required, a choice,
+// the closed one. tags are the source's (see requestTagsOf), and a source
+// without tags needs neither. The s3:PutObjectTagging check is on the
+// object the copy replaces, so takes no s3:ExistingObjectTag keys (see
+// onWrite); the s3:GetObjectTagging check takes the source's. Both take
+// the source's tags as s3:RequestObjectTag and s3:RequestObjectTagKeys
+// where the reference lists them, on s3:PutObjectTagging.
+func copyTagChecks(op Operation, r *http.Request, tags []contracts.Tag) []check {
+	if op != CopyObject || replacesTags(r) || len(tags) == 0 {
+		return nil
+	}
+	return []check{
+		{action: "s3:GetObjectTagging", kind: objectResource, onSource: true},
+		{action: "s3:PutObjectTagging", kind: objectResource, onWrite: true},
+	}
 }
 
 // replacesTags reports whether r, a CopyObject, gives the copy its own
@@ -351,13 +383,17 @@ func Operations() []Operation {
 	return ops
 }
 
-// Actions returns the actions op is evaluated as, in order, for tests that
+// Actions returns the actions op is evaluated as, in the order they are
+// evaluated, CopyObject's source first (see evaluateCopy), for tests that
 // check a denial names the right one.
 func Actions(op Operation) []string {
 	checks := operations[op]
 	actions := make([]string, len(checks))
 	for i, c := range checks {
 		actions[i] = c.action
+	}
+	if op == CopyObject {
+		slices.Reverse(actions)
 	}
 	return actions
 }

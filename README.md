@@ -314,7 +314,7 @@ through its handler.
 | ListMultipartUploads | `s3:ListBucketMultipartUploads` | bucket |
 | GetObject, HeadObject | `s3:GetObject` | object |
 | PutObject | `s3:PutObject` | object |
-| CopyObject | `s3:PutObject`, then `s3:GetObject` | destination, then source object |
+| CopyObject | `s3:GetObject`, then, for a source with tags under the `COPY` tagging directive, `s3:GetObjectTagging`; then `s3:PutObject`, then, for that source, `s3:PutObjectTagging` | source object, then destination |
 | UploadPartCopy | `s3:PutObject`, then `s3:GetObject` | destination, then source object |
 | DeleteObject | `s3:DeleteObject` | object |
 | DeleteObjects | `s3:DeleteObject` | each key; a denied key gets its own `AccessDenied` entry in the result |
@@ -354,8 +354,24 @@ need `s3:PutObjectTagging` ("To successfully set the tag-set with your
 `PutObject` request, you must have the `s3:PutObjectTagging`", PutObject
 API reference; the reference lists it for all three), a copy only under
 `x-amz-tagging-directive: REPLACE`, since under `COPY` the header is not
-read. A copy that takes its source's tags needs only `s3:PutObject`, a
-choice S3 does not document.
+read.
+
+A CopyObject under `COPY`, the default, of a source with tags gives the
+copy those tags, and needs `s3:PutObjectTagging` on the destination
+("Required if you want to put the copied object with object tagging to
+the destination bucket when you make a `CopyObject` request", "Required
+permissions for Amazon S3 API operations", S3 User Guide; the reference
+also authorizes CopyObject with it) and `s3:GetObjectTagging` on the
+source. AWS does not list `s3:GetObjectTagging` for CopyObject in the API
+reference, the User Guide or the reference; without it a caller could read
+tags it may not read by copying their object and reading the copy's, so it
+is required, a choice, the closed one, and the table test records the
+exception. A copy of a source without tags needs neither, and one under
+`REPLACE` is checked as above. A copy's source is checked before its
+destination, `s3:GetObject` and then `s3:GetObjectTagging`, and the
+source's tags are supplied to the destination's checks only once those
+pass, so a caller denied the source's read is denied the same way
+whatever the source's tags, and learns nothing of them.
 
 UploadPartCopy needs `s3:GetObject` on the source and `s3:PutObject` on the
 destination ("you must have the `s3:GetObject` permission to read the
@@ -442,20 +458,35 @@ are supplied for the actions the reference lists them for:
   none. It is not supplied to a write, nor to the `s3:PutObjectTagging` a
   write's `x-amz-tagging` adds: "When granting permissions for the `PUT
   Object` and `DELETE Object` operations, this condition key is not
-  supported." The tags are read once per request, when it is evaluated:
-  before the operation acts, and without the lock that orders writes to
-  the key. A request racing a write that replaces the object, or one that
-  retags it, may therefore be decided on the previous object's tags, as a
-  bucket policy that changes in flight may be evaluated in its previous
-  version (above). A read of them that fails fails the request with `500
-  InternalError`.
+  supported." The tags are read once per request, when it is evaluated,
+  with the ETag and modification time of the object they are the tags of,
+  in one read of it. The decision is bound to that object: once the
+  operation opens the object it acts on (the object of GetObject,
+  HeadObject, GetObjectAttributes, GetObjectAcl, PutObjectAcl,
+  GetObjectTagging, PutObjectTagging and DeleteObjectTagging, and the
+  source of CopyObject and UploadPartCopy, a write's under the key's lock),
+  it checks that the object has the same ETag, modification time and tag
+  set, in any order,
+  and that there was an object when it was evaluated. When it does not,
+  because a write replaced the object or a PutObjectTagging retagged it
+  meanwhile, the operation does nothing and answers `409
+  OperationAborted`, S3's error for a conflicting operation in progress,
+  which asks the client to try again; it is not evaluated again against
+  the object opened, a choice. So an operation is never performed on an
+  object, or with tags, its decision was not made for. The root principal
+  is not evaluated, so its operations are not checked. A read of the tags
+  that fails fails the request with `500 InternalError`.
 - `s3:RequestObjectTag/<key>`, each tag the request sets, and
   `s3:RequestObjectTagKeys`, their keys, a multivalued key, for
   `s3:PutObject` and `s3:PutObjectTagging`: the tags of PutObjectTagging's
   document, and of the `x-amz-tagging` header of PutObject,
   CreateMultipartUpload and a CopyObject under `REPLACE`. A copy under
-  `COPY` sets its source's tags, which are not taken as the request's, a
-  choice. PutObjectTagging therefore reads and parses its document before
+  `COPY` sets its source's tags, which are its request's tags here, so a
+  condition on the tags a write sets applies to the tags a copy copies;
+  AWS does not document how copied tags are evaluated, and this is a
+  choice, the closed one. They are the tags of the source the copy is
+  bound to (above), so the tags copied are the tags evaluated.
+  PutObjectTagging therefore reads and parses its document before
   it is evaluated, unlike the other writes of a document, so a malformed
   one is refused before a caller's permission is known.
 
@@ -515,13 +546,44 @@ refused with `400 InvalidArgument`, which bounds the cost of evaluating it.
   RCPs are not evaluated.
 - There is no per-account ownership of buckets: every bucket belongs to
   `TULE_Auth_AccountID`.
-- CopyObject and UploadPartCopy check the destination before the source; the order S3 checks
-  them in, which decides the action a doubly denied copy names, is not
-  documented. DeleteObjects checks that the bucket exists before it
+- CopyObject checks the source before the destination, so that the
+  source's tags, which are the destination's request tags, reach a policy
+  only once the caller may read them; UploadPartCopy, which copies no tags,
+  checks the destination first. The order S3 checks them in, which decides
+  the action a doubly denied copy names, is not documented. DeleteObjects checks that the bucket exists before it
   evaluates any key, so a caller with no permission learns whether a bucket
   exists; S3's order is not documented either.
 
 ### Changes in this version
+
+- **Behavior:** a CopyObject under the `COPY` tagging directive, the
+  default, of a source with tags also needs `s3:GetObjectTagging` on the
+  source and `s3:PutObjectTagging` on the destination, and the source's
+  tags are its `s3:RequestObjectTag/<key>` and `s3:RequestObjectTagKeys`
+  ([Actions and resources](#actions-and-resources),
+  [Condition keys](#condition-keys)). Up to this version it needed only
+  `s3:GetObject` and `s3:PutObject`, so a caller could copy tags it may
+  not read and set tags it may not set. A policy that allows such a copy
+  with those two actions alone now refuses it with `403 AccessDenied`; a
+  copy of a source without tags, or under `REPLACE`, needs what it did.
+- **Behavior:** CopyObject checks its source before its destination, so a
+  copy denied both names `s3:GetObject` on the source, where it named
+  `s3:PutObject` on the destination. The source's tags are supplied to the
+  destination's checks only once the source's read is allowed
+  ([Actions and resources](#actions-and-resources)).
+- **Fix:** a decision made on `s3:ExistingObjectTag/<key>` is bound to the
+  object whose tags it was made on. A request racing a write that replaced
+  the object, or a retagging, could be decided on the previous object's
+  tags and then act on the new one, such as a GetObject allowed on an
+  untagged object serving its replacement tagged to be denied. Such a
+  request now answers `409 OperationAborted` and does nothing
+  ([Condition keys](#condition-keys)).
+- **Fix:** the tags a write sets are stored with the object, so it is
+  never visible without them; it was, for a moment after its write, and a
+  request in that moment saw no tags ([Object tagging](#object-tagging)).
+  Objects and tags stored by v0.10.0 are read as they were.
+
+### Changes in v0.10.0
 
 - **Behavior:** object tagging is served: PutObjectTagging,
   GetObjectTagging and DeleteObjectTagging, which answered `501
@@ -954,7 +1016,10 @@ A copy takes its source's tags under `x-amz-tagging-directive: COPY`, the
 default, and its own header's under `REPLACE` ("You can specify the
 `x-amz-tagging-directive` in your request to direct Amazon S3 to either
 copy (default behavior) the tags or replace tags by a new set of tags
-provided in the request"); under `COPY` the header is not read. Another
+provided in the request"); under `COPY` the header is not read, and a
+source with tags needs `s3:GetObjectTagging` on it and
+`s3:PutObjectTagging` on the destination
+([Actions and resources](#actions-and-resources)). Another
 directive is `400 InvalidArgument`, a choice. A multipart upload's object
 gets the tags its CreateMultipartUpload named when it completes.
 
@@ -985,14 +1050,21 @@ with tags, and only to a caller allowed `s3:GetObjectTagging` on it, which
 is evaluated without refusing the read. A standalone server's key, which
 is never evaluated, is always answered it.
 
-An object's tags are kept in a side file per object, as its ACL is
-([Object Ownership and ACLs](#object-ownership-and-acls)), stored with the
-object's ETag and modification time and answered only for the object they
-were stored for: every write, copy and completed upload replaces or
-removes them, a delete removes them, and DeleteBucket removes them all, so
-an object written over, or deleted and written again, never shows its
-predecessor's tags. The tag conditions of policies are described under
-[Condition keys](#condition-keys).
+The tags a write, copy or completed upload sets are stored in the object
+itself, in the record of its metadata written with its bytes, so the
+object is never visible without them. PutObjectTagging and
+DeleteObjectTagging store the object's new tag set, empty for a delete, in
+a side file per object, as its ACL is
+([Object Ownership and ACLs](#object-ownership-and-acls)), with the
+object's ETag and modification time; the side file, when it was stored for
+the object as it now is, overrides the tags the object was written with,
+and is ignored otherwise. A write removes the side file of the object it
+replaced, a delete removes the object's, and DeleteBucket removes them
+all, though what is read never depends on that removal, so an object
+written over, or deleted and written again, never shows its predecessor's
+tags. An object written by v0.10.0 has no tags of its own, and its side
+file still applies to it. The tag conditions of policies are described
+under [Condition keys](#condition-keys).
 
 ## Part copies and copy conditions
 

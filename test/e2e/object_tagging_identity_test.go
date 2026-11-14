@@ -48,8 +48,9 @@ func conditionDoc(actions, cond, always string) string {
 		`{"Effect":"Allow","Action":` + always + `,"Resource":"*"}]}`
 }
 
-// A write carrying x-amz-tagging also needs s3:PutObjectTagging; a copy
-// under COPY, which takes its source's tags, does not.
+// A write carrying x-amz-tagging also needs s3:PutObjectTagging, as a
+// copy under REPLACE does; a copy under COPY of a tagged source needs it
+// and s3:GetObjectTagging (see TestACopyOfTagsNeedsTagPermissions).
 func TestTaggedWritesNeedPutObjectTagging(t *testing.T) {
 	e := startTagEnv(t)
 	ctx := t.Context()
@@ -77,7 +78,7 @@ func TestTaggedWritesNeedPutObjectTagging(t *testing.T) {
 	_, err = e.dev.CopyObject(ctx, &s3.CopyObjectInput{
 		Bucket: aws.String("bkt"), Key: aws.String("c"), CopySource: copySource("bkt", "src"),
 	})
-	requireNoErr(t, err, "copy src with its tags")
+	requireDenied(t, err, notAllowed(devARN, "s3:GetObjectTagging", "arn:aws:s3:::bkt/src"))
 
 	e.set(allowDoc(`["s3:PutObject","s3:PutObjectTagging"]`, "*"))
 	_, err = e.dev.PutObject(ctx, &s3.PutObjectInput{
@@ -145,7 +146,8 @@ func TestExistingObjectTagCondition(t *testing.T) {
 		requireNoErr(t, err, "put "+key)
 	}
 	e.set(conditionDoc(`["s3:GetObject","s3:GetObjectTagging","s3:GetObjectAcl"]`,
-		`{"StringEquals":{"s3:ExistingObjectTag/env":"prod"}}`, `"s3:PutObject"`))
+		`{"StringEquals":{"s3:ExistingObjectTag/env":"prod"}}`,
+		`["s3:PutObject","s3:PutObjectTagging"]`))
 
 	_, err := e.dev.GetObjectTagging(ctx, &s3.GetObjectTaggingInput{
 		Bucket: aws.String("bkt"), Key: aws.String("prod"),
@@ -263,4 +265,60 @@ func TestAWritesACLIgnoresExistingTags(t *testing.T) {
 	})
 	requireDenied(t, err, denied(devARN, "s3:PutObjectAcl", "arn:aws:s3:::acls/locked",
 		"with an explicit deny in a resource-based policy"))
+}
+
+// A copy under COPY, the default, of a source with tags needs
+// s3:GetObjectTagging on the source and s3:PutObjectTagging on the
+// destination, and the source's tags are the destination's
+// s3:RequestObjectTag keys, so a Deny on them applies to the copy. A
+// copy of a source without tags needs neither.
+func TestACopyOfTagsNeedsTagPermissions(t *testing.T) {
+	e := startTagEnv(t)
+	ctx := t.Context()
+	_, err := e.root.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String("bkt"), Key: aws.String("src"), Body: strings.NewReader("src"),
+		Tagging: aws.String("team=a"),
+	})
+	requireNoErr(t, err, "put a tagged source")
+	put(t, e.root, "bkt", "plain", []byte("plain"))
+	copyOf := func(src, dst string) error {
+		t.Helper()
+		_, cErr := e.dev.CopyObject(ctx, &s3.CopyObjectInput{
+			Bucket: aws.String("bkt"), Key: aws.String(dst), CopySource: copySource("bkt", src),
+		})
+		return cErr //nolint:wrapcheck // the test inspects the SDK error
+	}
+
+	e.set(allowDoc(`["s3:GetObject","s3:PutObject","s3:PutObjectTagging"]`, "*"))
+	requireDenied(t, copyOf("src", "c"),
+		notAllowed(devARN, "s3:GetObjectTagging", "arn:aws:s3:::bkt/src"))
+	e.set(allowDoc(`["s3:GetObject","s3:PutObject","s3:GetObjectTagging"]`, "*"))
+	requireDenied(t, copyOf("src", "c"),
+		notAllowed(devARN, "s3:PutObjectTagging", "arn:aws:s3:::bkt/c"))
+
+	e.set(allowDoc(`["s3:GetObject","s3:PutObject"]`, "*"))
+	requireNoErr(t, copyOf("plain", "p"), "copy an untagged source")
+	out, err := e.root.GetObjectTagging(ctx, &s3.GetObjectTaggingInput{
+		Bucket: aws.String("bkt"), Key: aws.String("p"),
+	})
+	requireNoErr(t, err, "the tags of the untagged copy")
+	requireEqual(t, len(out.TagSet), 0, "the untagged copy's tags")
+
+	all := `["s3:GetObject","s3:PutObject","s3:GetObjectTagging","s3:PutObjectTagging"]`
+	e.set(allowDoc(all, "*"))
+	requireNoErr(t, copyOf("src", "c"), "copy a tagged source with both permissions")
+	out, err = e.root.GetObjectTagging(ctx, &s3.GetObjectTaggingInput{
+		Bucket: aws.String("bkt"), Key: aws.String("c"),
+	})
+	requireNoErr(t, err, "the tags of the copy")
+	requireEqual(t, len(out.TagSet) == 1 && aws.ToString(out.TagSet[0].Key) == "team" &&
+		aws.ToString(out.TagSet[0].Value) == "a", true, "the copy has its source's tags")
+
+	e.set(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":` + all +
+		`,"Resource":"*"},{"Effect":"Deny","Action":"s3:PutObject",` +
+		`"Resource":"arn:aws:s3:::bkt/*","Condition":` +
+		`{"StringEquals":{"s3:RequestObjectTag/team":"a"}}}]}`)
+	requireDenied(t, copyOf("src", "d"), denied(devARN, "s3:PutObject", "arn:aws:s3:::bkt/d",
+		"with an explicit deny in an identity-based policy"))
+	requireNoErr(t, copyOf("plain", "d"), "copy an untagged source past the Deny")
 }

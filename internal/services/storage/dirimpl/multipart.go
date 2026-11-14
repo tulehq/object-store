@@ -205,11 +205,11 @@ func (s *Service) storePart(uploadID string, partNumber int, body io.Reader) (st
 
 // UploadPartCopy stores the bytes of in's source object in in.Range, or
 // all of them, as part in.PartNumber of an upload, replacing any earlier
-// upload of the part, if in.SourceCondition holds of the source as it is
-// read. The bytes are streamed from the source as it was opened, so a
-// source written over meanwhile is copied whole as it was. A range must be
-// within the source, which must be larger than MinRangeCopySource, and
-// the copy at most MaxCopyPartSize. ctx must be pinned to both buckets.
+// upload of the part, if in.SourceCheck passes and in.SourceCondition
+// holds of the source as it is read. The bytes are streamed from the
+// source as it was opened, so a source written over meanwhile is copied
+// whole as it was. A range must be within the source, which must be larger
+// than MinRangeCopySource, and the copy at most MaxCopyPartSize. ctx must be pinned to both buckets.
 func (s *Service) UploadPartCopy(
 	ctx context.Context,
 	in contracts.UploadPartCopyInput,
@@ -227,7 +227,7 @@ func (s *Service) UploadPartCopy(
 			err = errors.Join(err, fmt.Errorf("%s: copy %q: %w", s.Name(), in.SrcKey, cErr))
 		}
 	}()
-	if err = checkSourceCondition(in.SourceCondition, &src.ObjectInfo); err != nil {
+	if err = checkSource(in.SourceCheck, in.SourceCondition, &src.ObjectInfo); err != nil {
 		return nil, nil, err
 	}
 	first, length, err := copySpan(in.Range, src.Size)
@@ -369,7 +369,9 @@ func (s *Service) CompleteMultipartUpload(
 	}
 	r := &partsReader{root: s.root, names: names}
 
-	info, err := s.putObject(ctx, bucket, key, r, m.Put.ContentType, meta)
+	info, err := s.putObject(ctx, bucket, key, r, &trailer{
+		Meta: meta, ContentType: m.Put.ContentType, Tags: m.Put.Tags,
+	})
 	if cErr := r.Close(); cErr != nil {
 		err = errors.Join(err, cErr)
 	}
@@ -380,7 +382,7 @@ func (s *Service) CompleteMultipartUpload(
 	if err = s.setObjectACL(bucket, info, m.Put.ACL); err != nil {
 		return nil, err
 	}
-	if err = s.setObjectTags(bucket, info, m.Put.Tags); err != nil {
+	if err = s.dropTagFile(bucket, key); err != nil {
 		return nil, err
 	}
 

@@ -84,7 +84,8 @@ func TestManyPartSizes(t *testing.T) {
 	meta := map[string]string{etagMetaKey: "0123456789abcdef0123456789abcdef-10000"}
 	joinParts(meta, sizes)
 
-	if _, err := s.putObject(ctx, "bucket", "k", strings.NewReader("x"), "", meta); err != nil {
+	if _, err := s.putObject(ctx, "bucket", "k", strings.NewReader("x"),
+		&trailer{Meta: meta}); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	info, err := s.StatObject(ctx, "bucket", "k")

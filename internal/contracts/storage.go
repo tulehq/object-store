@@ -189,25 +189,40 @@ type StorageProvider interface {
 	DeleteBucketConfig(ctx context.Context, bucket string, kind BucketConfig) error
 
 	// GetObjectACL returns the ACL document stored for the object at key
-	// as it now is: storage.ErrObjectNotFound when there is no object, and
+	// as it now is, if check passes for that object:
+	// storage.ErrObjectNotFound when there is no object, and
 	// ErrNoSuchBucketConfig when the object has no ACL of its own, which
 	// includes one written over, or deleted and written again, since its
 	// ACL was stored.
-	GetObjectACL(ctx context.Context, bucket, key string) ([]byte, error)
+	GetObjectACL(ctx context.Context, bucket, key string, check ObjectCheck) ([]byte, error)
 	// PutObjectACL stores doc as the ACL of the object at key as it now
-	// is: storage.ErrObjectNotFound when there is none.
-	PutObjectACL(ctx context.Context, bucket, key string, doc []byte) error
+	// is, if check passes for that object: storage.ErrObjectNotFound when
+	// there is none.
+	PutObjectACL(ctx context.Context, bucket, key string, doc []byte, check ObjectCheck) error
 
-	// GetObjectTagging returns the tags stored for the object at key as it
-	// now is, none for an object written over, or deleted and written
-	// again, since they were stored: storage.ErrObjectNotFound when there
-	// is no object. ctx need not be pinned; one pinned to bucket reads
-	// them under the pin.
+	// GetObjectTagging returns the tags of the object at key as it now is:
+	// the ones it was written with, or those PutObjectTagging stored for it
+	// since, which an object written over, or deleted and written again,
+	// does not keep: storage.ErrObjectNotFound when there is no object.
+	// ctx need not be pinned; one pinned to bucket reads them under the
+	// pin.
 	GetObjectTagging(ctx context.Context, bucket, key string) ([]Tag, error)
+	// StatObjectTagging returns the info of the object at key as it now
+	// is with its Tags set, as GetObjectTagging returns them, both read
+	// from one open of the object, so the tags are that object's:
+	// storage.ErrObjectNotFound when there is no object. ctx need not be
+	// pinned; one pinned to bucket reads them under the pin.
+	StatObjectTagging(ctx context.Context, bucket, key string) (*ObjectInfo, error)
 	// PutObjectTagging stores tags as the tags of the object at key as it
-	// now is, replacing any it had; no tags removes them:
-	// storage.ErrObjectNotFound when there is no object.
-	PutObjectTagging(ctx context.Context, bucket, key string, tags []Tag) error
+	// now is, replacing any it had, if check passes for that object; no
+	// tags removes them: storage.ErrObjectNotFound when there is no
+	// object.
+	PutObjectTagging(
+		ctx context.Context,
+		bucket, key string,
+		tags []Tag,
+		check ObjectCheck,
+	) error
 
 	// UploadPartCopy stores as part in.PartNumber of an upload the bytes of
 	// its source object in in.Range, or all of them, if in.Condition holds
@@ -240,7 +255,8 @@ type BucketInfo struct {
 // described on PutObjectInput. PartSizes lists the part sizes of an object
 // assembled by a multipart upload, and is empty for other objects. Tags
 // are the object's tags, as GetObjectTagging returns them; only GetObject
-// reads them, and every other operation leaves them nil.
+// and StatObjectTagging read them, and every other operation leaves them
+// nil.
 type ObjectInfo struct {
 	LastModified time.Time
 	Metadata     map[string]string
@@ -319,7 +335,11 @@ type Precondition struct {
 // ACL is the copy's ACL, as PutObjectInput's. Tags are the copy's tags,
 // unless CopyTags is set, which gives it its source's instead, as S3's
 // COPY tagging directive does. Precondition applies to the destination,
-// and SourceCondition to the source as it is read.
+// and SourceCondition to the source as it is read. SourceCheck, when set,
+// is called with the source's info, Tags included, as it was opened for
+// the copy, and an error it returns fails the copy before anything is
+// written: it binds the copy to the source its authorization was
+// evaluated for.
 type CopyObjectInput struct {
 	Replace         *PutObjectInput
 	Headers         map[string]string
@@ -330,9 +350,15 @@ type CopyObjectInput struct {
 	SrcKey          string
 	DstBucket       string
 	DstKey          string
+	SourceCheck     ObjectCheck
 	Precondition    Precondition
 	CopyTags        bool
 }
+
+// ObjectCheck checks an object an operation opened, its info with its
+// Tags, before the operation acts on it; an error it returns fails the
+// operation with that error. A nil ObjectCheck checks nothing.
+type ObjectCheck func(*ObjectInfo) error
 
 // SourceCondition guards a copy's source, following S3's
 // x-amz-copy-source-if-* headers and RFC 7232's order of evaluation: a set
@@ -346,9 +372,11 @@ type SourceCondition struct {
 }
 
 // UploadPartCopyInput copies SrcBucket/SrcKey, or its Range, into part
-// PartNumber of upload UploadID of Bucket/Key.
+// PartNumber of upload UploadID of Bucket/Key. SourceCheck is as
+// CopyObjectInput's.
 type UploadPartCopyInput struct {
 	Range           *CopyRange
+	SourceCheck     ObjectCheck
 	SourceCondition SourceCondition
 	Bucket          string
 	Key             string

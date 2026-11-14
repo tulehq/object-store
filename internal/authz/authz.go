@@ -41,11 +41,11 @@ var errNoPrincipal = errors.New("authz: the request has no verified principal")
 // Block Public Access settings that restrict them and the tags of the
 // objects they act on, and pins the buckets an operation acts on to the
 // generation evaluated: contracts.StorageProvider's GetBucketPolicy,
-// GetBucketConfig, GetObjectTagging and Pin.
+// GetBucketConfig, StatObjectTagging and Pin.
 type PolicySource interface {
 	GetBucketPolicy(ctx context.Context, bucket string) (string, []byte, error)
 	GetBucketConfig(ctx context.Context, bucket string, kind contracts.BucketConfig) ([]byte, error)
-	GetObjectTagging(ctx context.Context, bucket, key string) ([]contracts.Tag, error)
+	StatObjectTagging(ctx context.Context, bucket, key string) (*contracts.ObjectInfo, error)
 	Pin(ctx context.Context, refs ...contracts.BucketRef) (context.Context, func(), error)
 }
 
@@ -98,9 +98,10 @@ type Caller struct {
 	// unknown are the condition keys whose values could not be told, which
 	// policy.Authorize resolves against the caller.
 	unknown []string
-	// existingTags are the tags of the objects read for
-	// s3:ExistingObjectTag, by target, so each is read once per request.
-	existingTags map[s3api.Target][]contracts.Tag
+	// evaluated are the objects read for s3:ExistingObjectTag, by target,
+	// so each is read once per request, and the operation is bound to them
+	// (see CheckObject).
+	evaluated map[s3api.Target]evaluatedObject
 	// requestTags are the tags the operation evaluated sets, for
 	// s3:RequestObjectTag and s3:RequestObjectTagKeys (see requestTagsOf).
 	requestTags []contracts.Tag
@@ -228,7 +229,8 @@ func (a *Authorizer) parse(doc []byte, resource bool) (*policy.Policy, error) {
 
 // Authorize evaluates op's checks in order, the n-th on targets[n], then
 // the checks the request's ACL and Object Ownership headers add (see
-// headerChecks) on targets[0]: the root principal is allowed everything; any other principal gets S3's
+// headerChecks) on targets[0], CopyObject's in the order evaluateCopy
+// gives: the root principal is allowed everything; any other principal gets S3's
 // AccessDenied for the first check its policies and the target bucket's
 // policy do not allow together. An operation with no entry, or with a
 // different number of targets than checks, is an internal error, so a
@@ -262,10 +264,14 @@ func (c *Caller) Authorize(op Operation, targets ...s3api.Target) error {
 }
 
 // evaluateChecks evaluates checks, the n-th on targets[n], then op's
-// header checks on targets[0].
+// header checks on targets[0]; CopyObject's are evaluated as evaluateCopy
+// describes.
 func (c *Caller) evaluateChecks(op Operation, checks []check, targets []s3api.Target) error {
 	extra := operationKeys(op, targets)
-	tags, err := c.requestTagsOf(op)
+	if op == CopyObject {
+		return c.evaluateCopy(checks, targets, extra)
+	}
+	tags, err := c.requestTagsOf(op, targets)
 	if err != nil {
 		return err
 	}
@@ -277,6 +283,61 @@ func (c *Caller) evaluateChecks(op Operation, checks []check, targets []s3api.Ta
 	}
 	for _, ch := range headerChecks(op, c.req) {
 		if err := c.evaluate(ch, targets[0], extra); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// evaluateCopy evaluates CopyObject's checks, its entry's on targets, the
+// destination and then the source, in the order that reads the source
+// first: s3:GetObject on the source, then, for a source whose tags the
+// copy takes, s3:GetObjectTagging on it (copyTagChecks), and only then the
+// destination's, s3:PutObject, the header checks and s3:PutObjectTagging.
+// The source's tags are the destination checks' request tags (see
+// requestTagsOf), so they are supplied to a policy only once the caller
+// is known to be allowed to read them: a caller denied the source's read
+// is denied it whatever the source's tags, and learns nothing of them
+// from which check denied it. The order does not depend on the source's
+// tags. S3 does not document the order it checks a copy in.
+func (c *Caller) evaluateCopy(
+	checks []check,
+	targets []s3api.Target,
+	extra map[string]map[string]string,
+) error {
+	dst, src := targets[0], targets[1]
+	if err := c.evaluate(checks[1], src, extra); err != nil {
+		return err
+	}
+	tags, err := c.requestTagsOf(CopyObject, targets)
+	if err != nil {
+		return err
+	}
+	var onSource, onDestination []check
+	for _, ch := range copyTagChecks(CopyObject, c.req, tags) {
+		if ch.onSource {
+			onSource = append(onSource, ch)
+		} else {
+			onDestination = append(onDestination, ch)
+		}
+	}
+	if err = c.evaluateEach(onSource, src, extra); err != nil {
+		return err
+	}
+	c.requestTags = tags
+	then := append([]check{checks[0]}, headerChecks(CopyObject, c.req)...)
+	return c.evaluateEach(append(then, onDestination...), dst, extra)
+}
+
+// evaluateEach evaluates checks in turn on t, stopping at the first that
+// fails.
+func (c *Caller) evaluateEach(
+	checks []check,
+	t s3api.Target,
+	extra map[string]map[string]string,
+) error {
+	for _, ch := range checks {
+		if err := c.evaluate(ch, t, extra); err != nil {
 			return err
 		}
 	}
@@ -704,6 +765,16 @@ func (g *Grant) NotFound(bucket string, err error) error { return g.caller.NotFo
 
 // Caller is the caller the operation was authorized for.
 func (g *Grant) Caller() *Caller { return g.caller }
+
+// CheckObject is the caller's CheckObject.
+func (g *Grant) CheckObject(t s3api.Target, info *contracts.ObjectInfo) error {
+	return g.caller.CheckObject(t, info)
+}
+
+// ObjectCheck is the caller's ObjectCheck.
+func (g *Grant) ObjectCheck(t s3api.Target) contracts.ObjectCheck {
+	return g.caller.ObjectCheck(t)
+}
 
 // AuthorizeAndPin authorizes op on targets for r's caller, as Authorize
 // does, and pins the targets' buckets to the generations evaluated (see

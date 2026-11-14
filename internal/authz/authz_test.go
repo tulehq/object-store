@@ -62,10 +62,14 @@ var testTags = map[string][]contracts.Tag{
 	"locked": {{Key: "locked", Value: "true"}},
 }
 
-func (b buckets) GetObjectTagging(
+// testModified is the modification time of every object.
+var testModified = time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+
+// Every object's ETag is "etag-" and its key.
+func (b buckets) StatObjectTagging(
 	_ context.Context,
 	bucket, key string,
-) ([]contracts.Tag, error) {
+) (*contracts.ObjectInfo, error) {
 	if _, ok := b[bucket]; !ok {
 		return nil, storage.ErrBucketNotFound
 	}
@@ -73,7 +77,9 @@ func (b buckets) GetObjectTagging(
 	if !ok {
 		return nil, storage.ErrObjectNotFound
 	}
-	return tags, nil
+	return &contracts.ObjectInfo{
+		Key: key, ETag: "etag-" + key, LastModified: testModified, Tags: tags,
+	}, nil
 }
 
 func (b buckets) Pin(
@@ -439,10 +445,11 @@ func TestCopySourceIsTheDecodedSource(t *testing.T) {
 // are exempt.
 func TestObjectCreationOperation(t *testing.T) {
 	a := newAuthorizer(nil)
-	p := user(allow("s3:PutObject", "*"), `{"Version":"2012-10-17","Statement":[{`+
-		`"Sid":"BlockNonConditionalObjectCreation","Effect":"Deny","Action":"s3:PutObject",`+
-		`"Resource":"arn:aws:s3:::b/*","Condition":{"Null":{"s3:if-match":"true"},`+
-		`"Bool":{"s3:ObjectCreationOperation":"true"}}}]}`)
+	p := user(allow("s3:PutObject", "*"), allow("s3:GetObject", "*"),
+		`{"Version":"2012-10-17","Statement":[{`+
+			`"Sid":"BlockNonConditionalObjectCreation","Effect":"Deny","Action":"s3:PutObject",`+
+			`"Resource":"arn:aws:s3:::b/*","Condition":{"Null":{"s3:if-match":"true"},`+
+			`"Bool":{"s3:ObjectCreationOperation":"true"}}}]}`)
 	explicit := `User: ` + userARN + ` is not authorized to perform: s3:PutObject on resource: ` +
 		`"arn:aws:s3:::b/dir/k.txt" with an explicit deny in an identity-based policy`
 	src := s3api.Target{Bucket: "b", Key: "src"}
@@ -454,17 +461,15 @@ func TestObjectCreationOperation(t *testing.T) {
 		if op == CopyObject {
 			targets = append(targets, src)
 		}
-		// GetObject on the source is not allowed, so a copy that passes
-		// the Deny stops there instead.
+		// A copy is allowed s3:GetObject on its source, which it is
+		// checked for first (evaluateCopy), so it reaches the Deny.
 		err := a.check(request(p, "/b/dir/k.txt"), op, targets...)
 		if denied {
 			requireDenied(t, err, explicit)
 			conditional := request(p, "/b/dir/k.txt")
 			conditional.Header.Set("If-Match", `"etag"`)
 			err = a.check(conditional, op, targets...)
-			if op == CopyObject {
-				requireDenied(t, err, notAllowedMsg("s3:GetObject", "arn:aws:s3:::b/src"))
-			} else if err != nil {
+			if err != nil {
 				t.Errorf("%s with If-Match: %v", op, err)
 			}
 			continue

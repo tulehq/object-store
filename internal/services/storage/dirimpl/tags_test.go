@@ -6,6 +6,7 @@ import (
 	"crypto/md5" //nolint:gosec // S3 ETags are MD5 digests, not a security control
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"slices"
 	"strconv"
@@ -78,7 +79,7 @@ func TestObjectTagsGoWithTheirObjects(t *testing.T) {
 
 	_, err := s.GetObjectTagging(ctx, "bucket", "k")
 	requireIs(t, "no object", err, storage.ErrObjectNotFound)
-	requireIs(t, "put on no object", s.PutObjectTagging(ctx, "bucket", "k", testTags),
+	requireIs(t, "put on no object", s.PutObjectTagging(ctx, "bucket", "k", testTags, nil),
 		storage.ErrObjectNotFound)
 
 	put("k", testTags)
@@ -94,14 +95,30 @@ func TestObjectTagsGoWithTheirObjects(t *testing.T) {
 	requireNoTagFile(t, s, "k", "written over without tags")
 
 	one := []contracts.Tag{{Key: "a", Value: ""}}
-	if err = s.PutObjectTagging(ctx, "bucket", "k", one); err != nil {
+	if err = s.PutObjectTagging(ctx, "bucket", "k", one, nil); err != nil {
 		t.Fatal(err)
 	}
 	requireTags(t, s, ctx, "k", one, "PutObjectTagging")
-	if err = s.PutObjectTagging(ctx, "bucket", "k", nil); err != nil {
+	if err = s.PutObjectTagging(ctx, "bucket", "k", nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	requireNoTagFile(t, s, "k", "tags removed")
+	requireTags(t, s, ctx, "k", nil, "tags removed")
+
+	// Tags written with the object are in its trailer, not a tag file, and
+	// a removal of them is stored, so they do not apply again.
+	put("k", testTags)
+	requireNoTagFile(t, s, "k", "written with tags")
+	if err = s.PutObjectTagging(ctx, "bucket", "k", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	requireTags(t, s, ctx, "k", nil, "tags written with the object removed")
+	if err = s.PutObjectTagging(ctx, "bucket", "k", one, nil); err != nil {
+		t.Fatal(err)
+	}
+	requireTags(t, s, ctx, "k", one, "tags written with the object replaced")
+	put("k", nil)
+	requireTags(t, s, ctx, "k", nil, "replaced tags written over")
+	requireNoTagFile(t, s, "k", "replaced tags written over")
 
 	put("deleted", testTags)
 	if err = s.DeleteObject(ctx, "bucket", "deleted"); err != nil {
@@ -173,6 +190,144 @@ func TestStaleTagsAreNotInherited(t *testing.T) {
 		t.Fatal(err)
 	}
 	requireTags(t, s, ctx, "k", nil, "a stale tag file")
+}
+
+// An object is visible with the tags it was written with from the moment
+// its write commits: they are read from the object itself, before the
+// write removes the tag file of the object it replaced, which holds other
+// tags. The object is read between the two steps of PutObject: the commit
+// (putObject) and the removal (dropTagFile).
+func TestAWrittenObjectIsVisibleWithItsTags(t *testing.T) {
+	s := newTestService(t)
+	ctx, _ := pin(t, s)
+	putTagged(t, s, ctx, "k", nil)
+	if err := s.PutObjectTagging(ctx, "bucket", "k",
+		[]contracts.Tag{{Key: "old", Value: "1"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	unlock := s.locks.lock("bucket", "k")
+	er := newETagReader(strings.NewReader("y"), nil)
+	if _, err := s.putObject(ctx, "bucket", "k", er,
+		&trailer{Meta: er.meta, Tags: testTags}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.root.Stat(tagFile("bucket", "k")); err != nil {
+		t.Fatalf("the earlier object's tag file is not left to read past: %v", err)
+	}
+	requireTags(t, s, ctx, "k", testTags, "just after the write commits")
+	unlock()
+}
+
+// An object written before tags were stored with it has the tags its tag
+// file holds for it, as v0.10.0 stored them.
+func TestTagFilesOfEarlierWritesStillApply(t *testing.T) {
+	s := newTestService(t)
+	ctx, _ := pin(t, s)
+	er := newETagReader(strings.NewReader("x"), nil)
+	info, err := s.putObject(ctx, "bucket", "k", er, &trailer{Meta: er.meta})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(objectTags{
+		ETag: info.ETag, LastModified: info.LastModified, Tags: testTags,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.writeFile(tagFile("bucket", "k"), raw); err != nil {
+		t.Fatal(err)
+	}
+	requireTags(t, s, ctx, "k", testTags, "an object stored with a v0.10.0 tag file")
+	got, err := s.StatObjectTagging(context.Background(), "bucket", "k")
+	if err != nil || got.ETag != info.ETag || !slices.Equal(got.Tags, testTags) {
+		t.Fatalf("StatObjectTagging: %+v, %v", got, err)
+	}
+}
+
+// errStop is what a test's check fails with.
+var errStop = errors.New("stop")
+
+// checkRecorder is an operation's check that records the object it is
+// given, and fails with errStop unless pass is set.
+type checkRecorder struct {
+	seen *contracts.ObjectInfo
+	pass bool
+}
+
+func (c *checkRecorder) check(info *contracts.ObjectInfo) error {
+	c.seen = info
+	if c.pass {
+		return nil
+	}
+	return errStop
+}
+
+// requireSeen fails unless the check was given "src", written with
+// testTags, with its tags, and resets it.
+func (c *checkRecorder) requireSeen(t *testing.T, what string) {
+	t.Helper()
+	if c.seen == nil || c.seen.Key != "src" || !slices.Equal(c.seen.Tags, testTags) ||
+		c.seen.ETag == "" {
+		t.Fatalf("%s: the check saw %+v", what, c.seen)
+	}
+	c.seen = nil
+}
+
+// A copy's check is given the source it opens, with its tags, and an
+// error it returns fails the copy before it writes anything.
+func TestACopysCheckSeesTheSourceOpened(t *testing.T) {
+	s := newTestService(t)
+	ctx, _ := pin(t, s)
+	putTagged(t, s, ctx, "src", testTags)
+	rec := &checkRecorder{}
+	in := contracts.CopyObjectInput{
+		SrcBucket: "bucket", SrcKey: "src", DstBucket: "bucket", DstKey: "dst",
+		CopyTags: true, SourceCheck: rec.check,
+	}
+	_, err := s.CopyObject(ctx, in)
+	requireIs(t, "a stopped copy", err, errStop)
+	rec.requireSeen(t, "CopyObject")
+	_, err = s.StatObject(ctx, "bucket", "dst")
+	requireIs(t, "the stopped copy's destination", err, storage.ErrObjectNotFound)
+	rec.pass = true
+	if _, err = s.CopyObject(ctx, in); err != nil {
+		t.Fatal(err)
+	}
+	rec.requireSeen(t, "a passed CopyObject")
+	requireTags(t, s, ctx, "dst", testTags, "a passed copy")
+
+	_, _, part := copySource(t, s, ctx)
+	putTagged(t, s, ctx, "src", testTags)
+	rec.pass, part.SourceCheck = false, rec.check
+	_, _, err = s.UploadPartCopy(ctx, part)
+	requireIs(t, "a stopped part copy", err, errStop)
+	rec.requireSeen(t, "UploadPartCopy")
+	parts, err := s.ListParts(ctx, "bucket", "dst", part.UploadID)
+	if err != nil || len(parts) != 0 {
+		t.Fatalf("the stopped part copy stored %v, %v", parts, err)
+	}
+}
+
+// The checks of PutObjectTagging, PutObjectACL and GetObjectACL are given
+// the object they act on, with its tags, and an error one returns fails
+// the operation before it writes anything.
+func TestTagAndACLChecksSeeTheObjectOpened(t *testing.T) {
+	s := newTestService(t)
+	ctx, _ := pin(t, s)
+	putTagged(t, s, ctx, "src", testTags)
+	rec := &checkRecorder{}
+	requireIs(t, "a stopped PutObjectTagging",
+		s.PutObjectTagging(ctx, "bucket", "src", nil, rec.check), errStop)
+	rec.requireSeen(t, "PutObjectTagging")
+	requireTags(t, s, ctx, "src", testTags, "after a stopped PutObjectTagging")
+	requireIs(t, "a stopped PutObjectACL",
+		s.PutObjectACL(ctx, "bucket", "src", []byte("<a/>"), rec.check), errStop)
+	rec.requireSeen(t, "PutObjectACL")
+	_, err := s.GetObjectACL(ctx, "bucket", "src", rec.check)
+	requireIs(t, "a stopped GetObjectACL", err, errStop)
+	rec.requireSeen(t, "GetObjectACL")
+	_, err = s.GetObjectACL(ctx, "bucket", "src", nil)
+	requireIs(t, "the ACL after a stopped PutObjectACL", err, contracts.ErrNoSuchBucketConfig)
 }
 
 // Deleting a bucket removes its objects' tags.

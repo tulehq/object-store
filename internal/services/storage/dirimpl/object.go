@@ -75,7 +75,7 @@ func (s *Service) statObject(
 	ctx context.Context,
 	bucket, key string,
 ) (*contracts.ObjectInfo, error) {
-	obj, err := s.openObject(ctx, "stat", bucket, key)
+	obj, _, err := s.openObject(ctx, "stat", bucket, key)
 	if err != nil {
 		return nil, err
 	}
@@ -88,42 +88,54 @@ func (s *Service) statObject(
 // GetObject opens an object for reading, with its tags. The caller must
 // close its Body. The info and body come from the same read, so they match
 // even when the object is overwritten meanwhile, and the tags are those
-// stored for that object. ctx must be pinned to bucket.
+// stored for that object (see readObjectTags). ctx must be pinned to
+// bucket.
 func (s *Service) GetObject(ctx context.Context, bucket, key string) (*contracts.Object, error) {
 	if _, err := requirePin(ctx, bucket); err != nil {
 		return nil, err
 	}
-	obj, err := s.openObject(ctx, "get", bucket, key)
+	return s.getObject(ctx, "get", bucket, key)
+}
+
+// getObject is GetObject without the pin check, for StatObjectTagging,
+// which may hold the bucket's lock instead. op names the operation in
+// errors.
+func (s *Service) getObject(
+	ctx context.Context,
+	op, bucket, key string,
+) (*contracts.Object, error) {
+	obj, written, err := s.openObject(ctx, op, bucket, key)
 	if err != nil {
 		return nil, err
 	}
-	if obj.Tags, err = s.readObjectTags(bucket, &obj.ObjectInfo); err != nil {
+	if obj.Tags, err = s.readObjectTags(bucket, &obj.ObjectInfo, written); err != nil {
 		return nil, errors.Join(err, obj.Body.Close())
 	}
 	return obj, nil
 }
 
-// openObject opens an object and reads its trailer. A missing object is an
-// error wrapping storage.ErrObjectNotFound. op names the operation in
-// errors.
+// openObject opens an object and reads its trailer, returning it with the
+// tags its trailer holds, the ones it was written with, which leave the
+// info's Tags nil. A missing object is an error wrapping
+// storage.ErrObjectNotFound. op names the operation in errors.
 func (s *Service) openObject(
 	ctx context.Context,
 	op, bucket, key string,
-) (*contracts.Object, error) {
+) (*contracts.Object, []contracts.Tag, error) {
 	if _, err := s.HeadBucket(ctx, bucket); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	base, err := objectInput(bucket, key)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %s %q: %w", s.Name(), op, key, err)
+		return nil, nil, fmt.Errorf("%s: %s %q: %w", s.Name(), op, key, err)
 	}
 
 	obj, err := s.dir.GetObject(ctx, &storage.GetObjectInput{
 		HeadObjectInput: storage.HeadObjectInput{BaseObjectInput: base},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("%s: %s %q: %w", s.Name(), op, key, err)
+		return nil, nil, fmt.Errorf("%s: %s %q: %w", s.Name(), op, key, err)
 	}
 
 	// The dir backend's body is an io.ReadSeeker, which the trailer is
@@ -132,22 +144,23 @@ func (s *Service) openObject(
 	if !ok {
 		err = fmt.Errorf("%s: %s %q: backend body %T is not seekable",
 			s.Name(), op, key, obj.Body)
-		return nil, errors.Join(err, obj.Body.Close())
+		return nil, nil, errors.Join(err, obj.Body.Close())
 	}
 
 	tr, size, err := readTrailer(rs, obj.Size)
 	if err != nil {
 		err = fmt.Errorf("%s: %s %q: %w", s.Name(), op, key, err)
-		return nil, errors.Join(err, obj.Body.Close())
+		return nil, nil, errors.Join(err, obj.Body.Close())
 	}
 
 	info, err := objectInfo(key, tr, size)
 	if err != nil {
 		err = fmt.Errorf("%s: %s %q: %w", s.Name(), op, key, err)
-		return nil, errors.Join(err, obj.Body.Close())
+		return nil, nil, errors.Join(err, obj.Body.Close())
 	}
 
-	return &contracts.Object{ObjectInfo: *info, Body: &objectBody{rs: rs, size: size}}, nil
+	return &contracts.Object{ObjectInfo: *info, Body: &objectBody{rs: rs, size: size}},
+		tr.Tags, nil
 }
 
 // DeleteObject removes an object. Deleting a key that holds no object
@@ -189,8 +202,10 @@ func (s *Service) DeleteObject(ctx context.Context, bucket, key string) error {
 // PutObject stores body with the content type, user metadata and system
 // headers in in, and in's ACL and tags, if any, as its ACL and tags,
 // replacing or removing the ones it had, and returns the stored object's
-// info. The write only happens
-// if cond holds. ctx must be pinned to bucket.
+// info. The tags are written in the object's trailer, so the object is
+// never visible without them; the tag file stored for the object it
+// replaces is removed after (see dropTagFile). The write only happens if
+// cond holds. ctx must be pinned to bucket.
 func (s *Service) PutObject(
 	ctx context.Context,
 	bucket, key string,
@@ -213,28 +228,29 @@ func (s *Service) PutObject(
 	}
 
 	er := newETagReader(body, joinMetadata(in.Metadata, in.Headers))
-	info, err := s.putObject(ctx, bucket, key, er, in.ContentType, er.meta)
+	info, err := s.putObject(ctx, bucket, key, er, &trailer{
+		Meta: er.meta, ContentType: in.ContentType, Tags: in.Tags,
+	})
 	if err != nil {
 		return nil, err
 	}
 	if err = s.setObjectACL(bucket, info, in.ACL); err != nil {
 		return nil, err
 	}
-	if err = s.setObjectTags(bucket, info, in.Tags); err != nil {
+	if err = s.dropTagFile(bucket, key); err != nil {
 		return nil, err
 	}
 	return info, nil
 }
 
-// putObject indexes key and writes the object, with meta as the metadata
-// of its trailer. An empty contentType is detected from the body. The
-// caller holds the key's lock.
+// putObject indexes key and writes the object, with tr as its trailer,
+// whose metadata, content type and tags the caller sets. An empty content
+// type is detected from the body. The caller holds the key's lock.
 func (s *Service) putObject(
 	ctx context.Context,
 	bucket, key string,
 	body io.Reader,
-	contentType string,
-	meta map[string]string,
+	tr *trailer,
 ) (*contracts.ObjectInfo, error) {
 	base, err := objectInput(bucket, key)
 	if err != nil {
@@ -246,7 +262,7 @@ func (s *Service) putObject(
 
 	if _, err = s.dir.PutObject(ctx, &storage.PutObjectInput{
 		BaseObjectInput: base,
-		Body:            withTrailer(body, &trailer{Meta: meta, ContentType: contentType}),
+		Body:            withTrailer(body, tr),
 	}); err != nil {
 		err = fmt.Errorf("%s: put %q: %w", s.Name(), key, err)
 		return nil, errors.Join(err, s.unindexMissing(ctx, base, bucket, key))
@@ -279,8 +295,8 @@ func (s *Service) checkKey(key string) error {
 	return nil
 }
 
-// CopyObject copies an object within or across buckets, if
-// in.SourceCondition holds of the source as it is read. Copying an object
+// CopyObject copies an object within or across buckets, if in.SourceCheck
+// passes and in.SourceCondition holds of the source as it is read. Copying an object
 // onto itself is safe: the backend writes the copy to a new data file, while
 // the source stays open for reading. ctx must be pinned to both buckets.
 func (s *Service) CopyObject(
@@ -296,7 +312,7 @@ func (s *Service) CopyObject(
 			err = errors.Join(err, fmt.Errorf("%s: copy %q: %w", s.Name(), in.SrcKey, cErr))
 		}
 	}()
-	if err = checkSourceCondition(in.SourceCondition, &src.ObjectInfo); err != nil {
+	if err = checkSource(in.SourceCheck, in.SourceCondition, &src.ObjectInfo); err != nil {
 		return nil, err
 	}
 
@@ -329,6 +345,22 @@ func (s *Service) CopyObject(
 	}
 
 	return s.PutObject(ctx, in.DstBucket, in.DstKey, src.Body, put, in.Precondition)
+}
+
+// checkSource checks info, the source of a copy as it was opened, with its
+// tags: the error check returns for it, when check is set, and then
+// checkSourceCondition's for cond.
+func checkSource(
+	check contracts.ObjectCheck,
+	cond contracts.SourceCondition,
+	info *contracts.ObjectInfo,
+) error {
+	if check != nil {
+		if err := check(info); err != nil {
+			return err
+		}
+	}
+	return checkSourceCondition(cond, info)
 }
 
 // checkSourceCondition returns contracts.ErrPreconditionFailed unless cond

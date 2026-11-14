@@ -119,7 +119,8 @@ func (m *Module) uploadPart(ctx gas.Context, t s3api.Target) error {
 // uploadPartCopy serves UploadPartCopy: UploadPart with x-amz-copy-source,
 // which copies the source, or its x-amz-copy-source-range, into the part,
 // streamed from the source as it was opened, if the
-// x-amz-copy-source-if-* conditions hold of it. It answers a
+// x-amz-copy-source-if-* conditions hold of it and it is the source the
+// request was evaluated for (authz.CheckObject). It answers a
 // CopyPartResult and, as UploadPart does, the encryption headers of the
 // upload's object.
 func (m *Module) uploadPartCopy(ctx gas.Context, t s3api.Target) error {
@@ -140,6 +141,7 @@ func (m *Module) uploadPartCopy(ctx gas.Context, t s3api.Target) error {
 	in := contracts.UploadPartCopyInput{
 		Bucket: t.Bucket, Key: t.Key, UploadID: q.Get("uploadId"),
 		SrcBucket: srcBucket, SrcKey: srcKey, SourceCondition: sourceCondition(r),
+		SourceCheck: g.ObjectCheck(src),
 	}
 	if in.UploadID == "" {
 		return s3api.WriteError(ctx, t,

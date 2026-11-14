@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"tule.dev/object-store/internal/contracts"
 	"tule.dev/object-store/internal/s3api"
 )
 
@@ -225,6 +226,38 @@ func TestEveryHeaderCheckMatchesTheReference(t *testing.T) {
 	grant := &http.Request{Header: http.Header{"X-Amz-Grant-Read": {`id="x"`}}}
 	if checks := headerChecks(PutObject, grant); len(checks) != 1 {
 		t.Errorf("PutObject with a grant header adds %v", checks)
+	}
+}
+
+// Every check a copy of a tagged source adds is an action the reference
+// authorizes CopyObject with, or s3:GetObjectTagging, which it does not
+// (see copyTagChecks), on a resource type it lists, and only under COPY.
+func TestEveryCopyTagCheckMatchesTheReference(t *testing.T) {
+	ref := loadReference(t)
+	tags := []contracts.Tag{{Key: "k", Value: "v"}}
+	r := &http.Request{Header: http.Header{}}
+	checks := copyTagChecks(CopyObject, r, tags)
+	if len(checks) != 2 || !checks[0].onSource || checks[0].onWrite ||
+		!checks[1].onWrite || checks[1].onSource {
+		t.Fatalf("copy tag checks %+v", checks)
+	}
+	authorized := append(slices.Clone(ref.Operations[string(CopyObject)]), "GetObjectTagging")
+	for _, c := range checks {
+		checkMatchesReference(t, ref, CopyObject, c, authorized)
+	}
+	if !slices.Contains(ref.Operations[string(CopyObject)], "PutObjectTagging") {
+		t.Error("the reference does not authorize CopyObject with s3:PutObjectTagging")
+	}
+	for name, got := range map[string][]check{
+		"no tags":   copyTagChecks(CopyObject, r, nil),
+		"PutObject": copyTagChecks(PutObject, r, tags),
+		"REPLACE": copyTagChecks(CopyObject, &http.Request{Header: http.Header{
+			"X-Amz-Tagging-Directive": {"REPLACE"},
+		}}, tags),
+	} {
+		if len(got) != 0 {
+			t.Errorf("%s adds %v", name, got)
+		}
 	}
 }
 
