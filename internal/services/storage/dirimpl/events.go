@@ -317,6 +317,33 @@ func (s *Service) committed(p *pendingEvent, fill func(ev *contracts.BucketEvent
 	return p.confirm(fill)
 }
 
+// committedAll is committed for ps, the events of one change, nil ones
+// included: once the stageCommitted hook passes, each is confirmed in
+// order. The error is only the hooks'.
+func (s *Service) committedAll(ps []*pendingEvent) error {
+	if err := s.at(stageCommitted); err != nil {
+		return err
+	}
+	for _, p := range ps {
+		if err := p.confirm(nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// settleAll settles ps, the events of one change whose commit step
+// failed, in order (see settle). The error is only the
+// stageEventConfirmed hook's, which stops it.
+func settleAll(ctx context.Context, ps []*pendingEvent) error {
+	for _, p := range ps {
+		if err := p.settle(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // abort removes p's intent, for a change that was not committed. A
 // failure is logged, and the intent is renamed "<id>.aborted", which
 // RecoverEvents removes; should that fail too, it is left for

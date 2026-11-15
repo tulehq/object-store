@@ -964,8 +964,8 @@ func (s *Service) deleteVersion(
 }
 
 // dropVersions removes the manifest of key, whose last version, e, was
-// deleted: it commits an empty manifest, confirms p, the event of the
-// delete, nil for none, then removes the object at keyHash, e's data and
+// deleted: it commits an empty manifest, confirms ps, the events of the
+// delete in order, nil ones for none, then removes the object at keyHash, e's data and
 // side files, the manifest, and the key's index entry, in this order, so
 // a crash leaves the empty manifest, under which the object at keyHash, if
 // left, does not come back. Once the empty manifest is committed, the
@@ -975,15 +975,15 @@ func (s *Service) dropVersions(
 	ctx context.Context,
 	bucket, key string,
 	e *versionEntry,
-	p *pendingEvent,
+	ps ...*pendingEvent,
 ) error {
 	if err := s.writeVersions(
 		bucket,
 		&versionManifest{Key: key, Versions: []versionEntry{}},
 	); err != nil {
-		return errors.Join(err, p.settle(ctx))
+		return errors.Join(err, settleAll(ctx, ps))
 	}
-	if err := s.committed(p, nil); err != nil {
+	if err := s.committedAll(ps); err != nil {
 		return err
 	}
 	s.warnAfterCommit("remove a key's last version", bucket, key, s.removeKey(ctx, bucket, key, e))

@@ -41,6 +41,13 @@ type EventSource struct {
 	HostID      string
 }
 
+// LifecyclePrincipal is the principalId and the sourceIPAddress of the
+// events lifecycle rules cause: S3 acts as itself, and no request from an
+// address causes them. A lifecycle event's request and host IDs are fresh
+// for each event, in the formats of a response's x-amz-request-id and
+// x-amz-id-2, and no response carries them.
+const LifecyclePrincipal = "s3.amazonaws.com"
+
 // eventSourceKey is the context key of an EventSource.
 type eventSourceKey struct{}
 

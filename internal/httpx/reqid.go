@@ -4,13 +4,11 @@ package httpx
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/base64"
-	"encoding/hex"
 	"net/http"
-	"strings"
 
 	"github.com/go-chi/chi/v5/middleware"
+
+	"tule.dev/object-store/internal/contracts"
 )
 
 // The response headers that carry a request's ID pair, as S3 names them.
@@ -19,9 +17,9 @@ const (
 	HostIDHeader    = "x-amz-id-2"
 )
 
-// hostIDBytes is how many random bytes a host ID encodes: 48, which base64
-// writes as 64 characters, the length of the x-amz-id-2 values S3 answers.
-const hostIDBytes = 48
+// hostIDBytes is how many random bytes a host ID encodes (see
+// contracts.HostIDBytes).
+const hostIDBytes = contracts.HostIDBytes
 
 type hostIDKey struct{}
 
@@ -39,7 +37,7 @@ type hostIDKey struct{}
 // a request ID from the client. Both values are opaque to clients.
 func RequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		id, hostID := newRequestID(), newHostID()
+		id, hostID := contracts.NewRequestID(), contracts.NewHostID()
 		w.Header().Set(RequestIDHeader, id)
 		w.Header().Set(HostIDHeader, hostID)
 		ctx := context.WithValue(r.Context(), middleware.RequestIDKey, id)
@@ -53,16 +51,4 @@ func RequestID(next http.Handler) http.Handler {
 func HostID(ctx context.Context) string {
 	id, _ := ctx.Value(hostIDKey{}).(string)
 	return id
-}
-
-func newRequestID() string {
-	var b [8]byte
-	_, _ = rand.Read(b[:]) // never fails: crypto/rand.Read crashes the program instead
-	return strings.ToUpper(hex.EncodeToString(b[:]))
-}
-
-func newHostID() string {
-	b := make([]byte, hostIDBytes)
-	_, _ = rand.Read(b) // never fails, as above
-	return base64.StdEncoding.EncodeToString(b)
 }
