@@ -229,3 +229,53 @@ func TestConcurrentCompletionsOfOneUpload(t *testing.T) {
 		t.Fatalf("versions %v", f.ids("k"))
 	}
 }
+
+// The data of a displaced legacy null version is the object at keyHash,
+// so it is removed under the key's lock: removed after, it could remove
+// an object a later write put there in place. A suspended overwrite (A)
+// displaces the legacy null; while it is about to remove it, a delete of
+// the new null (B) empties the key and a suspended write (C) writes in
+// place. C's object must survive A.
+func TestADisplacedLegacyNullIsCollectedUnderTheLock(t *testing.T) {
+	f := newFixture(t)
+	f.put("k", "legacy")
+	f.state(contracts.VersioningEnabled)
+	v1 := f.put("k", "v1")
+	f.del(vref("k", v1.VersionID))
+	f.state(contracts.VersioningSuspended)
+	f.requireIDs(contracts.VersionNull) // the legacy null, listed
+
+	later := make(chan error, 1)
+	f.s.hook = func(stage string) error {
+		if stage != stageCollecting {
+			return nil
+		}
+		f.s.hook = nil
+		go func() { // B, then C
+			if _, err := f.s.DeleteObject(f.ctx, vref("k", contracts.VersionNull)); err != nil {
+				later <- err
+				return
+			}
+			later <- errOf(f.s.PutObject(f.ctx, "bucket", "k", strings.NewReader("C"),
+				contracts.PutObjectInput{}, contracts.Precondition{}))
+		}()
+		// B and C get the key's lock only after A releases it; give them
+		// the time to run first if they could.
+		select {
+		case err := <-later:
+			later <- err
+		case <-time.After(200 * time.Millisecond):
+		}
+		return nil
+	}
+	if _, err := f.s.PutObject(f.ctx, "bucket", "k", strings.NewReader("A"),
+		contracts.PutObjectInput{}, contracts.Precondition{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-later; err != nil {
+		t.Fatal(err)
+	}
+	if got := f.body(oref("bucket", "k")); got != "C" {
+		t.Fatalf("k: %q, want C's write", got)
+	}
+}

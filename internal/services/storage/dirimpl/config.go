@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -83,8 +84,9 @@ func (s *Service) DeleteBucketConfig(
 	return nil
 }
 
-// resetConfigs removes the policy, configuration, object ACLs and object
-// tags bucket has, which an interrupted DeleteBucket can leave, and stores
+// resetConfigs removes the policy, configuration, object ACLs, object
+// tags, version manifests and versioning state bucket has, which an
+// interrupted DeleteBucket can leave (see removeConfigs), and stores
 // configs as its configuration, for CreateBucket, which holds the bucket's
 // write lock.
 func (s *Service) resetConfigs(bucket string, configs map[contracts.BucketConfig][]byte) error {
@@ -104,7 +106,8 @@ func (s *Service) resetConfigs(bucket string, configs map[contracts.BucketConfig
 }
 
 // removeConfigs removes every configuration, object ACL, object tag set
-// and version manifest of bucket, and its versioning state. The caller holds the bucket's write lock.
+// and version manifest of bucket, and its versioning state. The caller
+// holds the bucket's write lock.
 func (s *Service) removeConfigs(bucket string) error {
 	for _, kind := range contracts.BucketConfigs {
 		if err := s.removeIfExists(configFile(kind, bucket)); err != nil {
@@ -144,6 +147,64 @@ func (s *Service) writeFile(name string, doc []byte) error {
 		return errors.Join(err, s.removeIfExists(tmp))
 	}
 	return nil
+}
+
+// writeDurable writes doc to name as writeFile does, but syncs the temp
+// file before the rename and the directory after it, and the parent of a
+// directory it creates, so a commit that returned survives a power loss,
+// and is not lost while a backend delete made after it, which the backend
+// syncs, is kept. It is for the commits of version manifests and of the
+// versioning state.
+func (s *Service) writeDurable(name string, doc []byte) error {
+	dir := filepath.Dir(name)
+	if err := s.makeDurableDir(dir); err != nil {
+		return err
+	}
+	tmp := name + ".tmp-" + rand.Text()
+	if err := s.writeSynced(tmp, doc); err != nil {
+		return errors.Join(err, s.removeIfExists(tmp))
+	}
+	if err := s.root.Rename(tmp, name); err != nil {
+		return errors.Join(err, s.removeIfExists(tmp))
+	}
+	return s.syncDir(dir)
+}
+
+// makeDurableDir creates dir, when it does not exist, and syncs its
+// parent, so the new entry survives a power loss.
+func (s *Service) makeDurableDir(dir string) error {
+	_, err := s.root.Stat(dir)
+	if !errors.Is(err, fs.ErrNotExist) {
+		return err //nolint:wrapcheck // wrapped by the caller with what is written
+	}
+	if err = s.root.MkdirAll(dir, 0o750); err != nil {
+		return err //nolint:wrapcheck // wrapped by the caller with what is written
+	}
+	return s.syncDir(filepath.Dir(dir))
+}
+
+// writeSynced writes doc to name, a new file, and syncs it.
+func (s *Service) writeSynced(name string, doc []byte) (err error) {
+	f, err := s.root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err //nolint:wrapcheck // wrapped by the caller with what is written
+	}
+	defer func() { err = errors.Join(err, f.Close()) }()
+	if _, err = f.Write(doc); err != nil {
+		return err //nolint:wrapcheck // wrapped by the caller with what is written
+	}
+	return f.Sync() //nolint:wrapcheck // wrapped by the caller with what is written
+}
+
+// syncDir syncs directory dir, so the entries renamed or created in it
+// are durable.
+func (s *Service) syncDir(dir string) (err error) {
+	d, err := s.root.Open(dir)
+	if err != nil {
+		return err //nolint:wrapcheck // wrapped by the caller with what is written
+	}
+	defer func() { err = errors.Join(err, d.Close()) }()
+	return d.Sync() //nolint:wrapcheck // wrapped by the caller with what is written
 }
 
 // objectACL is what is stored for an object's ACL: the document, and the

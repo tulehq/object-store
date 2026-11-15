@@ -51,7 +51,10 @@ func (s *Service) GetBucketVersioning(
 
 // PutBucketVersioning stores cfg as bucket's versioning configuration,
 // replacing the one it had: contracts.ErrUnversionedState for a Status of
-// Unversioned, which a bucket never returns to. It is written to a temp
+// Unversioned, which a bucket never returns to, an error wrapping
+// contracts.ErrInvalidVersioningStatus for a Status that is none, and one
+// wrapping contracts.ErrMFADeleteUnsupported for an MFADelete other than
+// "" and "Disabled". It is written to a temp
 // file and renamed into place, so the last writer wins; it takes no key
 // lock, since every write reads the state under its key's lock. ctx must
 // be pinned to bucket.
@@ -63,25 +66,24 @@ func (s *Service) PutBucketVersioning(
 	if _, err := requirePin(ctx, bucket); err != nil {
 		return err
 	}
-	switch cfg.Status {
-	case contracts.VersioningEnabled, contracts.VersioningSuspended:
-	case contracts.Unversioned:
-		return contracts.ErrUnversionedState
-	default:
-		return fmt.Errorf("%s: invalid versioning status %q", s.Name(), cfg.Status)
-	}
-	if cfg.MFADelete != "" && cfg.MFADelete != mfaDeleteDisabled {
-		return fmt.Errorf("%s: unsupported MFA delete %q", s.Name(), cfg.MFADelete)
+	if err := s.checkVersioning(cfg); err != nil {
+		return err
 	}
 	if _, err := s.HeadBucket(ctx, bucket); err != nil {
 		return err
+	}
+	// The directory of the bucket's manifests is made with its state, so
+	// the first manifests do not race to create it (see writeDurable).
+	if err := s.makeDurableDir(filepath.Join(versionsDir, bucket)); err != nil {
+		return fmt.Errorf("%s: failed to create the versions of bucket %s: %w",
+			s.Name(), bucket, err)
 	}
 	raw, err := json.Marshal(versioningState{Status: cfg.Status, MFADelete: cfg.MFADelete})
 	if err != nil {
 		return fmt.Errorf("%s: failed to encode the versioning of bucket %s: %w",
 			s.Name(), bucket, err)
 	}
-	if err = s.writeFile(versioningFile(bucket), raw); err != nil {
+	if err = s.writeDurable(versioningFile(bucket), raw); err != nil {
 		return fmt.Errorf("%s: failed to store the versioning of bucket %s: %w",
 			s.Name(), bucket, err)
 	}
@@ -105,4 +107,21 @@ func (s *Service) versioning(bucket string) (versioningState, error) {
 			"%s: failed to decode the versioning of bucket %s: %w", s.Name(), bucket, err)
 	}
 	return st, nil
+}
+
+// checkVersioning returns PutBucketVersioning's error for cfg, a
+// configuration it does not store, and nil for one it does.
+func (s *Service) checkVersioning(cfg contracts.VersioningConfig) error {
+	switch cfg.Status {
+	case contracts.VersioningEnabled, contracts.VersioningSuspended:
+	case contracts.Unversioned:
+		return contracts.ErrUnversionedState
+	default:
+		return fmt.Errorf("%s: %q: %w", s.Name(), cfg.Status, contracts.ErrInvalidVersioningStatus)
+	}
+	if cfg.MFADelete != "" && cfg.MFADelete != mfaDeleteDisabled {
+		return fmt.Errorf("%s: MFA delete %q: %w", s.Name(), cfg.MFADelete,
+			contracts.ErrMFADeleteUnsupported)
+	}
+	return nil
 }

@@ -87,6 +87,9 @@ const (
 	// stageResolved: a read has read the manifest and is about to open
 	// the data it lists.
 	stageResolved = "resolved"
+	// stageCollecting: a change is about to remove the data of a version
+	// its committed manifest no longer lists.
+	stageCollecting = "collecting"
 )
 
 // at calls s.hook, when set, at stage.
@@ -158,7 +161,7 @@ func (s *Service) writeVersions(bucket string, m *versionManifest) error {
 	if err != nil {
 		return fmt.Errorf("%s: failed to encode the versions of %q: %w", s.Name(), m.Key, err)
 	}
-	if err = s.writeFile(versionsFile(bucket, m.Key), raw); err != nil {
+	if err = s.writeDurable(versionsFile(bucket, m.Key), raw); err != nil {
 		return fmt.Errorf("%s: failed to store the versions of %q: %w", s.Name(), m.Key, err)
 	}
 	return nil
@@ -586,8 +589,10 @@ func (s *Service) writeData(
 
 // commitVersion commits e, a version of key whose data is written, under
 // the key's lock, if w.cond holds of the current version and w.check
-// passes, and reports whether it did, also when an error follows the
-// commit.
+// passes, and reports whether it did. Once it did, the write has
+// happened: a failure to remove what the version displaced, or of w.done,
+// is logged, not returned (see warnAfterCommit), so a retry does not add
+// the version twice.
 func (s *Service) commitVersion(
 	ctx context.Context,
 	bucket, key string,
@@ -601,6 +606,7 @@ func (s *Service) commitVersion(
 	if err != nil {
 		return false, err
 	}
+	fresh := !existed && len(m.Versions) == 0
 	cur := m.live()
 	if err = preconditionHolds(w.cond, cur != nil, etagOf(cur)); err != nil {
 		return false, err
@@ -614,31 +620,48 @@ func (s *Service) commitVersion(
 	if err != nil {
 		return false, err
 	}
-	if err = s.commit(bucket, m, existed); err != nil {
+	if err = s.commit(bucket, m, fresh); err != nil {
 		return false, err
 	}
 	if err = s.at(stageCommitted); err != nil {
 		return true, err
 	}
-	if err = s.collect(ctx, bucket, key, displaced); err != nil {
-		return true, err
-	}
+	s.warnAfterCommit("collect the version a write displaced", bucket, key,
+		s.collect(ctx, bucket, key, displaced))
 	if w.done != nil {
-		return true, w.done()
+		s.warnAfterCommit("finish a write", bucket, key, w.done())
 	}
 	return true, nil
 }
 
+// warnAfterCommit logs err, a failure of step, done after the manifest of
+// key in bucket was committed: the change has happened, and what the step
+// left behind is garbage no manifest lists, which DeleteBucket removes
+// (see purgeObjects). A nil err logs nothing.
+func (s *Service) warnAfterCommit(step, bucket, key string, err error) {
+	if err == nil {
+		return
+	}
+	s.logger.Warn("failed to "+step+" after its commit").
+		Str("bucket", bucket).Str("key", key).Err("error", err).Send()
+}
+
 // place gives e, a new version or marker, its ID and sequence in bucket's
 // state, and makes it the current version of m: in a Suspended bucket, it
-// is the null version, and the one m had is returned, removed. The caller
+// is the null version, and the one m had is returned, removed. Its
+// sequence is above every one m holds, even after a restart on a clock
+// that went back, so m stays in sequence order (see resumeAt). The caller
 // holds the key's lock.
 func (s *Service) place(bucket string, m *versionManifest, e *versionEntry) (*versionEntry, error) {
 	st, err := s.versioning(bucket)
 	if err != nil {
 		return nil, err
 	}
-	e.Seq = s.nextSeq()
+	var floor int64
+	for _, v := range m.Versions {
+		floor = max(floor, v.Seq)
+	}
+	e.Seq = s.nextSeq(floor)
 	var displaced *versionEntry
 	switch st.Status {
 	case contracts.VersioningEnabled:
@@ -654,15 +677,16 @@ func (s *Service) place(bucket string, m *versionManifest, e *versionEntry) (*ve
 }
 
 // commit indexes m's key and commits m, after which the caller calls
-// s.at(stageCommitted). When a key that had neither a
-// manifest nor an object fails to commit, its index entry is dropped. The
-// caller holds the key's lock.
-func (s *Service) commit(bucket string, m *versionManifest, existed bool) error {
+// s.at(stageCommitted). When it fails for a fresh key, one that had
+// neither a manifest nor an object before the change, the key's index
+// entry is dropped; any other key keeps it, since it still holds what it
+// held. The caller holds the key's lock.
+func (s *Service) commit(bucket string, m *versionManifest, fresh bool) error {
 	if err := s.addToIndex(bucket, m.Key); err != nil {
 		return err
 	}
 	err := s.writeVersions(bucket, m)
-	if err != nil && !existed && len(m.Versions) == 1 {
+	if err != nil && fresh {
 		err = errors.Join(err, s.removeFromIndex(bucket, m.Key))
 	}
 	return err
@@ -676,6 +700,9 @@ func (s *Service) commit(bucket string, m *versionManifest, existed bool) error 
 func (s *Service) collect(ctx context.Context, bucket, key string, e *versionEntry) error {
 	if e == nil || e.Marker {
 		return nil
+	}
+	if err := s.at(stageCollecting); err != nil {
+		return err
 	}
 	return s.removeVersion(ctx, bucket, key, e)
 }
@@ -712,20 +739,20 @@ func (s *Service) deleteCurrent(
 	if err != nil {
 		return nil, err
 	}
+	fresh := !existed && len(m.Versions) == 0
 	marker := versionEntry{Marker: true, LastModified: time.Now()}
 	displaced, err := s.place(bucket, m, &marker)
 	if err != nil {
 		return nil, err
 	}
-	if err = s.commit(bucket, m, existed); err != nil {
+	if err = s.commit(bucket, m, fresh); err != nil {
 		return nil, err
 	}
 	if err = s.at(stageCommitted); err != nil {
 		return nil, err
 	}
-	if err = s.collect(ctx, bucket, key, displaced); err != nil {
-		return nil, err
-	}
+	s.warnAfterCommit("collect the version a delete displaced", bucket, key,
+		s.collect(ctx, bucket, key, displaced))
 	return &contracts.DeleteObjectOutput{VersionID: marker.ID, DeleteMarker: true}, nil
 }
 
@@ -746,22 +773,28 @@ func (s *Service) deleteVersion(
 	e := m.remove(i)
 	out := &contracts.DeleteObjectOutput{VersionID: e.ID, DeleteMarker: e.Marker}
 	if len(m.Versions) == 0 {
-		return out, s.dropVersions(ctx, bucket, m.Key, e)
+		if err := s.dropVersions(ctx, bucket, m.Key, e); err != nil {
+			return nil, err
+		}
+		return out, nil
 	}
-	if err := s.commit(bucket, m, true); err != nil {
+	if err := s.commit(bucket, m, false); err != nil {
 		return nil, err
 	}
 	if err := s.at(stageCommitted); err != nil {
 		return nil, err
 	}
-	return out, s.collect(ctx, bucket, m.Key, e)
+	s.warnAfterCommit("collect a deleted version", bucket, m.Key, s.collect(ctx, bucket, m.Key, e))
+	return out, nil
 }
 
 // dropVersions removes the manifest of key, whose last version, e, was
 // deleted: it commits an empty manifest, then removes the object at
 // keyHash, e's data and side files, the manifest, and the key's index
 // entry, in this order, so a crash leaves the empty manifest, under which
-// the object at keyHash, if left, does not come back. The caller holds the
+// the object at keyHash, if left, does not come back. Once the empty
+// manifest is committed, the delete has happened, and a failure of the
+// removals after it is logged (see warnAfterCommit). The caller holds the
 // key's lock.
 func (s *Service) dropVersions(ctx context.Context, bucket, key string, e *versionEntry) error {
 	if err := s.writeVersions(
@@ -773,6 +806,14 @@ func (s *Service) dropVersions(ctx context.Context, bucket, key string, e *versi
 	if err := s.at(stageCommitted); err != nil {
 		return err
 	}
+	s.warnAfterCommit("remove a key's last version", bucket, key, s.removeKey(ctx, bucket, key, e))
+	return nil
+}
+
+// removeKey removes the object at keyHash of key, the data and side files
+// of e, its last version, its empty manifest and its index entry, in this
+// order, stopping at the first that fails. The caller holds the key's lock.
+func (s *Service) removeKey(ctx context.Context, bucket, key string, e *versionEntry) error {
 	if err := s.removeVersion(ctx, bucket, key, &versionEntry{
 		ID: contracts.VersionNull, Legacy: true,
 	}); err != nil {

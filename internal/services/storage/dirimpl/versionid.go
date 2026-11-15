@@ -23,13 +23,13 @@ const versionIDHalf = 13
 // base32hex is the alphabet version IDs are written in.
 const base32hex = "0123456789ABCDEFGHIJKLMNOPQRSTUV"
 
-// nextSeq returns a commit sequence greater than every one it returned
-// before: the time in nanoseconds, or one more than the last when the
-// clock has not moved past it.
-func (s *Service) nextSeq() int64 {
+// nextSeq returns a commit sequence greater than after and than every one
+// it returned before: the time in nanoseconds, or one more than the
+// greater of those when the clock has not moved past it.
+func (s *Service) nextSeq(after int64) int64 {
 	for {
 		last := s.seq.Load()
-		next := max(time.Now().UnixNano(), last+1)
+		next := max(time.Now().UnixNano(), last+1, after+1)
 		if s.seq.CompareAndSwap(last, next) {
 			return next
 		}

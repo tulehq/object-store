@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -29,7 +30,7 @@ func TestVersionIDs(t *testing.T) {
 	for g := range goroutines {
 		wg.Go(func() {
 			for range each {
-				seqs[g] = append(seqs[g], s.nextSeq())
+				seqs[g] = append(seqs[g], s.nextSeq(0))
 			}
 		})
 	}
@@ -197,15 +198,14 @@ func TestVersioningStates(t *testing.T) {
 	}
 	requireVersioning(t, f, cfg)
 
-	for _, bad := range []contracts.VersioningConfig{
-		{}, {Status: "Paused"}, {Status: contracts.VersioningEnabled, MFADelete: "Enabled"},
+	for bad, want := range map[contracts.VersioningConfig]error{
+		{}:                 contracts.ErrUnversionedState,
+		{Status: "Paused"}: contracts.ErrInvalidVersioningStatus,
+		{Status: contracts.VersioningEnabled, MFADelete: "Enabled"}: contracts.
+			ErrMFADeleteUnsupported,
 	} {
-		if err := f.s.PutBucketVersioning(f.ctx, "bucket", bad); err == nil {
-			t.Errorf("%+v was stored", bad)
-		}
+		requireIs(t, fmt.Sprintf("%+v", bad), f.s.PutBucketVersioning(f.ctx, "bucket", bad), want)
 	}
-	requireIs(t, "unversioned", f.s.PutBucketVersioning(f.ctx, "bucket",
-		contracts.VersioningConfig{}), contracts.ErrUnversionedState)
 	requireVersioning(t, f, cfg)
 	if err := f.s.PutBucketVersioning(context.Background(), "bucket", cfg); err == nil {
 		t.Error("PutBucketVersioning without a pin succeeded")
@@ -525,7 +525,7 @@ func requireDeletedInPlace(t *testing.T, f *fixture, out *contracts.DeleteObject
 // keyHash. A version the key does not have is deleted already.
 func TestVersionedDeleteMatrix(t *testing.T) {
 	forEachCase(t, func(t *testing.T, f *fixture, st contracts.Versioning) {
-		missing := newVersionID(f.s.nextSeq())
+		missing := newVersionID(f.s.nextSeq(0))
 		out := f.del(vref("k", missing))
 		if want := missingDeleted(st, missing); *out != want {
 			t.Fatalf("delete of a missing version: %+v, want %+v", out, want)

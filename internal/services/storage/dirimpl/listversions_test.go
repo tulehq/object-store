@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"slices"
 	"testing"
+	"time"
 
 	"tule.dev/object-store/internal/contracts"
 )
@@ -203,7 +204,7 @@ func TestListObjectVersionsBadMarkers(t *testing.T) {
 	_, err := f.s.ListObjectVersions(f.ctx, "bucket", contracts.ListObjectVersionsInput{
 		VersionIDMarker: contracts.VersionNull, MaxKeys: 1,
 	})
-	requireIs(t, "version-id marker alone", err, errVersionMarkerWithoutKey)
+	requireIs(t, "version-id marker alone", err, contracts.ErrVersionMarkerWithoutKey)
 	_, err = f.s.ListObjectVersions(f.ctx, "bucket", contracts.ListObjectVersionsInput{
 		KeyMarker: "k", VersionIDMarker: "nope", MaxKeys: 1,
 	})
@@ -248,5 +249,70 @@ func TestListObjectsHidesDeleteMarkers(t *testing.T) {
 	})
 	if err != nil || !slices.Equal(out.CommonPrefixes, []string{"b/"}) {
 		t.Fatalf("delimited: %+v %v", out, err)
+	}
+}
+
+// A key whose current version is a delete marker takes no room in a page
+// of ListObjects, so a page is not truncated on it.
+func TestListObjectsPagesCountOnlyListedKeys(t *testing.T) {
+	f := newFixture(t)
+	f.state(contracts.VersioningEnabled)
+	f.put("a", "x")
+	f.del(oref("bucket", "b"))
+	f.requirePage("", "a", false)
+	f.put("c", "x")
+	f.requirePage("", "a", true)
+	f.requirePage("a", "c", false)
+}
+
+// requirePage fails unless the page of one key after startAfter lists key
+// alone, truncated or not.
+func (f *fixture) requirePage(startAfter, key string, truncated bool) {
+	f.t.Helper()
+	out, err := f.s.ListObjects(f.ctx, "bucket", contracts.ListObjectsInput{
+		MaxKeys: 1, StartAfter: startAfter,
+	})
+	if err != nil || len(out.Objects) != 1 || out.Objects[0].Key != key ||
+		out.IsTruncated != truncated {
+		f.t.Fatalf("page after %q: %+v %v, want %s, truncated %v",
+			startAfter, out, err, key, truncated)
+	}
+}
+
+// A version listing of no keys at most is an empty page, not truncated.
+func TestListObjectVersionsMaxKeysZero(t *testing.T) {
+	f, _ := listingFixture(t)
+	for _, n := range []int{0, -1} {
+		out := f.list(contracts.ListObjectVersionsInput{MaxKeys: n})
+		if out.IsTruncated || len(out.Versions) != 0 || len(out.CommonPrefixes) != 0 {
+			t.Fatalf("MaxKeys %d: %+v", n, out)
+		}
+	}
+}
+
+// A version committed on a clock behind the key's newest version, as after
+// a restart on a clock that went back, still sorts above it.
+func TestASequenceStaysAboveTheKeys(t *testing.T) {
+	f := newFixture(t)
+	f.state(contracts.VersioningEnabled)
+	ahead := time.Now().Add(time.Hour).UnixNano()
+	if err := f.s.writeVersions("bucket", &versionManifest{Key: "k", Versions: []versionEntry{
+		{ID: newVersionID(ahead), Marker: true, Seq: ahead},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.s.addToIndex("bucket", "k"); err != nil {
+		t.Fatal(err)
+	}
+	v := f.put("k", "x")
+	vs := f.versions("k")
+	if vs[0].ID != v.VersionID || vs[0].Seq <= ahead || v.VersionID <= vs[1].ID {
+		t.Fatalf("versions %+v", vs)
+	}
+	next := f.list(contracts.ListObjectVersionsInput{
+		KeyMarker: "k", VersionIDMarker: v.VersionID, MaxKeys: 10,
+	})
+	if len(next.Versions) != 1 || next.Versions[0].VersionID != vs[1].ID {
+		t.Fatalf("after %s: %+v", v.VersionID, next.Versions)
 	}
 }

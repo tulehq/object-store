@@ -2,18 +2,12 @@ package dirimpl
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"slices"
 	"strings"
 
 	"tule.dev/object-store/internal/contracts"
 )
-
-// errVersionMarkerWithoutKey is a ListObjectVersions with a
-// VersionIDMarker and no KeyMarker: "A version-id marker cannot be
-// specified without a key marker."
-var errVersionMarkerWithoutKey = errors.New("storage: a version-id marker needs a key marker")
 
 // ListObjectVersions lists one page of the versions and delete markers of
 // bucket's keys: keys in order, each with its versions and markers
@@ -37,6 +31,11 @@ func (s *Service) ListObjectVersions(
 	keys, err := s.bucketKeys(ctx, bucket)
 	if err != nil {
 		return nil, err
+	}
+	if in.MaxKeys <= 0 {
+		// A page that can hold nothing is empty, not truncated, so a
+		// client paging on its markers does not loop.
+		return &contracts.ListObjectVersionsOutput{}, nil
 	}
 	start, _ := slices.BinarySearch(keys, max(in.KeyMarker, in.Prefix))
 
@@ -62,12 +61,14 @@ func (s *Service) ListObjectVersions(
 	return &p.out, nil
 }
 
-// checkVersionListing returns errVersionMarkerWithoutKey for in with a
+// checkVersionListing returns an error wrapping
+// contracts.ErrVersionMarkerWithoutKey for in with a
 // VersionIDMarker and no KeyMarker, and contracts.ErrInvalidVersionID for
 // a VersionIDMarker this package does not issue.
 func checkVersionListing(in contracts.ListObjectVersionsInput) error {
 	if in.VersionIDMarker != "" && in.KeyMarker == "" {
-		return errVersionMarkerWithoutKey
+		return fmt.Errorf("list versions after %s: %w", in.VersionIDMarker,
+			contracts.ErrVersionMarkerWithoutKey)
 	}
 	return checkVersionID(in.VersionIDMarker)
 }

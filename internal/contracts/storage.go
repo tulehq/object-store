@@ -78,6 +78,19 @@ var (
 	// ErrMethodNotAllowed is returned, as a DeleteMarkerError, for an
 	// operation on a version that is a delete marker.
 	ErrMethodNotAllowed = errors.New("storage: the version is a delete marker")
+
+	// ErrInvalidVersioningStatus is returned by PutBucketVersioning for a
+	// Status other than Enabled, Suspended and Unversioned.
+	ErrInvalidVersioningStatus = errors.New("storage: invalid versioning status")
+
+	// ErrMFADeleteUnsupported is returned by PutBucketVersioning for an
+	// MFADelete other than "" and "Disabled": MFA delete is not served.
+	ErrMFADeleteUnsupported = errors.New("storage: MFA delete is not supported")
+
+	// ErrVersionMarkerWithoutKey is returned by ListObjectVersions for a
+	// VersionIDMarker without a KeyMarker: "A version-id marker cannot be
+	// specified without a key marker."
+	ErrVersionMarkerWithoutKey = errors.New("storage: a version-id marker needs a key marker")
 )
 
 // VersionNull is the version ID of a key's null version: "Objects that are
