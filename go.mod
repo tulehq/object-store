@@ -18,8 +18,8 @@ require (
 	github.com/gasmod/gas/storage v0.9.0
 	github.com/go-chi/chi/v5 v5.5.1-0.20261018135022-9f8adb1aabaa
 	github.com/rs/zerolog v1.35.1
-	tule.dev/identity v0.5.0
-	tule.dev/policy v0.3.0
+	tule.dev/identity v0.5.1
+	tule.dev/policy v0.4.0
 	tule.dev/sigv4 v0.5.0
 )
 

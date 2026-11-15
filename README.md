@@ -432,7 +432,9 @@ was deleted, which is refused), `aws:userid`, `aws:PrincipalType`,
 `aws:PrincipalAccount`, for IAM users `aws:username`,
 `aws:PrincipalTag/<key>` for each tag of an IAM user or of a session's role
 (identity issues no session tags), and `aws:PrincipalOrgID` and
-`aws:PrincipalOrgPaths` (below). They also fill policy variables such as
+`aws:PrincipalOrgPaths` (below), and `aws:PrincipalIsAWSService` as
+`false`, with `aws:PrincipalServiceName` absent, whatever a request
+carries (tule.dev/policy v0.4.0). They also fill policy variables such as
 `${aws:username}`.
 
 `aws:PrincipalOrgID` (the organization's ID, `o-...`) and
@@ -592,6 +594,13 @@ refused with `400 InvalidArgument`, which bounds the cost of evaluating it.
   exists; S3's order is not documented either.
 
 ### Changes in this version
+
+- **Behavior:** `aws:PrincipalIsAWSService` is `false` for every
+  evaluated principal, where it was absent, and `aws:PrincipalServiceName`
+  is absent whatever the request carries (tule.dev/policy v0.4.0). A `Bool`
+  `Deny` on `aws:PrincipalIsAWSService` being `false` now applies.
+
+### Changes in v0.12.0
 
 - **Behavior:** lifecycle configuration is served:
   PutBucketLifecycleConfiguration, GetBucketLifecycleConfiguration and
