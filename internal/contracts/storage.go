@@ -5,8 +5,11 @@ package contracts
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"time"
+
+	"github.com/gasmod/gas/storage"
 )
 
 var (
@@ -63,7 +66,76 @@ var (
 	// ErrEntityTooLarge is returned by UploadPartCopy for a copy larger
 	// than MaxCopyPartSize.
 	ErrEntityTooLarge = errors.New("storage: part too large")
+
+	// ErrInvalidVersionID is returned for a version ID that is neither
+	// VersionNull nor one this store issues.
+	ErrInvalidVersionID = errors.New("storage: invalid version id")
+
+	// ErrUnversionedState is returned by PutBucketVersioning for a Status
+	// of Unversioned, which a bucket cannot return to.
+	ErrUnversionedState = errors.New("storage: a bucket cannot return to unversioned")
+
+	// ErrMethodNotAllowed is returned, as a DeleteMarkerError, for an
+	// operation on a version that is a delete marker.
+	ErrMethodNotAllowed = errors.New("storage: the version is a delete marker")
 )
+
+// VersionNull is the version ID of a key's null version: "Objects that are
+// stored in your bucket before you set the versioning state have a version
+// ID of null" (S3 User Guide, "Retaining multiple versions of objects").
+const VersionNull = "null"
+
+// Versioning is a bucket's versioning state. The zero value is
+// Unversioned, which a bucket never returns to once it has another.
+type Versioning string
+
+// The versioning states of a bucket.
+const (
+	Unversioned         Versioning = ""
+	VersioningEnabled   Versioning = "Enabled"
+	VersioningSuspended Versioning = "Suspended"
+)
+
+// VersioningConfig is a bucket's versioning subresource. MFADelete is ""
+// (never configured) or "Disabled"; "Enabled" is refused (see
+// PutBucketVersioning).
+type VersioningConfig struct {
+	Status    Versioning
+	MFADelete string
+}
+
+// DeleteMarkerError is a read that found a delete marker: the current
+// version (Current, which Is storage.ErrObjectNotFound) or the version
+// asked for (!Current, which Is ErrMethodNotAllowed).
+type DeleteMarkerError struct {
+	LastModified time.Time
+	VersionID    string
+	Current      bool
+}
+
+func (e *DeleteMarkerError) Error() string {
+	if e.Current {
+		return fmt.Sprintf("storage: the current version is delete marker %s", e.VersionID)
+	}
+	return fmt.Sprintf("storage: version %s is a delete marker", e.VersionID)
+}
+
+// Is reports whether target is storage.ErrObjectNotFound, for a current
+// delete marker, or ErrMethodNotAllowed, for one asked for by version.
+func (e *DeleteMarkerError) Is(target error) bool {
+	if e.Current {
+		return target == storage.ErrObjectNotFound
+	}
+	return target == ErrMethodNotAllowed
+}
+
+// ObjectRef names an object version; a Version of "" is the current
+// version.
+type ObjectRef struct {
+	Bucket  string
+	Key     string
+	Version string
+}
 
 // BucketConfig names a kind of bucket configuration, each kept as one
 // document per bucket, as S3 keeps a bucket's subresources.
@@ -121,9 +193,17 @@ type StorageProvider interface {
 		configs map[BucketConfig][]byte,
 	) (*BucketInfo, error)
 	DeleteBucket(ctx context.Context, ref BucketRef) error
-	StatObject(ctx context.Context, bucket, key string) (*ObjectInfo, error)
-	GetObject(ctx context.Context, bucket, key string) (*Object, error)
-	DeleteObject(ctx context.Context, bucket, key string) error
+	StatObject(ctx context.Context, ref ObjectRef) (*ObjectInfo, error)
+	GetObject(ctx context.Context, ref ObjectRef) (*Object, error)
+	// DeleteObject deletes ref: without a Version, permanently
+	// (Unversioned), by adding a delete marker (Enabled), or by replacing
+	// the null version with a null marker (Suspended); with one, that
+	// version permanently. Deleting a version or key that does not exist
+	// succeeds.
+	DeleteObject(ctx context.Context, ref ObjectRef) (*DeleteObjectOutput, error)
+	// PutObject stores body as the object at key, a new version of it in
+	// a bucket that is not Unversioned, and returns its info with its
+	// VersionID set.
 	PutObject(
 		ctx context.Context,
 		bucket, key string,
@@ -131,7 +211,7 @@ type StorageProvider interface {
 		in PutObjectInput,
 		cond Precondition,
 	) (*ObjectInfo, error)
-	CopyObject(ctx context.Context, in CopyObjectInput) (*ObjectInfo, error)
+	CopyObject(ctx context.Context, in CopyObjectInput) (*CopyObjectOutput, error)
 
 	CreateMultipartUpload(
 		ctx context.Context,
@@ -147,6 +227,9 @@ type StorageProvider interface {
 		partNumber int,
 		body io.Reader,
 	) (etag string, headers map[string]string, err error)
+	// CompleteMultipartUpload writes the object as PutObject does, in the
+	// bucket's versioning state at completion, and returns its info with
+	// its VersionID set.
 	CompleteMultipartUpload(
 		ctx context.Context,
 		bucket, key, uploadID string,
@@ -188,51 +271,74 @@ type StorageProvider interface {
 	// without one is not an error.
 	DeleteBucketConfig(ctx context.Context, bucket string, kind BucketConfig) error
 
-	// GetObjectACL returns the ACL document stored for the object at key
-	// as it now is, if check passes for that object:
+	// GetObjectACL returns the ACL document stored for the version ref
+	// names as it now is, and that version's ID, if check passes for it:
 	// storage.ErrObjectNotFound when there is no object, and
-	// ErrNoSuchBucketConfig when the object has no ACL of its own, which
+	// ErrNoSuchBucketConfig when the version has no ACL of its own, which
 	// includes one written over, or deleted and written again, since its
 	// ACL was stored.
-	GetObjectACL(ctx context.Context, bucket, key string, check ObjectCheck) ([]byte, error)
-	// PutObjectACL stores doc as the ACL of the object at key as it now
-	// is, if check passes for that object: storage.ErrObjectNotFound when
-	// there is none.
-	PutObjectACL(ctx context.Context, bucket, key string, doc []byte, check ObjectCheck) error
+	GetObjectACL(
+		ctx context.Context,
+		ref ObjectRef,
+		check ObjectCheck,
+	) (doc []byte, versionID string, err error)
+	// PutObjectACL stores doc as the ACL of the version ref names as it
+	// now is, if check passes for it, and returns that version's ID:
+	// storage.ErrObjectNotFound when there is none.
+	PutObjectACL(
+		ctx context.Context,
+		ref ObjectRef,
+		doc []byte,
+		check ObjectCheck,
+	) (versionID string, err error)
 
-	// GetObjectTagging returns the tags of the object at key as it now is:
-	// the ones it was written with, or those PutObjectTagging stored for it
-	// since, which an object written over, or deleted and written again,
-	// does not keep: storage.ErrObjectNotFound when there is no object.
-	// ctx need not be pinned; one pinned to bucket reads them under the
-	// pin.
-	GetObjectTagging(ctx context.Context, bucket, key string) ([]Tag, error)
-	// StatObjectTagging returns the info of the object at key as it now
-	// is with its Tags set, as GetObjectTagging returns them, both read
-	// from one open of the object, so the tags are that object's:
+	// GetObjectTagging returns the tags of the version ref names as it
+	// now is: the ones it was written with, or those PutObjectTagging
+	// stored for it since, which an object written over, or deleted and
+	// written again, does not keep: storage.ErrObjectNotFound when there
+	// is no object. ctx need not be pinned; one pinned to the bucket reads
+	// them under the pin.
+	GetObjectTagging(ctx context.Context, ref ObjectRef) ([]Tag, error)
+	// StatObjectTagging returns the info of the version ref names as it
+	// now is with its Tags set, as GetObjectTagging returns them, both
+	// read from one open of the object, so the tags are that object's:
 	// storage.ErrObjectNotFound when there is no object. ctx need not be
-	// pinned; one pinned to bucket reads them under the pin.
-	StatObjectTagging(ctx context.Context, bucket, key string) (*ObjectInfo, error)
-	// PutObjectTagging stores tags as the tags of the object at key as it
-	// now is, replacing any it had, if check passes for that object; no
-	// tags removes them: storage.ErrObjectNotFound when there is no
-	// object.
+	// pinned; one pinned to the bucket reads them under the pin.
+	StatObjectTagging(ctx context.Context, ref ObjectRef) (*ObjectInfo, error)
+	// PutObjectTagging stores tags as the tags of the version ref names as
+	// it now is, replacing any it had, if check passes for it, and returns
+	// that version's ID; no tags removes them: storage.ErrObjectNotFound
+	// when there is no object. It never creates a version.
 	PutObjectTagging(
 		ctx context.Context,
-		bucket, key string,
+		ref ObjectRef,
 		tags []Tag,
 		check ObjectCheck,
-	) error
+	) (versionID string, err error)
 
 	// UploadPartCopy stores as part in.PartNumber of an upload the bytes of
 	// its source object in in.Range, or all of them, if in.Condition holds
 	// of the source, and returns the part as stored and the system headers
 	// the upload's object will be stored with, as UploadPart does. ctx must
 	// be pinned to both buckets.
-	UploadPartCopy(
+	UploadPartCopy(ctx context.Context, in UploadPartCopyInput) (*UploadPartCopyOutput, error)
+
+	// GetBucketVersioning returns bucket's versioning configuration, the
+	// zero value when it was never set: storage.ErrBucketNotFound when
+	// there is no bucket. ctx need not be pinned; one pinned to bucket
+	// reads it under the pin.
+	GetBucketVersioning(ctx context.Context, bucket string) (*VersioningConfig, error)
+	// PutBucketVersioning sets bucket's versioning configuration:
+	// ErrUnversionedState for a Status of Unversioned. ctx must be pinned
+	// to bucket.
+	PutBucketVersioning(ctx context.Context, bucket string, cfg VersioningConfig) error
+	// ListObjectVersions lists one page of the versions and delete markers
+	// of bucket's keys. ctx must be pinned to bucket.
+	ListObjectVersions(
 		ctx context.Context,
-		in UploadPartCopyInput,
-	) (*PartInfo, map[string]string, error)
+		bucket string,
+		in ListObjectVersionsInput,
+	) (*ListObjectVersionsOutput, error)
 }
 
 // BucketRef names a bucket of one generation. A bucket deleted and created
@@ -256,12 +362,15 @@ type BucketInfo struct {
 // assembled by a multipart upload, and is empty for other objects. Tags
 // are the object's tags, as GetObjectTagging returns them; only GetObject
 // and StatObjectTagging read them, and every other operation leaves them
-// nil.
+// nil. VersionID is the ID of the version described: VersionNull or an
+// issued ID, and empty only for an object of an Unversioned bucket, which
+// reports none.
 type ObjectInfo struct {
 	LastModified time.Time
 	Metadata     map[string]string
 	Headers      map[string]string
 	Key          string
+	VersionID    string
 	ContentType  string
 	ETag         string
 	PartSizes    []int64
@@ -327,7 +436,8 @@ type Precondition struct {
 	IfNoneMatch bool
 }
 
-// CopyObjectInput copies SrcBucket/SrcKey to DstBucket/DstKey. A nil Replace
+// CopyObjectInput copies SrcBucket/SrcKey, the version SrcVersion of it or
+// the current one when that is "", to DstBucket/DstKey. A nil Replace
 // keeps the source's content type, metadata and headers; otherwise the copy
 // gets Replace's instead. Headers, when set, are set on the copy over
 // either, such as the encryption headers a copy gets from its own request;
@@ -348,6 +458,7 @@ type CopyObjectInput struct {
 	Tags            []Tag
 	SrcBucket       string
 	SrcKey          string
+	SrcVersion      string
 	DstBucket       string
 	DstKey          string
 	SourceCheck     ObjectCheck
@@ -371,7 +482,8 @@ type SourceCondition struct {
 	IfNoneMatch       string
 }
 
-// UploadPartCopyInput copies SrcBucket/SrcKey, or its Range, into part
+// UploadPartCopyInput copies SrcBucket/SrcKey, the version SrcVersion of
+// it or the current one when that is "", or its Range, into part
 // PartNumber of upload UploadID of Bucket/Key. SourceCheck is as
 // CopyObjectInput's.
 type UploadPartCopyInput struct {
@@ -383,7 +495,72 @@ type UploadPartCopyInput struct {
 	UploadID        string
 	SrcBucket       string
 	SrcKey          string
+	SrcVersion      string
 	PartNumber      int
+}
+
+// UploadPartCopyOutput is the part UploadPartCopy stored, the system
+// headers the upload's object will be stored with, and the version ID of
+// the source copied, "" when its bucket is Unversioned.
+type UploadPartCopyOutput struct {
+	Headers         map[string]string
+	SourceVersionID string
+	Part            PartInfo
+}
+
+// DeleteObjectOutput is what DeleteObject did: VersionID is the delete
+// marker it created or the version it removed, "" in an Unversioned
+// bucket, and DeleteMarker is set when it created a marker or the version
+// it removed was one.
+type DeleteObjectOutput struct {
+	VersionID    string
+	DeleteMarker bool
+}
+
+// CopyObjectOutput is the copy CopyObject wrote, and the version ID of its
+// source, "" when the source's bucket is Unversioned.
+type CopyObjectOutput struct {
+	SourceVersionID string
+	ObjectInfo
+}
+
+// ListObjectVersionsInput selects the versions a ListObjectVersions call
+// returns, following S3's ListObjectVersions: keys in lexicographic
+// order, each with its versions and delete markers newest first, starting
+// after KeyMarker, or after its version VersionIDMarker when that is set,
+// and keys sharing Prefix up to the next Delimiter are rolled up into a
+// single common prefix. MaxKeys counts versions, markers and prefixes.
+type ListObjectVersionsInput struct {
+	Prefix          string
+	Delimiter       string
+	KeyMarker       string
+	VersionIDMarker string
+	MaxKeys         int
+}
+
+// ObjectVersion is one version or delete marker of a key. IsLatest is set
+// for the key's current version.
+type ObjectVersion struct {
+	LastModified time.Time
+	Key          string
+	VersionID    string
+	ETag         string
+	Size         int64
+	IsLatest     bool
+	DeleteMarker bool
+}
+
+// ListObjectVersionsOutput is one page of a version listing, its versions
+// and markers interleaved in S3's order. NextKeyMarker and
+// NextVersionIDMarker are the last entry returned, set only when
+// IsTruncated is; a page ended by a common prefix has that prefix as
+// NextKeyMarker and no NextVersionIDMarker.
+type ListObjectVersionsOutput struct {
+	NextKeyMarker       string
+	NextVersionIDMarker string
+	Versions            []ObjectVersion
+	CommonPrefixes      []string
+	IsTruncated         bool
 }
 
 // CopyRange is the bytes First to Last of a source object, both included

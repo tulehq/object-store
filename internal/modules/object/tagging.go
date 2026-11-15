@@ -47,7 +47,8 @@ func (m *Module) putObjectTagging(ctx gas.Context, t s3api.Target) error {
 		return s3api.WriteError(ctx, t, err)
 	}
 	defer release()
-	if err = m.storage.PutObjectTagging(pinned, t.Bucket, t.Key, tags,
+	if _, err = m.storage.PutObjectTagging(pinned,
+		contracts.ObjectRef{Bucket: t.Bucket, Key: t.Key}, tags,
 		caller.ObjectCheck(t)); err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
@@ -64,7 +65,8 @@ func (m *Module) getObjectTagging(ctx gas.Context, t s3api.Target) error {
 		return s3api.WriteError(ctx, t, err)
 	}
 	defer g.Release()
-	info, err := m.storage.StatObjectTagging(g.Context(), t.Bucket, t.Key)
+	info, err := m.storage.StatObjectTagging(g.Context(),
+		contracts.ObjectRef{Bucket: t.Bucket, Key: t.Key})
 	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
@@ -83,7 +85,8 @@ func (m *Module) deleteObjectTagging(ctx gas.Context, t s3api.Target) error {
 		return s3api.WriteError(ctx, t, err)
 	}
 	defer g.Release()
-	if err = m.storage.PutObjectTagging(g.Context(), t.Bucket, t.Key, nil,
+	if _, err = m.storage.PutObjectTagging(g.Context(),
+		contracts.ObjectRef{Bucket: t.Bucket, Key: t.Key}, nil,
 		g.ObjectCheck(t)); err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}

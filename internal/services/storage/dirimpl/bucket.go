@@ -82,12 +82,16 @@ func (s *Service) ListObjects(
 	lastPrefix := ""
 
 	for _, key := range keys {
-		if !strings.HasPrefix(key, in.Prefix) || !isAfter(key, in.StartAfter, in.Delimiter) {
+		if !selects(in, key) {
 			continue
 		}
 
 		if cp := commonPrefix(key, in.Prefix, in.Delimiter); cp != "" {
-			if cp == lastPrefix {
+			emit, eErr := s.emitsPrefix(bucket, key, cp, lastPrefix)
+			if eErr != nil {
+				return nil, eErr
+			}
+			if !emit {
 				continue
 			}
 			if count == in.MaxKeys {
@@ -127,14 +131,30 @@ func (s *Service) bucketKeys(ctx context.Context, bucket string) ([]string, erro
 	return s.indexedKeys(bucket)
 }
 
-// listObject adds the object at key to out. An indexed key that holds no
-// object is skipped.
+// listObject adds the current version of the object at key to out. An
+// indexed key that holds no object, or whose current version is a delete
+// marker, is skipped. The current version of a key with a manifest is
+// described from its manifest, without opening it.
 func (s *Service) listObject(
 	ctx context.Context,
 	bucket, key string,
 	out *contracts.ListObjectsOutput,
 ) error {
-	info, err := s.StatObject(ctx, bucket, key)
+	m, _, err := s.readVersions(bucket, key)
+	if err != nil {
+		return err
+	}
+	if m != nil {
+		if e := m.live(); e != nil {
+			out.Objects = append(out.Objects, contracts.ObjectInfo{
+				Key: key, ETag: e.ETag, Size: e.Size, LastModified: e.LastModified,
+				VersionID: e.ID,
+			})
+			out.NextStartAfter = key
+		}
+		return nil
+	}
+	info, err := s.StatObject(ctx, contracts.ObjectRef{Bucket: bucket, Key: key})
 	if errors.Is(err, storage.ErrObjectNotFound) {
 		return nil
 	}
@@ -144,6 +164,28 @@ func (s *Service) listObject(
 	out.Objects = append(out.Objects, *info)
 	out.NextStartAfter = key
 	return nil
+}
+
+// selects reports whether in's listing includes key, or the common prefix
+// it rolls up into.
+func selects(in contracts.ListObjectsInput, key string) bool {
+	return strings.HasPrefix(key, in.Prefix) && isAfter(key, in.StartAfter, in.Delimiter)
+}
+
+// emitsPrefix reports whether key makes a listing emit cp, the common
+// prefix it rolls up into, when the last emitted was lastPrefix: once, for
+// the first key under it that holds an object, or has no manifest, as any
+// indexed key without one counts. A prefix whose keys all have a delete
+// marker as their current version holds no object to list.
+func (s *Service) emitsPrefix(bucket, key, cp, lastPrefix string) (bool, error) {
+	if cp == lastPrefix {
+		return false, nil
+	}
+	m, _, err := s.readVersions(bucket, key)
+	if err != nil {
+		return false, err
+	}
+	return m == nil || m.live() != nil, nil
 }
 
 // isAfter reports whether key sorts after the listing's start point. A start
@@ -274,14 +316,27 @@ func (s *Service) checkDeletable(ctx context.Context, ref contracts.BucketRef) e
 }
 
 // checkEmpty returns contracts.ErrBucketNotEmpty when bucket holds an
-// object. An indexed key that holds none does not count.
+// object version or a delete marker: "All objects (including all object
+// versions and delete markers) in the bucket must be deleted before the
+// bucket itself can be deleted" (DeleteBucket API reference). An indexed
+// key that holds none does not count.
 func (s *Service) checkEmpty(ctx context.Context, bucket string) error {
 	keys, err := s.indexedKeys(bucket)
 	if err != nil {
 		return err
 	}
 	for _, key := range keys {
-		_, sErr := s.statObject(ctx, bucket, key)
+		m, _, rErr := s.readVersions(bucket, key)
+		if rErr != nil {
+			return rErr
+		}
+		if m != nil {
+			if len(m.Versions) > 0 {
+				return contracts.ErrBucketNotEmpty
+			}
+			continue
+		}
+		_, sErr := s.statObject(ctx, contracts.ObjectRef{Bucket: bucket, Key: key})
 		if sErr == nil {
 			return contracts.ErrBucketNotEmpty
 		}
@@ -290,6 +345,42 @@ func (s *Service) checkEmpty(ctx context.Context, bucket string) error {
 		}
 	}
 	return nil
+}
+
+// removeContents removes what bucket, an empty bucket of generation gen,
+// still holds: its uploads and the garbage objects of its backend bucket.
+// The caller holds the bucket's write lock.
+func (s *Service) removeContents(ctx context.Context, bucket, gen string) error {
+	if err := s.removeUploads(bucket, gen); err != nil {
+		return err
+	}
+	return s.purgeObjects(ctx, bucket)
+}
+
+// purgeObjects deletes every object the backend holds in bucket, which
+// holds no object version or marker: what is left is garbage no manifest
+// lists, the data of a version a crash kept from being committed or
+// removed, or an object at keyHash behind an empty manifest. The caller
+// holds the bucket's write lock.
+func (s *Service) purgeObjects(ctx context.Context, bucket string) error {
+	for {
+		out, err := s.dir.ListObjects(ctx, &storage.ListObjectsInput{Bucket: &bucket})
+		if err != nil {
+			return fmt.Errorf("%s: failed to list the objects of bucket %s: %w",
+				s.Name(), bucket, err)
+		}
+		for _, o := range out.Objects {
+			if err = s.dir.DeleteObject(ctx, &storage.DeleteObjectInput{
+				BaseObjectInput: storage.BaseObjectInput{Bucket: &bucket, Key: o.Key},
+			}); err != nil {
+				return fmt.Errorf("%s: failed to delete garbage of bucket %s: %w",
+					s.Name(), bucket, err)
+			}
+		}
+		if !out.IsTruncated {
+			return nil
+		}
+	}
 }
 
 // registerBucket adds bucket to the registry with a new generation. The
@@ -322,9 +413,12 @@ func (s *Service) registerBucket(bucket string) error {
 // the bucket's requests are not blocked meanwhile; an operation pinned to
 // the bucket that outlasts it fails the delete with
 // contracts.ErrOperationAborted. Under the write lock both are checked
-// again, the uploads of this generation are removed, and the registry entry
-// is renamed away, which makes the bucket not exist; then the policy, the
-// configurations, the object ACLs and the index are removed. The bucket is left in the backend, empty.
+// again, the uploads of this generation and the objects left in the
+// backend, which are garbage (see purgeObjects), are removed, and the
+// registry entry is renamed away, which makes the bucket not exist; then
+// the policy, the configurations, the object ACLs, tags and versions, the
+// versioning state and the index are removed. The bucket is left in the
+// backend, empty.
 // Creating the bucket again reuses it, with a new generation.
 func (s *Service) DeleteBucket(ctx context.Context, ref contracts.BucketRef) error {
 	bucket := ref.Name
@@ -342,7 +436,7 @@ func (s *Service) DeleteBucket(ctx context.Context, ref contracts.BucketRef) err
 	if err = s.checkDeletable(ctx, ref); err != nil {
 		return err
 	}
-	if err = s.removeUploads(bucket, ref.Generation); err != nil {
+	if err = s.removeContents(ctx, bucket, ref.Generation); err != nil {
 		return err
 	}
 

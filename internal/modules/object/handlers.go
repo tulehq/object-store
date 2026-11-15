@@ -56,7 +56,7 @@ func (m *Module) getObject(ctx gas.Context) error {
 	}
 	defer g.Release()
 
-	obj, err := m.storage.GetObject(g.Context(), t.Bucket, t.Key)
+	obj, err := m.storage.GetObject(g.Context(), contracts.ObjectRef{Bucket: t.Bucket, Key: t.Key})
 	// The object is open, and its body is the backend's open data file,
 	// which "keeps reading the contents it opened when the object is
 	// replaced or deleted" (gas storage/dir), so streaming it needs no pin
@@ -127,7 +127,7 @@ func (m *Module) headObject(ctx gas.Context) error {
 	defer g.Release()
 
 	// The object is opened, rather than stated, to read its tags with it.
-	obj, err := m.storage.GetObject(g.Context(), t.Bucket, t.Key)
+	obj, err := m.storage.GetObject(g.Context(), contracts.ObjectRef{Bucket: t.Bucket, Key: t.Key})
 	if err != nil {
 		// A HEAD's error has no body; the status alone tells 403 from 404.
 		return s3api.WriteError(ctx, t, g.NotFound(t.Bucket, err))
@@ -315,10 +315,11 @@ func (m *Module) copyObject(ctx gas.Context, t s3api.Target) error {
 	in.CopyTags, in.Tags = !replacesTags(ctx.Request()), ws.tags
 	in.SourceCheck = g.ObjectCheck(src)
 
-	info, err := m.storage.CopyObject(g.Context(), in)
+	out, err := m.storage.CopyObject(g.Context(), in)
 	if err != nil {
 		return s3api.WriteError(ctx, t, m.copyNotFound(g, in, err))
 	}
+	info := &out.ObjectInfo
 
 	setEncryptionHeaders(ctx.ResponseWriter(), ws.encryption)
 	return ctx.XML(http.StatusOK, s3api.NewCopyObjectResult(info.ETag, info.LastModified))
@@ -333,7 +334,8 @@ func (m *Module) copyNotFound(g *authz.Grant, in contracts.CopyObjectInput, err 
 		return err
 	}
 	bucket := in.DstBucket
-	if _, sErr := m.storage.StatObject(g.Context(), in.SrcBucket, in.SrcKey); errors.Is(sErr,
+	if _, sErr := m.storage.StatObject(g.Context(),
+		contracts.ObjectRef{Bucket: in.SrcBucket, Key: in.SrcKey}); errors.Is(sErr,
 		storage.ErrObjectNotFound) {
 		bucket = in.SrcBucket
 	}
@@ -416,7 +418,8 @@ func (m *Module) deleteObject(ctx gas.Context) error {
 	}
 	defer g.Release()
 
-	if err := m.storage.DeleteObject(g.Context(), t.Bucket, t.Key); err != nil {
+	if _, err := m.storage.DeleteObject(g.Context(),
+		contracts.ObjectRef{Bucket: t.Bucket, Key: t.Key}); err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
 

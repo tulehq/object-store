@@ -41,6 +41,15 @@ var (
 	// tagDir holds the tags objects were given, one directory per bucket
 	// with one file per object, named by keyHash, as aclDir does.
 	tagDir = filepath.Join(stateDir, "tags")
+
+	// versioningDir holds the versioning state of the buckets, one file
+	// per bucket that has one, named after it (see versioningFile).
+	versioningDir = filepath.Join(stateDir, "versioning")
+
+	// versionsDir holds the version manifests, one directory per bucket
+	// with one file per key that has versions, named by keyHash (see
+	// versions.go).
+	versionsDir = filepath.Join(stateDir, "versions")
 )
 
 func (s *Service) openRoot() (*os.Root, error) {
@@ -53,6 +62,7 @@ func (s *Service) openRoot() (*os.Root, error) {
 	}
 	for _, d := range []string{
 		bucketsDir, indexDir, multipartDir, policiesDir, configDir, aclDir, tagDir,
+		versioningDir, versionsDir,
 	} {
 		if err = root.MkdirAll(d, 0o750); err != nil {
 			return nil, errors.Join(

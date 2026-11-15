@@ -30,7 +30,7 @@ func TestPutRecordsETag(t *testing.T) {
 		t.Fatalf("put: %v", err)
 	}
 
-	info, err := s.StatObject(ctx, "bucket", "k")
+	info, err := s.StatObject(ctx, oref("bucket", "k"))
 	if err != nil {
 		t.Fatalf("stat: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestManyPartSizes(t *testing.T) {
 		&trailer{Meta: meta}); err != nil {
 		t.Fatalf("put: %v", err)
 	}
-	info, err := s.StatObject(ctx, "bucket", "k")
+	info, err := s.StatObject(ctx, oref("bucket", "k"))
 	if err != nil {
 		t.Fatalf("stat: %v", err)
 	}
@@ -144,11 +144,11 @@ func TestDamagedDataFile(t *testing.T) {
 
 			damageDataFile(t, s.root, damage)
 
-			_, err := s.StatObject(ctx, "bucket", "k")
+			_, err := s.StatObject(ctx, oref("bucket", "k"))
 			if err == nil || errors.Is(err, storage.ErrObjectNotFound) {
 				t.Fatalf("stat: got %v, want an error other than not found", err)
 			}
-			_, err = s.GetObject(ctx, "bucket", "k")
+			_, err = s.GetObject(ctx, oref("bucket", "k"))
 			if err == nil || errors.Is(err, storage.ErrObjectNotFound) {
 				t.Fatalf("get: got %v, want an error other than not found", err)
 			}

@@ -10,6 +10,7 @@ import (
 	"github.com/gasmod/gas"
 
 	"tule.dev/object-store/internal/authz"
+	"tule.dev/object-store/internal/contracts"
 	"tule.dev/object-store/internal/s3api"
 )
 
@@ -96,7 +97,10 @@ func (m *Module) deleteOne(
 		}
 		return err
 	}
-	if err := m.storage.DeleteObject(ctx, bucket, obj.Key); err != nil {
+	if _, err := m.storage.DeleteObject(
+		ctx,
+		contracts.ObjectRef{Bucket: bucket, Key: obj.Key},
+	); err != nil {
 		return fmt.Errorf("delete %q: %w", obj.Key, err)
 	}
 	return nil

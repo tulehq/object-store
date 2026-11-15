@@ -152,7 +152,7 @@ func (m *Module) storedACL(
 	check contracts.ObjectCheck,
 ) (string, []s3api.Grant, error) {
 	bucketOwner := s3api.CanonicalUserID(m.authz.Account())
-	doc, err := m.storage.GetObjectACL(ctx, bucket, key, check)
+	doc, _, err := m.storage.GetObjectACL(ctx, contracts.ObjectRef{Bucket: bucket, Key: key}, check)
 	if errors.Is(err, contracts.ErrNoSuchBucketConfig) {
 		return bucketOwner, []s3api.Grant{s3api.OwnerFullControl(bucketOwner)}, nil
 	}
@@ -278,11 +278,11 @@ func (m *Module) setObjectACL(
 	if err != nil {
 		return err //nolint:wrapcheck // s3api's own error
 	}
-	return m.storage.PutObjectACL(
+	_, err = m.storage.PutObjectACL(
 		ctx,
-		t.Bucket,
-		t.Key,
+		contracts.ObjectRef{Bucket: t.Bucket, Key: t.Key},
 		stored,
 		check,
-	) //nolint:wrapcheck // the storage's own error, answered as is
+	)
+	return err //nolint:wrapcheck // the storage's own error, answered as is
 }

@@ -32,11 +32,11 @@ func requireTags(
 	what string,
 ) {
 	t.Helper()
-	got, err := s.GetObjectTagging(ctx, "bucket", key)
+	got, err := s.GetObjectTagging(ctx, oref("bucket", key))
 	if err != nil || !slices.Equal(got, want) {
 		t.Fatalf("%s: tags %v, %v; want %v", what, got, err, want)
 	}
-	obj, err := s.GetObject(ctx, "bucket", key)
+	obj, err := s.GetObject(ctx, oref("bucket", key))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,16 +77,20 @@ func TestObjectTagsGoWithTheirObjects(t *testing.T) {
 	ctx, _ := pin(t, s)
 	put := func(key string, tags []contracts.Tag) { t.Helper(); putTagged(t, s, ctx, key, tags) }
 
-	_, err := s.GetObjectTagging(ctx, "bucket", "k")
+	_, err := s.GetObjectTagging(ctx, oref("bucket", "k"))
 	requireIs(t, "no object", err, storage.ErrObjectNotFound)
-	requireIs(t, "put on no object", s.PutObjectTagging(ctx, "bucket", "k", testTags, nil),
-		storage.ErrObjectNotFound)
+	requireIs(
+		t,
+		"put on no object",
+		errOf(s.PutObjectTagging(ctx, oref("bucket", "k"), testTags, nil)),
+		storage.ErrObjectNotFound,
+	)
 
 	put("k", testTags)
 	requireTags(t, s, ctx, "k", testTags, "written with tags")
 	// Read without a pin, under the bucket's lock, as authorization reads
 	// them.
-	if got, gErr := s.GetObjectTagging(context.Background(), "bucket", "k"); gErr != nil ||
+	if got, gErr := s.GetObjectTagging(context.Background(), oref("bucket", "k")); gErr != nil ||
 		!slices.Equal(got, testTags) {
 		t.Fatalf("unpinned: %v %v", got, gErr)
 	}
@@ -95,11 +99,11 @@ func TestObjectTagsGoWithTheirObjects(t *testing.T) {
 	requireNoTagFile(t, s, "k", "written over without tags")
 
 	one := []contracts.Tag{{Key: "a", Value: ""}}
-	if err = s.PutObjectTagging(ctx, "bucket", "k", one, nil); err != nil {
+	if err = errOf(s.PutObjectTagging(ctx, oref("bucket", "k"), one, nil)); err != nil {
 		t.Fatal(err)
 	}
 	requireTags(t, s, ctx, "k", one, "PutObjectTagging")
-	if err = s.PutObjectTagging(ctx, "bucket", "k", nil, nil); err != nil {
+	if err = errOf(s.PutObjectTagging(ctx, oref("bucket", "k"), nil, nil)); err != nil {
 		t.Fatal(err)
 	}
 	requireTags(t, s, ctx, "k", nil, "tags removed")
@@ -108,11 +112,11 @@ func TestObjectTagsGoWithTheirObjects(t *testing.T) {
 	// a removal of them is stored, so they do not apply again.
 	put("k", testTags)
 	requireNoTagFile(t, s, "k", "written with tags")
-	if err = s.PutObjectTagging(ctx, "bucket", "k", nil, nil); err != nil {
+	if err = errOf(s.PutObjectTagging(ctx, oref("bucket", "k"), nil, nil)); err != nil {
 		t.Fatal(err)
 	}
 	requireTags(t, s, ctx, "k", nil, "tags written with the object removed")
-	if err = s.PutObjectTagging(ctx, "bucket", "k", one, nil); err != nil {
+	if err = errOf(s.PutObjectTagging(ctx, oref("bucket", "k"), one, nil)); err != nil {
 		t.Fatal(err)
 	}
 	requireTags(t, s, ctx, "k", one, "tags written with the object replaced")
@@ -121,7 +125,7 @@ func TestObjectTagsGoWithTheirObjects(t *testing.T) {
 	requireNoTagFile(t, s, "k", "replaced tags written over")
 
 	put("deleted", testTags)
-	if err = s.DeleteObject(ctx, "bucket", "deleted"); err != nil {
+	if err = errOf(s.DeleteObject(ctx, oref("bucket", "deleted"))); err != nil {
 		t.Fatal(err)
 	}
 	requireNoTagFile(t, s, "deleted", "a delete")
@@ -201,7 +205,7 @@ func TestAWrittenObjectIsVisibleWithItsTags(t *testing.T) {
 	s := newTestService(t)
 	ctx, _ := pin(t, s)
 	putTagged(t, s, ctx, "k", nil)
-	if err := s.PutObjectTagging(ctx, "bucket", "k",
+	if _, err := s.PutObjectTagging(ctx, oref("bucket", "k"),
 		[]contracts.Tag{{Key: "old", Value: "1"}}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -238,7 +242,7 @@ func TestTagFilesOfEarlierWritesStillApply(t *testing.T) {
 		t.Fatal(err)
 	}
 	requireTags(t, s, ctx, "k", testTags, "an object stored with a v0.10.0 tag file")
-	got, err := s.StatObjectTagging(context.Background(), "bucket", "k")
+	got, err := s.StatObjectTagging(context.Background(), oref("bucket", "k"))
 	if err != nil || got.ETag != info.ETag || !slices.Equal(got.Tags, testTags) {
 		t.Fatalf("StatObjectTagging: %+v, %v", got, err)
 	}
@@ -287,7 +291,7 @@ func TestACopysCheckSeesTheSourceOpened(t *testing.T) {
 	_, err := s.CopyObject(ctx, in)
 	requireIs(t, "a stopped copy", err, errStop)
 	rec.requireSeen(t, "CopyObject")
-	_, err = s.StatObject(ctx, "bucket", "dst")
+	_, err = s.StatObject(ctx, oref("bucket", "dst"))
 	requireIs(t, "the stopped copy's destination", err, storage.ErrObjectNotFound)
 	rec.pass = true
 	if _, err = s.CopyObject(ctx, in); err != nil {
@@ -299,7 +303,7 @@ func TestACopysCheckSeesTheSourceOpened(t *testing.T) {
 	_, _, part := copySource(t, s, ctx)
 	putTagged(t, s, ctx, "src", testTags)
 	rec.pass, part.SourceCheck = false, rec.check
-	_, _, err = s.UploadPartCopy(ctx, part)
+	_, err = s.UploadPartCopy(ctx, part)
 	requireIs(t, "a stopped part copy", err, errStop)
 	rec.requireSeen(t, "UploadPartCopy")
 	parts, err := s.ListParts(ctx, "bucket", "dst", part.UploadID)
@@ -317,16 +321,16 @@ func TestTagAndACLChecksSeeTheObjectOpened(t *testing.T) {
 	putTagged(t, s, ctx, "src", testTags)
 	rec := &checkRecorder{}
 	requireIs(t, "a stopped PutObjectTagging",
-		s.PutObjectTagging(ctx, "bucket", "src", nil, rec.check), errStop)
+		errOf(s.PutObjectTagging(ctx, oref("bucket", "src"), nil, rec.check)), errStop)
 	rec.requireSeen(t, "PutObjectTagging")
 	requireTags(t, s, ctx, "src", testTags, "after a stopped PutObjectTagging")
 	requireIs(t, "a stopped PutObjectACL",
-		s.PutObjectACL(ctx, "bucket", "src", []byte("<a/>"), rec.check), errStop)
+		errOf(s.PutObjectACL(ctx, oref("bucket", "src"), []byte("<a/>"), rec.check)), errStop)
 	rec.requireSeen(t, "PutObjectACL")
-	_, err := s.GetObjectACL(ctx, "bucket", "src", rec.check)
+	_, _, err := s.GetObjectACL(ctx, oref("bucket", "src"), rec.check)
 	requireIs(t, "a stopped GetObjectACL", err, errStop)
 	rec.requireSeen(t, "GetObjectACL")
-	_, err = s.GetObjectACL(ctx, "bucket", "src", nil)
+	_, _, err = s.GetObjectACL(ctx, oref("bucket", "src"), nil)
 	requireIs(t, "the ACL after a stopped PutObjectACL", err, contracts.ErrNoSuchBucketConfig)
 }
 
@@ -509,16 +513,16 @@ func TestUploadPartCopyErrors(t *testing.T) {
 	ctx, _ := pin(t, s)
 	src, srcInfo, in := copySource(t, s, ctx)
 	in.Range = &contracts.CopyRange{First: 0, Last: int64(len(src))}
-	_, _, err := s.UploadPartCopy(ctx, in)
+	_, err := s.UploadPartCopy(ctx, in)
 	requireIs(t, "a range past the end", err, contracts.ErrInvalidCopyRange)
 	in.Range, in.SourceCondition = nil, contracts.SourceCondition{IfNoneMatch: srcInfo.ETag}
-	_, _, err = s.UploadPartCopy(ctx, in)
+	_, err = s.UploadPartCopy(ctx, in)
 	requireIs(t, "a failed condition", err, contracts.ErrPreconditionFailed)
 	in.SourceCondition, in.SrcKey = contracts.SourceCondition{}, "missing"
-	_, _, err = s.UploadPartCopy(ctx, in)
+	_, err = s.UploadPartCopy(ctx, in)
 	requireIs(t, "a missing source", err, storage.ErrObjectNotFound)
 	in.SrcKey, in.UploadID = "src", "AAAAAAAAAAAAAAAAAAAAAAAAAA"
-	_, _, err = s.UploadPartCopy(ctx, in)
+	_, err = s.UploadPartCopy(ctx, in)
 	requireIs(t, "a missing upload", err, contracts.ErrNoSuchUpload)
 }
 
@@ -528,20 +532,22 @@ func TestUploadPartCopy(t *testing.T) {
 	s := newTestService(t)
 	ctx, _ := pin(t, s)
 	src, srcInfo, in := copySource(t, s, ctx)
-	whole, headers, err := s.UploadPartCopy(ctx, in)
+	out, err := s.UploadPartCopy(ctx, in)
 	if err != nil {
 		t.Fatal(err)
 	}
+	whole, headers := out.Part, out.Headers
 	if whole.ETag != srcInfo.ETag || whole.Size != int64(len(src)) ||
 		headers["X-Amz-Server-Side-Encryption"] != "AES256" || whole.LastModified.IsZero() {
 		t.Fatalf("whole copy: %+v %v", whole, headers)
 	}
 
 	in.PartNumber, in.Range = 2, &contracts.CopyRange{First: 3, Last: 12}
-	ranged, _, err := s.UploadPartCopy(ctx, in)
+	out, err = s.UploadPartCopy(ctx, in)
 	if err != nil {
 		t.Fatal(err)
 	}
+	ranged := out.Part
 	sum := md5.Sum(src[3:13]) //nolint:gosec // see import
 	if ranged.ETag != hex.EncodeToString(sum[:]) || ranged.Size != 10 {
 		t.Fatalf("ranged copy: %+v", ranged)
@@ -582,7 +588,7 @@ func readObject(
 	key string,
 ) []byte {
 	t.Helper()
-	obj, err := s.GetObject(ctx, "bucket", key)
+	obj, err := s.GetObject(ctx, oref("bucket", key))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -591,4 +597,99 @@ func readObject(
 		t.Fatal(err, cErr)
 	}
 	return got
+}
+
+// requireVersionTags fails unless version id of "k" has tags want.
+func requireVersionTags(t *testing.T, f *fixture, id string, want []contracts.Tag) {
+	t.Helper()
+	got, err := f.s.GetObjectTagging(f.ctx, vref("k", id))
+	if err != nil || !slices.Equal(got, want) {
+		t.Fatalf("tags of %s: %v %v, want %v", id, got, err, want)
+	}
+}
+
+// A legacy object keeps its tags and ACL, in its keyHash files, as the
+// null version its key's first versioned write makes it.
+func TestALegacyNullKeepsItsTagsAndACL(t *testing.T) {
+	f := newFixture(t)
+	f.putIn("k", "legacy", contracts.PutObjectInput{ACL: []byte("<legacy/>")})
+	one := []contracts.Tag{{Key: "a", Value: "1"}}
+	if err := errOf(f.s.PutObjectTagging(f.ctx, oref("bucket", "k"), one, nil)); err != nil {
+		t.Fatal(err)
+	}
+	f.state(contracts.VersioningEnabled)
+	v1 := f.putIn("k", "v1", contracts.PutObjectInput{Tags: testTags, ACL: []byte("<v1/>")})
+
+	requireVersionTags(t, f, contracts.VersionNull, one)
+	requireVersionTags(t, f, v1.VersionID, testTags)
+	if doc, id, err := f.s.GetObjectACL(f.ctx, vref("k", contracts.VersionNull), nil); err != nil ||
+		string(doc) != "<legacy/>" || id != contracts.VersionNull {
+		t.Fatalf("null ACL: %q %q %v", doc, id, err)
+	}
+	if !f.exists(tagFile("bucket", "k")) || !f.exists(aclFile("bucket", "k")) {
+		t.Fatal("the legacy null version's side files moved")
+	}
+	e := f.versions("k")[0]
+	if !f.exists(sideFile(aclDir, "bucket", "k", &e)) {
+		t.Fatal("the new version's ACL is not in its token's file")
+	}
+}
+
+// Tags are stored per version: PutObjectTagging of one changes none of
+// the others, and is stored in that version's file, and a delete marker
+// has none.
+func TestTagsArePerVersion(t *testing.T) {
+	f := newFixture(t)
+	f.state(contracts.VersioningEnabled)
+	v1 := f.putIn("k", "v1", contracts.PutObjectInput{Tags: testTags})
+	v2 := f.put("k", "v2")
+	one := []contracts.Tag{{Key: "a", Value: "1"}}
+	id, err := f.s.PutObjectTagging(f.ctx, vref("k", v1.VersionID), one, nil)
+	if err != nil || id != v1.VersionID {
+		t.Fatalf("tag v1: %q %v", id, err)
+	}
+	requireVersionTags(t, f, v1.VersionID, one)
+	requireVersionTags(t, f, v2.VersionID, nil)
+	if id, err = f.s.PutObjectTagging(f.ctx, oref("bucket", "k"), testTags, nil); err != nil ||
+		id != v2.VersionID {
+		t.Fatalf("tag the current version: %q %v", id, err)
+	}
+	requireVersionTags(t, f, v1.VersionID, one)
+	e := f.versions("k")[1]
+	if !f.exists(sideFile(tagDir, "bucket", "k", &e)) || f.exists(tagFile("bucket", "k")) {
+		t.Fatal("v1's tags are not in its token's file")
+	}
+
+	marker := f.del(oref("bucket", "k"))
+	_, err = f.s.PutObjectTagging(f.ctx, vref("k", marker.VersionID), one, nil)
+	requireIs(t, "tag a marker", err, contracts.ErrMethodNotAllowed)
+	_, err = f.s.GetObjectTagging(f.ctx, vref("k", marker.VersionID))
+	requireIs(t, "tags of a marker", err, contracts.ErrMethodNotAllowed)
+	_, err = f.s.PutObjectTagging(f.ctx, oref("bucket", "k"), one, nil)
+	requireIs(t, "tag a current marker", err, storage.ErrObjectNotFound)
+	_, err = f.s.PutObjectTagging(f.ctx, vref("k", newVersionID(1)), one, nil)
+	requireIs(t, "tag a missing version", err, storage.ErrVersionNotFound)
+}
+
+// A suspended write of the null version does not inherit the tags or ACL
+// of the one it replaces, whose files go with it.
+func TestASuspendedOverwriteInheritsNothing(t *testing.T) {
+	f := newFixture(t)
+	f.state(contracts.VersioningEnabled)
+	f.put("k", "v1")
+	f.state(contracts.VersioningSuspended)
+	f.putIn("k", "null", contracts.PutObjectInput{ACL: []byte("<old/>")})
+	if err := errOf(f.s.PutObjectTagging(f.ctx, oref("bucket", "k"), testTags, nil)); err != nil {
+		t.Fatal(err)
+	}
+	old := f.versions("k")[0]
+	f.put("k", "new")
+
+	requireVersionTags(t, f, contracts.VersionNull, nil)
+	_, _, err := f.s.GetObjectACL(f.ctx, vref("k", contracts.VersionNull), nil)
+	requireIs(t, "the new null version's ACL", err, contracts.ErrNoSuchBucketConfig)
+	if f.exists(sideFile(tagDir, "bucket", "k", &old)) ||
+		f.exists(sideFile(aclDir, "bucket", "k", &old)) || f.hasData(&old) {
+		t.Fatal("the replaced null version's files are left")
+	}
 }

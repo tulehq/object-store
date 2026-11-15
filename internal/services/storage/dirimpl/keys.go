@@ -62,12 +62,22 @@ func (s *Service) checkPrecondition(
 		return nil
 	}
 
-	info, err := s.StatObject(ctx, bucket, key)
+	info, err := s.StatObject(ctx, contracts.ObjectRef{Bucket: bucket, Key: key})
 	if err != nil && !errors.Is(err, storage.ErrObjectNotFound) {
 		return err
 	}
-	exists := err == nil
+	etag := ""
+	if err == nil {
+		etag = info.ETag
+	}
+	return preconditionHolds(cond, err == nil, etag)
+}
 
+// preconditionHolds returns contracts.ErrPreconditionFailed when cond does
+// not hold for the current object, which exists with etag, or does not,
+// and storage.ErrObjectNotFound when cond requires an object that does not
+// exist.
+func preconditionHolds(cond contracts.Precondition, exists bool, etag string) error {
 	if cond.IfNoneMatch && exists {
 		return contracts.ErrPreconditionFailed
 	}
@@ -75,7 +85,7 @@ func (s *Service) checkPrecondition(
 		if !exists {
 			return storage.ErrObjectNotFound
 		}
-		if cond.IfMatch != "*" && cond.IfMatch != info.ETag {
+		if cond.IfMatch != "*" && cond.IfMatch != etag {
 			return contracts.ErrPreconditionFailed
 		}
 	}

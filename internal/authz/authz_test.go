@@ -68,17 +68,17 @@ var testModified = time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 // Every object's ETag is "etag-" and its key.
 func (b buckets) StatObjectTagging(
 	_ context.Context,
-	bucket, key string,
+	ref contracts.ObjectRef,
 ) (*contracts.ObjectInfo, error) {
-	if _, ok := b[bucket]; !ok {
+	if _, ok := b[ref.Bucket]; !ok {
 		return nil, storage.ErrBucketNotFound
 	}
-	tags, ok := testTags[key]
+	tags, ok := testTags[ref.Key]
 	if !ok {
 		return nil, storage.ErrObjectNotFound
 	}
 	return &contracts.ObjectInfo{
-		Key: key, ETag: "etag-" + key, LastModified: testModified, Tags: tags,
+		Key: ref.Key, ETag: "etag-" + ref.Key, LastModified: testModified, Tags: tags,
 	}, nil
 }
 

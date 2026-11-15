@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/gasmod/gas"
@@ -29,7 +30,12 @@ type Service struct {
 	logger   gas.Logger
 	settings *Settings
 	root     *os.Root
-	locks    keyLocks
+	// hook, when set, is called at each stage of a change to an object's
+	// versions and of a read of one (see versions.go), and an error it
+	// returns fails the change or read there, as a crash would stop it.
+	// Tests set it.
+	hook  func(stage string) error
+	locks keyLocks
 	// bucketLocks order creating and deleting a bucket, which change its
 	// generation, against the operations pinned to it and the reads of its
 	// policy.
@@ -37,6 +43,8 @@ type Service struct {
 	// deleteWait bounds how long DeleteBucket waits for the operations
 	// pinned to its bucket.
 	deleteWait time.Duration
+	// seq is the last commit sequence nextSeq returned.
+	seq atomic.Int64
 }
 
 // defaultDeleteWait is deleteWait's value.

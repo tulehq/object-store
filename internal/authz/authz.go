@@ -45,7 +45,7 @@ var errNoPrincipal = errors.New("authz: the request has no verified principal")
 type PolicySource interface {
 	GetBucketPolicy(ctx context.Context, bucket string) (string, []byte, error)
 	GetBucketConfig(ctx context.Context, bucket string, kind contracts.BucketConfig) ([]byte, error)
-	StatObjectTagging(ctx context.Context, bucket, key string) (*contracts.ObjectInfo, error)
+	StatObjectTagging(ctx context.Context, ref contracts.ObjectRef) (*contracts.ObjectInfo, error)
 	Pin(ctx context.Context, refs ...contracts.BucketRef) (context.Context, func(), error)
 }
 

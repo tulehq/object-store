@@ -53,7 +53,8 @@ func (m *Module) getObjectAttributes(ctx gas.Context, t s3api.Target) error {
 	}
 	// The object is read with its tags, to check it against those it was
 	// evaluated with.
-	info, err := m.storage.StatObjectTagging(g.Context(), t.Bucket, t.Key)
+	info, err := m.storage.StatObjectTagging(g.Context(),
+		contracts.ObjectRef{Bucket: t.Bucket, Key: t.Key})
 	if err != nil {
 		return s3api.WriteError(ctx, t, g.NotFound(t.Bucket, err))
 	}
