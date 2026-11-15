@@ -23,6 +23,8 @@ const (
 	DeleteBucket            Operation = "DeleteBucket"
 	GetBucketLocation       Operation = "GetBucketLocation"
 	GetBucketVersioning     Operation = "GetBucketVersioning"
+	PutBucketVersioning     Operation = "PutBucketVersioning"
+	ListObjectVersions      Operation = "ListObjectVersions"
 	ListObjects             Operation = "ListObjects"
 	ListObjectsV2           Operation = "ListObjectsV2"
 	ListMultipartUploads    Operation = "ListMultipartUploads"
@@ -120,7 +122,9 @@ type check struct {
 // https://servicereference.us-east-1.amazonaws.com/v1/s3/s3.json, and the
 // S3 page "Actions, resources, and condition keys for Amazon S3"). Several
 // operations are evaluated as an action of another name: HeadBucket and the
-// ListObjects versions as s3:ListBucket, HeadObject as s3:GetObject,
+// ListObjects versions as s3:ListBucket, ListObjectVersions as
+// s3:ListBucketVersions ("Be aware of the name difference", its API
+// reference), HeadObject as s3:GetObject,
 // ListMultipartUploads as s3:ListBucketMultipartUploads, ListParts as
 // s3:ListMultipartUploadParts, and the multipart writes as s3:PutObject.
 //
@@ -158,6 +162,11 @@ type check struct {
 // and s3:GetObjectVersionAttributes permissions"), the second beyond the
 // reference's entry as s3:GetObjectAttributes is.
 //
+// PutBucketVersioning is not owner-only: "all authorized users can enable
+// versioning. However, only the bucket owner (root account) can enable MFA
+// delete." ("Configuring MFA delete", S3 User Guide), and MFA delete is
+// refused.
+//
 // A write that sets an ACL, tags or an Object Ownership needs more
 // actions, which headerChecks adds. The actions the reference lists for
 // object lock, which this server does not implement, are not checked.
@@ -176,6 +185,8 @@ var operations = map[Operation][]check{
 	DeleteBucket:         {{action: "s3:DeleteBucket", kind: bucketResource}},
 	GetBucketLocation:    {{action: "s3:GetBucketLocation", kind: bucketResource}},
 	GetBucketVersioning:  {{action: "s3:GetBucketVersioning", kind: bucketResource}},
+	PutBucketVersioning:  {{action: "s3:PutBucketVersioning", kind: bucketResource}},
+	ListObjectVersions:   {{action: "s3:ListBucketVersions", kind: bucketResource}},
 	ListObjects:          {{action: "s3:ListBucket", kind: bucketResource}},
 	ListObjectsV2:        {{action: "s3:ListBucket", kind: bucketResource}},
 	ListMultipartUploads: {{action: "s3:ListBucketMultipartUploads", kind: bucketResource}},

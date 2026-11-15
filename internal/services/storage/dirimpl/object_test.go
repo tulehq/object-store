@@ -70,6 +70,30 @@ func TestStaleIndexEntries(t *testing.T) {
 	}
 }
 
+// A listing of MaxKeys 0 is empty and not truncated, though the bucket
+// has keys, so a client paging on it has nothing to continue from.
+func TestListObjectsMaxKeysZero(t *testing.T) {
+	s := newTestService(t)
+	ctx, release := pin(t, s)
+	defer release()
+	for _, k := range []string{"a", "b/c"} {
+		if _, err := s.PutObject(ctx, "bucket", k, strings.NewReader("x"),
+			contracts.PutObjectInput{}, contracts.Precondition{}); err != nil {
+			t.Fatalf("put %s: %v", k, err)
+		}
+	}
+	for _, in := range []contracts.ListObjectsInput{{}, {Delimiter: "/"}} {
+		out, err := s.ListObjects(ctx, "bucket", in)
+		if err != nil {
+			t.Fatalf("list %+v: %v", in, err)
+		}
+		if len(out.Objects)+len(out.CommonPrefixes) != 0 || out.IsTruncated ||
+			out.NextStartAfter != "" {
+			t.Fatalf("list %+v: %+v, want an empty page not truncated", in, out)
+		}
+	}
+}
+
 // TestManyPartSizes checks that the part sizes of an upload of the most
 // parts S3 allows are stored, which the backend's 2 KB metadata could not
 // hold.

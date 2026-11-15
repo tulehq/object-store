@@ -258,6 +258,18 @@ var calls = map[authz.Operation]call{
 	authz.GetBucketVersioning: func(ctx context.Context, c *s3.Client) error {
 		return sdkErr(c.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{Bucket: b}))
 	},
+	// PutBucketVersioning acts on cfg-bkt, so the state it sets applies to
+	// no other operation's request.
+	authz.PutBucketVersioning: func(ctx context.Context, c *s3.Client) error {
+		return sdkErr(c.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
+			Bucket: cfg, VersioningConfiguration: &s3types.VersioningConfiguration{
+				Status: s3types.BucketVersioningStatusSuspended,
+			},
+		}))
+	},
+	authz.ListObjectVersions: func(ctx context.Context, c *s3.Client) error {
+		return sdkErr(c.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{Bucket: b}))
+	},
 	authz.ListObjects: func(ctx context.Context, c *s3.Client) error {
 		return sdkErr(c.ListObjects(ctx, &s3.ListObjectsInput{Bucket: b}))
 	},

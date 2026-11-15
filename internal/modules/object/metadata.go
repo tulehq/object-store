@@ -73,7 +73,7 @@ func stripAWSChunked(v string) string {
 
 // setObjectHeaders writes the headers GET and HEAD share: the object's system
 // headers, its encryption headers (encryptionOf), its user metadata, and its
-// content type, ETag and modification time.
+// content type, ETag, modification time and version ID (setVersionHeader).
 func setObjectHeaders(w http.ResponseWriter, info *contracts.ObjectInfo) {
 	h := w.Header()
 	for name, v := range info.Headers {
@@ -90,6 +90,7 @@ func setObjectHeaders(w http.ResponseWriter, info *contracts.ObjectInfo) {
 	if info.ETag != "" {
 		h.Set("ETag", `"`+info.ETag+`"`)
 	}
+	setVersionHeader(w, info.VersionID)
 }
 
 // applyResponseOverrides replaces response headers with the response-*

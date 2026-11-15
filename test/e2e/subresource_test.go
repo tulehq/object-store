@@ -17,9 +17,28 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
-// TestVersionIDWithSubresource checks that ?versionId is refused with 501
-// NotImplemented whichever subresource it accompanies, rather than ignored
-// so the request acts on the current object.
+// versionIDRefusal is the answer to method with query, a subresource
+// with ?versionId=X: 501 naming ?versionId, or, as DELETE serves neither
+// ?acl nor ?partNumber, naming that subresource; and for a GET of
+// ?partNumber, a GetObject of version X, 400 for an ID the server does not
+// issue.
+func versionIDRefusal(method, query string) (int, string, string) {
+	if method == http.MethodGet && query == "partNumber=1&versionId=X" {
+		return http.StatusBadRequest, "InvalidArgument", "Invalid version id specified"
+	}
+	refused := "versionId"
+	if method == http.MethodDelete && query != "tagging&versionId=X" {
+		refused = strings.SplitN(strings.SplitN(query, "&", 2)[0], "=", 2)[0]
+	}
+	return http.StatusNotImplemented, "NotImplemented",
+		"The ?" + refused + " subresource is not supported."
+}
+
+// TestVersionIDWithSubresource checks that ?versionId with a subresource
+// not served with it is refused with 501 NotImplemented, rather than
+// ignored so the request acts on the current object. A GET of
+// ?partNumber with ?versionId is a GetObject of that version's part, so it
+// reads version X, which is not one the server issues.
 func TestVersionIDWithSubresource(t *testing.T) {
 	srv := startLive(t, nil)
 	c := clientFor(srv)
@@ -58,15 +77,9 @@ func TestVersionIDWithSubresource(t *testing.T) {
 			sErr := v4.NewSigner(func(o *v4.SignerOptions) { o.DisableURIPathEscaping = true }).
 				SignHTTP(ctx, testCreds, req, hash, "s3", "us-east-1", time.Now())
 			requireNoErr(t, sErr, "sign request")
-			// DELETE serves neither ?acl nor ?partNumber, so the
-			// refusal names it rather than ?versionId.
-			refused := "versionId"
-			if method == http.MethodDelete && query != "tagging&versionId=X" {
-				refused = strings.SplitN(strings.SplitN(query, "&", 2)[0], "=", 2)[0]
-			}
 			status, e := send(t, srv.Client(), req)
-			requireS3Error(t, status, e, http.StatusNotImplemented, "NotImplemented",
-				"The ?"+refused+" subresource is not supported.")
+			wantStatus, code, message := versionIDRefusal(method, query)
+			requireS3Error(t, status, e, wantStatus, code, message)
 		}
 	}
 

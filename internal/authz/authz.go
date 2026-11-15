@@ -441,7 +441,10 @@ func (c *Caller) Allows(op Operation, t s3api.Target) (bool, error) {
 // storage.ErrObjectNotFound): S3 answers 404 NoSuchKey only to a caller
 // with s3:ListBucket on the bucket, and 403 AccessDenied to any other (the
 // GetObject and HeadObject API references, Permissions), so whether a key
-// exists is not revealed to a caller who could not list it. Any other err
+// exists is not revealed to a caller who could not list it. A missing
+// version (NoSuchVersion) and a current delete marker are decided the
+// same way, by s3:ListBucket: those Permissions sections name only it,
+// never s3:ListBucketVersions, and say nothing of versions. Any other err
 // is returned as is. It is evaluated with the bucket policy the operation
 // was, without reading it again.
 func (c *Caller) NotFound(bucket string, err error) error {

@@ -57,7 +57,7 @@ func (m *Module) listBuckets(ctx gas.Context) error {
 
 // getBucket serves the GET bucket operations: ListObjects, ListObjectsV2
 // (list-type=2), GetBucketLocation, GetBucketVersioning,
-// ListMultipartUploads, GetBucketPolicy, GetBucketPolicyStatus,
+// ListObjectVersions, ListMultipartUploads, GetBucketPolicy, GetBucketPolicyStatus,
 // GetBucketAcl, GetBucketOwnershipControls and the configuration reads of
 // configKinds.
 func (m *Module) getBucket(ctx gas.Context) error {
@@ -96,8 +96,12 @@ func (m *Module) getSubresource(sub string) (func(gas.Context) error, bool) {
 		return func(ctx gas.Context) error { return m.getConfig(ctx, ck) }, true
 	}
 	switch sub {
-	case "location", "versioning":
-		return func(ctx gas.Context) error { return m.getBucketConfig(ctx, sub) }, true
+	case "location":
+		return m.getBucketLocation, true
+	case "versioning":
+		return m.getBucketVersioning, true
+	case "versions":
+		return m.listObjectVersions, true
 	case "uploads":
 		return m.listMultipartUploads, true
 	case "policy":
@@ -112,27 +116,19 @@ func (m *Module) getSubresource(sub string) (func(gas.Context) error, bool) {
 	return nil, false
 }
 
-// getBucketConfig serves GetBucketLocation (sub "location") and
-// GetBucketVersioning (sub "versioning").
-func (m *Module) getBucketConfig(ctx gas.Context, sub string) error {
+// getBucketLocation serves GetBucketLocation.
+func (m *Module) getBucketLocation(ctx gas.Context) error {
 	bucket := ctx.Param("bucket")
 	target := s3api.Target{Bucket: bucket}
 
-	op := authz.GetBucketVersioning
-	if sub == "location" {
-		op = authz.GetBucketLocation
-	}
-	g, err := m.authz.AuthorizeAndPin(ctx, ctx.Request(), op, target)
+	g, err := m.authz.AuthorizeAndPin(ctx, ctx.Request(), authz.GetBucketLocation, target)
 	if err != nil {
 		return s3api.WriteError(ctx, target, err)
 	}
 	g.Release()
-	if sub == "location" {
-		// Every bucket here is in us-east-1, which S3 reports as an empty
-		// constraint.
-		return ctx.XML(http.StatusOK, s3api.NewLocationConstraint(""))
-	}
-	return ctx.XML(http.StatusOK, s3api.NewVersioningConfiguration())
+	// Every bucket here is in us-east-1, which S3 reports as an empty
+	// constraint.
+	return ctx.XML(http.StatusOK, s3api.NewLocationConstraint(""))
 }
 
 // listObjectsV2 serves ListObjectsV2. Continuation tokens are the base64 of the
@@ -331,9 +327,10 @@ func (m *Module) headBucket(ctx gas.Context) error {
 	return nil
 }
 
-// putBucket serves CreateBucket, PutBucketPolicy (?policy), PutBucketAcl
-// (?acl), PutBucketOwnershipControls (?ownershipControls) and the
-// configuration writes of configKinds.
+// putBucket serves CreateBucket, PutBucketPolicy (?policy),
+// PutBucketVersioning (?versioning), PutBucketAcl (?acl),
+// PutBucketOwnershipControls (?ownershipControls) and the configuration
+// writes of configKinds.
 //
 // CreateBucket of an existing bucket answers a principal of the owner's
 // account with BucketAlreadyOwnedByYou, and any other with
@@ -383,6 +380,8 @@ func (m *Module) putSubresource(sub string) (func(gas.Context) error, bool) {
 	switch sub {
 	case "policy":
 		return m.putBucketPolicy, true
+	case "versioning":
+		return m.putBucketVersioning, true
 	case "acl":
 		return m.putBucketACL, true
 	case "ownershipControls":

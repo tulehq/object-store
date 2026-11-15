@@ -57,53 +57,71 @@ func (m *Module) postBucket(ctx gas.Context) error {
 
 	res := s3api.NewDeleteResult()
 	for _, obj := range req.Objects {
-		dErr := m.deleteOne(pinned, caller, bucket, obj)
+		out, dErr := m.deleteOne(pinned, caller, bucket, obj)
 		if dErr == nil {
 			if !req.Quiet {
-				res.Deleted = append(res.Deleted, s3api.DeletedObject{Key: obj.Key})
+				res.Deleted = append(res.Deleted, deleted(obj, out))
 			}
 			continue
 		}
 		s3Err := s3api.ToError(ctx, dErr)
 		res.Errors = append(res.Errors, s3api.DeleteError{
-			Key:     obj.Key,
-			Code:    s3Err.Code,
-			Message: s3Err.Message,
+			Key:       obj.Key,
+			VersionID: obj.VersionID,
+			Code:      s3Err.Code,
+			Message:   s3Err.Message,
 		})
 	}
 
 	return ctx.XML(http.StatusOK, res)
 }
 
-// deleteOne deletes one key of a DeleteObjects request, which is evaluated
-// as s3:DeleteObject on that key alone: a key the caller may not delete is
-// answered with its own entry, AccessDenied with the message "Access
-// Denied", as the DeleteObjects API reference's example shows it.
+// deleted is the Deleted entry of obj, which DeleteObject answered with
+// out, in the shapes of the DeleteObjects API reference's examples: a
+// delete without a version that created a delete marker gives
+// DeleteMarker and DeleteMarkerVersionId; one of a version gives its
+// VersionId, and, when that version was a delete marker, DeleteMarker and
+// DeleteMarkerVersionId, the same ID, too. An Unversioned bucket's gives
+// the key alone.
+func deleted(obj s3api.ObjectIdentifier, out *contracts.DeleteObjectOutput) s3api.DeletedObject {
+	d := s3api.DeletedObject{Key: obj.Key}
+	if obj.VersionID != "" {
+		d.VersionID = out.VersionID
+	}
+	if out.DeleteMarker {
+		d.DeleteMarker, d.DeleteMarkerVersionID = true, out.VersionID
+	}
+	return d
+}
+
+// deleteOne deletes one key of a DeleteObjects request, or the version of
+// it obj names, which is evaluated as DeleteObject is, s3:DeleteObject or
+// s3:DeleteObjectVersion, on that key alone: a key the caller may not
+// delete is answered with its own entry, AccessDenied with the message
+// "Access Denied", as the DeleteObjects API reference's example shows it.
 func (m *Module) deleteOne(
 	ctx context.Context,
 	caller *authz.Caller,
 	bucket string,
 	obj s3api.ObjectIdentifier,
-) error {
-	if obj.VersionID != "" {
-		return s3api.ErrNotImplemented("Deleting a specific object version is not supported.")
-	}
+) (*contracts.DeleteObjectOutput, error) {
+	t := s3api.Target{Bucket: bucket, Key: obj.Key, VersionID: obj.VersionID}
 	//nolint:contextcheck // the policy was read when the bucket was pinned
-	if err := caller.Authorize(authz.DeleteObjects,
-		s3api.Target{Bucket: bucket, Key: obj.Key}); err != nil {
+	if err := caller.Authorize(authz.DeleteObjects, t); err != nil {
 		var s3Err *s3api.Error
 		if errors.As(err, &s3Err) && s3Err.Code == "AccessDenied" {
-			return s3api.NewError(http.StatusForbidden, "AccessDenied", "Access Denied")
+			return nil, s3api.NewError(http.StatusForbidden, "AccessDenied", "Access Denied")
 		}
-		return err
+		return nil, err
 	}
-	if _, err := m.storage.DeleteObject(
+	out, err := m.storage.DeleteObject(
 		ctx,
-		contracts.ObjectRef{Bucket: bucket, Key: obj.Key},
-	); err != nil {
-		return fmt.Errorf("delete %q: %w", obj.Key, err)
+		contracts.ObjectRef{Bucket: bucket, Key: obj.Key, Version: obj.VersionID},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("delete %q: %w", obj.Key, err)
 	}
-	return nil
+	return out, nil
 }
 
 // readDeleteRequest reads and decodes a DeleteObjects document. The whole
