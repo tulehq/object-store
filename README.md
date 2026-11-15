@@ -608,14 +608,16 @@ refused with `400 InvalidArgument`, which bounds the cost of evaluating it.
   Suspended is not supported by v0.10.x and earlier, which do not read the
   versions kept for its keys and would serve stale or missing objects.
   Buckets never versioned stay readable by them.
-- **Fix:** a request naming `?versionId` with a subresource, such as
-  `?tagging&versionId=` or `?acl&versionId=`, acts on the version it
-  names, or answers `501 NotImplemented` where the operation takes no
-  version. It was served against the current object with `?versionId`
-  ignored, so a PutObjectTagging, PutObjectAcl or DeleteObjectTagging meant
-  for one version acted on the current object. Every subresource a request
-  names is checked, so any unserved one with a served one is `501
-  NotImplemented`.
+
+### Changes in v0.10.2
+
+- **Fix:** a request naming `?versionId` with a served subresource, such
+  as `?tagging&versionId=`, `?acl&versionId=` or `?partNumber=1&versionId=`,
+  answers `501 NotImplemented`, as every request with `?versionId` does. It
+  was served against the current object with `?versionId` ignored, so a
+  PutObjectTagging, PutObjectAcl or DeleteObjectTagging meant for one
+  version acted on the current object. Every subresource a request names is
+  checked, so any unserved one with a served one is `501 NotImplemented`.
 
 ### Changes in v0.10.1
 
