@@ -198,7 +198,9 @@ func startAuthzServerWith(
 	if wrap != nil {
 		a.RegisterSingletonService[contracts.StorageProvider](
 			func(c gas.ConfigProvider, l gas.Logger) contracts.StorageProvider {
-				return wrap(dirimpl.NewService(cfg.Storage, contracts.SystemClock)(c, l))
+				return wrap(
+					dirimpl.NewService(cfg.Storage, contracts.SystemClock, dirimpl.Events{})(c, l),
+				)
 			})
 	}
 	if err = a.Start(context.Background()); err != nil {

@@ -93,8 +93,7 @@ func (m *Module) deleteObjectTagging(ctx gas.Context, t s3api.Target) error {
 		return s3api.WriteError(ctx, t, err)
 	}
 	defer g.Release()
-	versionID, err := m.storage.PutObjectTagging(g.Context(), objectRef(t), nil,
-		g.ObjectCheck(t))
+	versionID, err := m.storage.DeleteObjectTagging(g.Context(), objectRef(t), g.ObjectCheck(t))
 	if err != nil {
 		return writeSubresourceError(ctx, t, err)
 	}

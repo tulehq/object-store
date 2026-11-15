@@ -83,7 +83,8 @@ func (s *Service) PutBucketVersioning(
 		return fmt.Errorf("%s: failed to encode the versioning of bucket %s: %w",
 			s.Name(), bucket, err)
 	}
-	if err = s.writeDurable(versioningFile(bucket), raw); err != nil {
+	name := versioningFile(bucket)
+	if err = s.unsynced(name, s.writeDurable(name, raw)); err != nil {
 		return fmt.Errorf("%s: failed to store the versioning of bucket %s: %w",
 			s.Name(), bucket, err)
 	}

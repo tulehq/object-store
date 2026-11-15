@@ -159,6 +159,21 @@ type objectACL struct {
 	grants    []s3api.Grant
 }
 
+// ImplicitACL returns the ACL document of an object of account's buckets
+// without one of its own, encoded as setObjectACL stores a document: the
+// bucket owner with FULL_CONTROL, what storedACL answers for one, and what
+// a canned private ACL sets on it. The storage is given it, so storing it
+// on such an object is no change, and causes no ObjectAcl:Put event.
+func ImplicitACL(account string) ([]byte, error) {
+	owner := s3api.CanonicalUserID(account)
+	doc, err := s3api.Encode(s3api.NewAccessControlPolicy(owner,
+		[]s3api.Grant{s3api.OwnerFullControl(owner)}))
+	if err != nil {
+		return nil, fmt.Errorf("object: encode the implicit ACL: %w", err)
+	}
+	return doc, nil
+}
+
 // storedACL returns the ACL of the object version ref names: its stored
 // ACL's owner and grants, or the bucket owner with FULL_CONTROL for one
 // without, and the version's ID. It is storage.ErrObjectNotFound when

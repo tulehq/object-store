@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -43,9 +44,18 @@ type Service struct {
 	// generation, against the operations pinned to it and the reads of its
 	// policy.
 	bucketLocks bucketLocks
+	// events routes and renders the bucket events s records (see
+	// events.go).
+	events Events
+	// committedMu serializes ConfirmCommitted.
+	committedMu sync.Mutex
+	// leaseMu serializes the writes of the sequence lease, and leased is
+	// the one stored (see leaseSeq).
+	leaseMu sync.Mutex
 	// deleteWait bounds how long DeleteBucket waits for the operations
 	// pinned to its bucket.
 	deleteWait time.Duration
+	leased     atomic.Int64
 	// seq is the last commit sequence nextSeq returned.
 	seq atomic.Int64
 }
@@ -60,12 +70,14 @@ var (
 )
 
 // NewService returns the constructor gas uses to build a Service from
-// settings, which stamps what it stores with clock's time. Settings are
-// bound from the configuration, so clock is an argument of its own. A nil
-// clock panics here, when the service is registered.
+// settings, which stamps what it stores with clock's time and records
+// bucket events with events. Settings are bound from the configuration, so
+// clock and events are arguments of their own. A nil clock panics here,
+// when the service is registered.
 func NewService(
 	settings *Settings,
 	clock contracts.Clock,
+	events Events,
 ) func(config gas.ConfigProvider, logger gas.Logger) *Service {
 	if clock == nil {
 		panic("dirimpl: NewService needs a clock; pass contracts.SystemClock for the system's")
@@ -73,7 +85,7 @@ func NewService(
 	return func(config gas.ConfigProvider, logger gas.Logger) *Service {
 		return &Service{
 			settings: settings, clock: clock, config: config, logger: logger,
-			deleteWait: defaultDeleteWait,
+			deleteWait: defaultDeleteWait, events: events,
 		}
 	}
 }
@@ -99,6 +111,7 @@ func (s *Service) Init(ctx context.Context) (err error) {
 	if err = s.removeOrphanUploads(); err != nil {
 		return fmt.Errorf("%s: %w", s.Name(), errors.Join(err, s.root.Close()))
 	}
+	s.resumeSeq()
 
 	s.dir, err = dir.New(
 		dir.WithRoot(s.root),

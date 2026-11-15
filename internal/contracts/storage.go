@@ -166,12 +166,17 @@ const (
 	// envelope naming the bucket generation it was stored for, which
 	// readers check (see StorageProvider's LifecycleTargets).
 	ConfigLifecycle BucketConfig = "lifecycle"
+	// ConfigNotification is stored as the notification package encodes it:
+	// an envelope naming the bucket generation it was stored for, as
+	// ConfigLifecycle's does, which the storage checks before it records an
+	// event.
+	ConfigNotification BucketConfig = "notification"
 )
 
 // BucketConfigs lists every BucketConfig.
 var BucketConfigs = []BucketConfig{
 	ConfigTagging, ConfigCORS, ConfigPublicAccessBlock, ConfigOwnership, ConfigEncryption,
-	ConfigACL, ConfigLifecycle,
+	ConfigACL, ConfigLifecycle, ConfigNotification,
 }
 
 // MinPartSize is the smallest size S3 allows for every multipart part but the
@@ -194,9 +199,10 @@ const MinRangeCopySource = 5 << 20
 // object, listing, conditional write and multipart operations S3 needs.
 //
 // The operations on a bucket's objects, uploads, listing and policy
-// (everything but ListBuckets, HeadBucket, CreateBucket, DeleteBucket and
-// GetBucketPolicy) require a context Pin returned for that bucket, and
-// fail without one.
+// (everything but ListBuckets, HeadBucket, CreateBucket, DeleteBucket,
+// GetBucketPolicy and the event outbox's PendingEvents, AckEvent,
+// RecoverEvents and ConfirmCommitted) require a context Pin returned for that bucket, and fail
+// without one.
 type StorageProvider interface {
 	ListBuckets(ctx context.Context) ([]BucketInfo, error)
 	ListObjects(ctx context.Context, bucket string, in ListObjectsInput) (*ListObjectsOutput, error)
@@ -336,6 +342,16 @@ type StorageProvider interface {
 		tags []Tag,
 		check ObjectCheck,
 	) (versionID string, err error)
+	// DeleteObjectTagging removes the tags of the version ref names as it
+	// now is, as PutObjectTagging with no tags does, if check passes for
+	// it, and returns that version's ID. It is an operation of its own,
+	// since the event it causes, ObjectTagging:Delete, is not the one of a
+	// PutObjectTagging with an empty tag set, ObjectTagging:Put.
+	DeleteObjectTagging(
+		ctx context.Context,
+		ref ObjectRef,
+		check ObjectCheck,
+	) (versionID string, err error)
 
 	// UploadPartCopy stores as part in.PartNumber of an upload the bytes of
 	// its source object in in.Range, or all of them, if in.Condition holds
@@ -397,6 +413,25 @@ type StorageProvider interface {
 		bucket, key, uploadID string,
 		initiated time.Time,
 	) (*LifecycleAbort, error)
+
+	// PendingEvents returns up to n of the recorded events not yet
+	// acknowledged: each bucket's in the order they were recorded, the
+	// buckets taken in turn.
+	PendingEvents(ctx context.Context, n int) ([]PendingEvent, error)
+	// AckEvent removes the pending event id of bucket, once it was
+	// delivered or dropped. An event already removed is not an error.
+	AckEvent(ctx context.Context, bucket, id string) error
+	// RecoverEvents settles the events a stop left recorded but not
+	// confirmed: an event whose change was committed becomes pending, and
+	// one whose change was not is removed. It runs before the store
+	// serves, so nothing changes what it checks.
+	RecoverEvents(ctx context.Context) (RecoveredEvents, error)
+	// ConfirmCommitted confirms the events whose change was committed but
+	// whose confirm failed, as on a full disk, so they become pending, and
+	// returns how many it did; the others are tried again on the next
+	// call. It is safe while the store serves, and is called after
+	// RecoverEvents and on each poll of the deliverer.
+	ConfirmCommitted(ctx context.Context) (int, error)
 }
 
 // LifecycleAbort is what AbortLifecycleUpload did to an upload.

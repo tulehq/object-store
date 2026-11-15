@@ -217,7 +217,7 @@ func newFixture(t *testing.T) *fixture {
 	}
 	clock := newFakeClock()
 	ctx := context.Background()
-	dir := dirimpl.NewService(&dirimpl.Settings{RootDir: t.TempDir()}, clock)(
+	dir := dirimpl.NewService(&dirimpl.Settings{RootDir: t.TempDir()}, clock, dirimpl.Events{})(
 		cfg, &gas.NopLogger{})
 	if err := dir.Init(ctx); err != nil {
 		t.Fatalf("init storage: %v", err)
