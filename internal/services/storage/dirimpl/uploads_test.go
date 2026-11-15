@@ -27,6 +27,28 @@ func (f *fixture) multipartEntries() []string {
 	return names
 }
 
+// CreateMultipartUpload and ListParts answer the time the upload was
+// initiated, which x-amz-abort-date counts from.
+func TestAnUploadReportsWhenItWasInitiated(t *testing.T) {
+	f, _ := newClockFixture(t)
+	id, initiated, err := f.s.CreateMultipartUpload(f.ctx, "bucket", "k",
+		contracts.PutObjectInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !initiated.Equal(clockStart) {
+		t.Fatalf("initiated at %v, want %v", initiated, clockStart)
+	}
+	up, err := f.s.ListParts(f.ctx, "bucket", "k", id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !up.Initiated.Equal(clockStart) || len(up.Parts) != 0 {
+		t.Fatalf("ListParts answered %v and %v, want %v and no parts",
+			up.Initiated, up.Parts, clockStart)
+	}
+}
+
 // An upload is made under a temporary name and renamed into place with its
 // manifest, so its directory is never seen without one.
 func TestAnUploadIsMadeWithItsManifest(t *testing.T) {

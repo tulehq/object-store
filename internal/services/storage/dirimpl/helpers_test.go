@@ -87,7 +87,7 @@ func (f *fixture) putIn(key, body string, in contracts.PutObjectInput) *contract
 // and parts.
 func (f *fixture) upload(key, body string) (string, []contracts.CompletedPart) {
 	f.t.Helper()
-	id, err := f.s.CreateMultipartUpload(f.ctx, "bucket", key, contracts.PutObjectInput{})
+	id, _, err := f.s.CreateMultipartUpload(f.ctx, "bucket", key, contracts.PutObjectInput{})
 	if err != nil {
 		f.t.Fatal(err)
 	}

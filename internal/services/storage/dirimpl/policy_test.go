@@ -106,7 +106,7 @@ func TestARecreatedBucketIsANewGeneration(t *testing.T) {
 	bg := context.Background()
 	old := ref(t, s, "bucket")
 	ctx, release := pin(t, s)
-	id, err := s.CreateMultipartUpload(ctx, "bucket", "k", contracts.PutObjectInput{})
+	id, _, err := s.CreateMultipartUpload(ctx, "bucket", "k", contracts.PutObjectInput{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,7 +216,7 @@ func TestDeleteBucketNotEmptyIsAnsweredAtOnce(t *testing.T) {
 func TestDeleteBucketRemovesItsUploads(t *testing.T) {
 	s := newTestService(t)
 	ctx, release := pin(t, s)
-	id, err := s.CreateMultipartUpload(ctx, "bucket", "k", contracts.PutObjectInput{})
+	id, _, err := s.CreateMultipartUpload(ctx, "bucket", "k", contracts.PutObjectInput{})
 	if err != nil {
 		t.Fatal(err)
 	}

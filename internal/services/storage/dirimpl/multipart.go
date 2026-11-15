@@ -62,39 +62,40 @@ func partETagFile(id string, n int) string {
 }
 
 // CreateMultipartUpload starts a multipart upload of bucket/key and returns
-// its upload ID. in is applied to the object when the upload completes.
-// ctx must be pinned to bucket.
+// its upload ID and the time it was initiated. in is applied to the object
+// when the upload completes. ctx must be pinned to bucket.
 func (s *Service) CreateMultipartUpload(
 	ctx context.Context,
 	bucket, key string,
 	in contracts.PutObjectInput,
-) (string, error) {
+) (string, time.Time, error) {
 	gen, err := requirePin(ctx, bucket)
 	if err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
 	if _, err = s.HeadBucket(ctx, bucket); err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
 	if err = s.checkKey(key); err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
 
+	initiated := s.now().UTC()
 	manifest, err := json.Marshal(uploadManifest{
 		Bucket:     bucket,
 		Key:        key,
 		Generation: gen,
-		Initiated:  s.now().UTC(),
+		Initiated:  initiated,
 		Put:        in,
 	})
 	if err != nil {
-		return "", fmt.Errorf("%s: create upload %q: %w", s.Name(), key, err)
+		return "", time.Time{}, fmt.Errorf("%s: create upload %q: %w", s.Name(), key, err)
 	}
 	id := rand.Text()
 	if err = s.makeUpload(id, manifest); err != nil {
-		return "", fmt.Errorf("%s: create upload %q: %w", s.Name(), key, err)
+		return "", time.Time{}, fmt.Errorf("%s: create upload %q: %w", s.Name(), key, err)
 	}
-	return id, nil
+	return id, initiated, nil
 }
 
 // uploadTempPrefix starts the name of an upload directory being made,
@@ -584,12 +585,14 @@ func (s *Service) removeUpload(id string) (bool, error) {
 	return true, s.root.RemoveAll(uploadDir(id))
 }
 
-// ListParts returns the uploaded parts of an upload, in part number order.
+// ListParts returns the time an upload was initiated and its uploaded
+// parts, in part number order.
 func (s *Service) ListParts(
 	ctx context.Context,
 	bucket, key, uploadID string,
-) ([]contracts.PartInfo, error) {
-	if _, err := s.loadUpload(ctx, bucket, key, uploadID); err != nil {
+) (*contracts.UploadParts, error) {
+	m, err := s.loadUpload(ctx, bucket, key, uploadID)
+	if err != nil {
 		return nil, err
 	}
 
@@ -626,7 +629,7 @@ func (s *Service) ListParts(
 		})
 	}
 
-	return parts, nil
+	return &contracts.UploadParts{Initiated: m.Initiated, Parts: parts}, nil
 }
 
 // removeUploads removes the uploads into bucket of generation gen, which

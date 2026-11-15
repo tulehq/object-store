@@ -691,7 +691,7 @@ func (f *fixture) createUpload(key string) contracts.UploadInfo {
 	f.t.Helper()
 	ctx, release := f.pin("bucket")
 	defer release()
-	id, err := f.dir.CreateMultipartUpload(ctx, "bucket", key, contracts.PutObjectInput{})
+	id, _, err := f.dir.CreateMultipartUpload(ctx, "bucket", key, contracts.PutObjectInput{})
 	if err != nil {
 		f.t.Fatalf("create upload %s: %v", key, err)
 	}

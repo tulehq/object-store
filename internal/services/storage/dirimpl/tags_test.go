@@ -148,14 +148,18 @@ func TestTagsOfCopiesAndUploads(t *testing.T) {
 	} {
 		tt.in.SrcBucket, tt.in.SrcKey, tt.in.DstBucket, tt.in.DstKey = "bucket", "src",
 			"bucket", "dst"
-		if _, err := s.CopyObject(ctx, tt.in); err != nil {
+		out, err := s.CopyObject(ctx, tt.in)
+		if err != nil {
 			t.Fatal(err)
 		}
 		requireTags(t, s, ctx, "dst", tt.want, "a copy")
+		if !slices.Equal(out.Tags, tt.want) {
+			t.Fatalf("a copy returned tags %v, want %v", out.Tags, tt.want)
+		}
 	}
 
 	for _, tags := range [][]contracts.Tag{testTags, nil} {
-		id, cErr := s.CreateMultipartUpload(ctx, "bucket", "src", contracts.PutObjectInput{
+		id, _, cErr := s.CreateMultipartUpload(ctx, "bucket", "src", contracts.PutObjectInput{
 			Tags: tags,
 		})
 		if cErr != nil {
@@ -165,12 +169,33 @@ func TestTagsOfCopiesAndUploads(t *testing.T) {
 		if uErr != nil {
 			t.Fatal(uErr)
 		}
-		if _, err := s.CompleteMultipartUpload(ctx, "bucket", "src", id,
+		info, err := s.CompleteMultipartUpload(ctx, "bucket", "src", id,
 			[]contracts.CompletedPart{{PartNumber: 1, ETag: etag}},
-			contracts.Precondition{}); err != nil {
+			contracts.Precondition{})
+		if err != nil {
 			t.Fatal(err)
 		}
 		requireTags(t, s, ctx, "src", tags, "a completed upload")
+		if !slices.Equal(info.Tags, tags) {
+			t.Fatalf("a completed upload returned tags %v, want %v", info.Tags, tags)
+		}
+	}
+}
+
+// A write returns the tags it wrote the object with, in place and as a
+// version alike.
+func TestAWriteReturnsItsTags(t *testing.T) {
+	for _, st := range []contracts.Versioning{
+		contracts.Unversioned, contracts.VersioningEnabled, contracts.VersioningSuspended,
+	} {
+		f := newFixture(t)
+		if st != contracts.Unversioned {
+			f.state(st)
+		}
+		info := f.putIn("k", "x", contracts.PutObjectInput{Tags: testTags})
+		if !slices.Equal(info.Tags, testTags) {
+			t.Fatalf("%s: a put returned tags %v, want %v", st, info.Tags, testTags)
+		}
 	}
 }
 
@@ -306,9 +331,9 @@ func TestACopysCheckSeesTheSourceOpened(t *testing.T) {
 	_, err = s.UploadPartCopy(ctx, part)
 	requireIs(t, "a stopped part copy", err, errStop)
 	rec.requireSeen(t, "UploadPartCopy")
-	parts, err := s.ListParts(ctx, "bucket", "dst", part.UploadID)
-	if err != nil || len(parts) != 0 {
-		t.Fatalf("the stopped part copy stored %v, %v", parts, err)
+	up, err := s.ListParts(ctx, "bucket", "dst", part.UploadID)
+	if err != nil || len(up.Parts) != 0 {
+		t.Fatalf("the stopped part copy stored %v, %v", up, err)
 	}
 }
 
@@ -494,7 +519,7 @@ func copySource(
 	if err != nil {
 		t.Fatal(err)
 	}
-	id, err := s.CreateMultipartUpload(ctx, "bucket", "dst", contracts.PutObjectInput{
+	id, _, err := s.CreateMultipartUpload(ctx, "bucket", "dst", contracts.PutObjectInput{
 		Headers: map[string]string{"X-Amz-Server-Side-Encryption": "AES256"},
 	})
 	if err != nil {

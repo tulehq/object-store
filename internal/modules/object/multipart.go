@@ -59,7 +59,7 @@ func (m *Module) createMultipartUpload(ctx gas.Context, t s3api.Target) error {
 	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
-	id, err := m.storage.CreateMultipartUpload(
+	id, initiated, err := m.storage.CreateMultipartUpload(
 		g.Context(),
 		t.Bucket,
 		t.Key,
@@ -70,6 +70,7 @@ func (m *Module) createMultipartUpload(ctx gas.Context, t s3api.Target) error {
 	}
 
 	setEncryptionHeaders(ctx.ResponseWriter(), ws.encryption)
+	setAbortDate(ctx.ResponseWriter(), ws.lifecycle, t.Key, initiated)
 	return ctx.XML(http.StatusOK, s3api.NewInitiateMultipartUploadResult(t.Bucket, t.Key, id))
 }
 
@@ -242,12 +243,19 @@ func (m *Module) completeMultipartUpload(ctx gas.Context, t s3api.Target, upload
 		return s3api.WriteError(ctx, t, err)
 	}
 	defer release()
+	// Read before the upload completes, so a failure to read it fails no
+	// write that happened.
+	cfg, err := m.lifecycleConfig(pinned, caller, t.Bucket)
+	if err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
 	info, err := m.storage.CompleteMultipartUpload(pinned, t.Bucket, t.Key, uploadID, parts, cond)
 	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
 	setVersionHeader(ctx.ResponseWriter(), info.VersionID)
 	setEncryptionHeaders(ctx.ResponseWriter(), encryptionOf(info.Headers))
+	setExpiration(ctx.ResponseWriter(), cfg, info)
 
 	return ctx.XML(http.StatusOK, s3api.NewCompleteMultipartUploadResult(
 		objectURL(r, t), t.Bucket, t.Key, info.ETag))
@@ -286,7 +294,11 @@ func (m *Module) listParts(ctx gas.Context, t s3api.Target) error {
 		return s3api.WriteError(ctx, t, err)
 	}
 
-	parts, err := m.storage.ListParts(g.Context(), t.Bucket, t.Key, uploadID)
+	cfg, err := m.lifecycleConfig(g.Context(), g.Caller(), t.Bucket)
+	if err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
+	up, err := m.storage.ListParts(g.Context(), t.Bucket, t.Key, uploadID)
 	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
@@ -297,7 +309,7 @@ func (m *Module) listParts(ctx gas.Context, t s3api.Target) error {
 	res.PartNumberMarker = marker
 	res.MaxParts = maxParts
 
-	for _, p := range parts {
+	for _, p := range up.Parts {
 		if p.PartNumber <= marker {
 			continue
 		}
@@ -316,6 +328,7 @@ func (m *Module) listParts(ctx gas.Context, t s3api.Target) error {
 		res.NextPartNumberMarker = res.Parts[len(res.Parts)-1].PartNumber
 	}
 
+	setAbortDate(ctx.ResponseWriter(), cfg, t.Key, up.Initiated)
 	return ctx.XML(http.StatusOK, res)
 }
 

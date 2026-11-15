@@ -13,6 +13,7 @@ import (
 
 	"tule.dev/object-store/internal/authz"
 	"tule.dev/object-store/internal/contracts"
+	"tule.dev/object-store/internal/lifecycle"
 	"tule.dev/object-store/internal/s3api"
 )
 
@@ -52,6 +53,10 @@ func (m *Module) getObject(ctx gas.Context) error {
 	}
 	defer g.Release()
 
+	cfg, err := m.lifecycleConfig(g.Context(), g.Caller(), t.Bucket)
+	if err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
 	obj, err := m.storage.GetObject(g.Context(), objectRef(t))
 	// The object is open, and its body is the backend's open data file,
 	// which "keeps reading the contents it opened when the object is
@@ -67,7 +72,7 @@ func (m *Module) getObject(ctx gas.Context) error {
 			m.logger.Warn("failed to close object body").Err("error", cErr).Send()
 		}
 	}()
-	return m.serveObject(ctx, g.Caller(), t, obj)
+	return m.serveObject(ctx, g.Caller(), t, obj, cfg)
 }
 
 // getSubresource returns the handler of the GET object operation other
@@ -99,12 +104,15 @@ func subresourceTarget(r *http.Request, t s3api.Target, sub string) (s3api.Targe
 }
 
 // serveObject answers caller's GetObject of t with obj, open, if it is
-// the object the request was evaluated for (authz.CheckObject).
+// the object the request was evaluated for (authz.CheckObject), with
+// x-amz-expiration by cfg, the bucket's lifecycle configuration, when obj
+// is its key's current version.
 func (m *Module) serveObject(
 	ctx gas.Context,
 	caller *authz.Caller,
 	t s3api.Target,
 	obj *contracts.Object,
+	cfg *lifecycle.Configuration,
 ) error {
 	r := ctx.Request()
 	w := ctx.ResponseWriter()
@@ -132,6 +140,7 @@ func (m *Module) serveObject(
 	}
 
 	setObjectHeaders(w, info)
+	setReadExpiration(w, cfg, info)
 	applyResponseOverrides(w, r)
 	http.ServeContent(w, serve, "", info.LastModified, rs)
 	return nil
@@ -151,6 +160,10 @@ func (m *Module) headObject(ctx gas.Context) error {
 	}
 	defer g.Release()
 
+	cfg, err := m.lifecycleConfig(g.Context(), g.Caller(), t.Bucket)
+	if err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
 	// The object is opened, rather than stated, to read its tags with it.
 	obj, err := m.storage.GetObject(g.Context(), objectRef(t))
 	if err != nil {
@@ -173,6 +186,7 @@ func (m *Module) headObject(ctx gas.Context) error {
 		return s3api.WriteError(ctx, t, err)
 	}
 	setObjectHeaders(w, info)
+	setReadExpiration(w, cfg, info)
 
 	if v := r.URL.Query().Get("partNumber"); v != "" {
 		return m.headPart(ctx, t, info, v)
@@ -297,6 +311,7 @@ func (m *Module) uploadObject(ctx gas.Context, t s3api.Target) error {
 	}
 	setVersionHeader(ctx.ResponseWriter(), info.VersionID)
 	setEncryptionHeaders(ctx.ResponseWriter(), ws.encryption)
+	setExpiration(ctx.ResponseWriter(), ws.lifecycle, info)
 	ctx.ResponseWriter().WriteHeader(http.StatusOK)
 	return nil
 }
@@ -364,6 +379,7 @@ func (m *Module) copyObject(ctx gas.Context, t s3api.Target) error {
 	setVersionHeader(ctx.ResponseWriter(), info.VersionID)
 	setCopySourceVersionHeader(ctx.ResponseWriter(), out.SourceVersionID)
 	setEncryptionHeaders(ctx.ResponseWriter(), ws.encryption)
+	setExpiration(ctx.ResponseWriter(), ws.lifecycle, info)
 	return ctx.XML(http.StatusOK, s3api.NewCopyObjectResult(info.ETag, info.LastModified))
 }
 

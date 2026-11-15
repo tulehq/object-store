@@ -11,6 +11,7 @@ import (
 
 	"tule.dev/object-store/internal/authz"
 	"tule.dev/object-store/internal/contracts"
+	"tule.dev/object-store/internal/lifecycle"
 	"tule.dev/object-store/internal/s3api"
 )
 
@@ -20,19 +21,23 @@ const maxACLDocument = 64 * 1024
 
 // writeSettings is what a write needs from its bucket's configuration and
 // its request beyond the object: the ACL to store with the object, nil for
-// none, the encryption headers it is stored and answered with, and the
-// tags of its x-amz-tagging header.
+// none, the encryption headers it is stored and answered with, the tags of
+// its x-amz-tagging header, and the bucket's lifecycle configuration, nil
+// for none, which its lifecycle headers are answered by.
 type writeSettings struct {
 	encryption map[string]string
+	lifecycle  *lifecycle.Configuration
 	acl        []byte
 	tags       []contracts.Tag
 }
 
-// settings reads the ACL, encryption and, with readTags, tags of a
-// PutObject, CopyObject or CreateMultipartUpload request r by caller to
-// bucket, ctx being pinned to it. The ACL is checked as writeACL
-// describes; the encryption is r's or the bucket's default
-// (s3api.EncryptionHeaders); the tags are s3api.RequestTags', and none
+// settings reads the ACL, encryption, lifecycle configuration and, with
+// readTags, tags of a PutObject, CopyObject or CreateMultipartUpload
+// request r by caller to bucket, ctx being pinned to it. The ACL is
+// checked as writeACL describes; the encryption is r's or the bucket's
+// default (s3api.EncryptionHeaders); the lifecycle configuration is
+// lifecycleConfig's, read before the write, so a failure to read it fails
+// no write that happened; the tags are s3api.RequestTags', and none
 // without readTags.
 func (m *Module) settings(
 	ctx context.Context,
@@ -53,7 +58,11 @@ func (m *Module) settings(
 	if err != nil {
 		return nil, err //nolint:wrapcheck // an S3 error, answered as is
 	}
-	ws := &writeSettings{encryption: enc, acl: acl}
+	cfg, err := m.lifecycleConfig(ctx, caller, bucket)
+	if err != nil {
+		return nil, err
+	}
+	ws := &writeSettings{encryption: enc, lifecycle: cfg, acl: acl}
 	if readTags {
 		if ws.tags, err = s3api.RequestTags(r); err != nil {
 			return nil, err //nolint:wrapcheck // an S3 error, answered as is
