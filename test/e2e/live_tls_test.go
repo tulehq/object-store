@@ -22,8 +22,8 @@ import (
 // startLiveTLS starts the app as startLive does, behind a TLS-terminating
 // listener that relays each connection's bytes unchanged to the app's
 // plain-HTTP server, as a TLS-terminating load balancer in front of a
-// deployment would. gas serves plain HTTP only (App.Serve calls
-// ListenAndServe), so this is how object-store is reached over TLS.
+// deployment would. object-store sets no certificate on its server, so it
+// serves plain HTTP, and this is how it is reached over TLS.
 //
 // The returned server's URL and Addr are the terminator's, and its Client
 // trusts the terminator's self-signed certificate.

@@ -5,8 +5,8 @@ package e2e
 import (
 	"context"
 	"io"
+	"net"
 	"net/http"
-	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -22,8 +22,8 @@ import (
 )
 
 // liveServer is object-store run as the binary runs it: the app's own
-// HTTP server (App.Serve) listening on a free port, called over the
-// network.
+// HTTP server, served through gas's lifecycle (App.ServeListener) on a
+// listener bound to a free port, called over the network.
 type liveServer struct {
 	httpClient *http.Client
 	// stop stops the server, once; the test's end calls it too.
@@ -67,7 +67,6 @@ func startLive(t *testing.T, env map[string]string) *liveServer {
 func startLiveWith(t *testing.T, env map[string]string, opts liveOptions) *liveServer {
 	t.Helper()
 
-	port := freePort(t)
 	root := opts.root
 	if root == "" {
 		root = t.TempDir()
@@ -76,7 +75,6 @@ func startLiveWith(t *testing.T, env map[string]string, opts liveOptions) *liveS
 	t.Setenv("TULE_Storage_RootDir", root)
 	t.Setenv("TULE_Auth_AccessKeyID", "test")
 	t.Setenv("TULE_Auth_SecretAccessKey", "test")
-	t.Setenv("TULE_Server_Port", strconv.Itoa(port))
 	for k, v := range env {
 		t.Setenv(k, v)
 	}
@@ -94,8 +92,15 @@ func startLiveWith(t *testing.T, env map[string]string, opts liveOptions) *liveS
 	requireNoErr(t, err, "new app")
 	requireNoErr(t, a.Start(context.Background()), "start app")
 
+	// The listener is bound here and served as it is, so no port is picked
+	// and released for another process to take first.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v (stop: %v)", err, a.Stop(context.Background()))
+	}
+
 	served := make(chan error, 1)
-	go func() { served <- a.Serve() }()
+	go func() { served <- a.ServeListener(ln) }()
 	var stopOnce sync.Once
 	stop := func() {
 		stopOnce.Do(func() {
@@ -109,7 +114,7 @@ func startLiveWith(t *testing.T, env map[string]string, opts liveOptions) *liveS
 	}
 	t.Cleanup(stop)
 
-	addr := "127.0.0.1:" + strconv.Itoa(port)
+	addr := ln.Addr().String()
 	tr := &http.Transport{}
 	t.Cleanup(tr.CloseIdleConnections)
 	l := &liveServer{

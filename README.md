@@ -610,6 +610,13 @@ refused with `400 InvalidArgument`, which bounds the cost of evaluating it.
 
 ### Changes in this version
 
+- **Behavior:** the `server started` log is written once the port is
+  bound, and its `addr` is the bound address (such as `[::]:9000`) where it
+  was the configured one (`:9000`); it also has a `tls` field. A port that
+  cannot be bound is no longer logged as started (gas v0.10.0).
+
+### Changes in v0.13.0
+
 - **Behavior:** bucket notification configuration is served
   ([Event notifications](#event-notifications)):
   PutBucketNotificationConfiguration and
