@@ -58,8 +58,8 @@ func (m *Module) listBuckets(ctx gas.Context) error {
 // getBucket serves the GET bucket operations: ListObjects, ListObjectsV2
 // (list-type=2), GetBucketLocation, GetBucketVersioning,
 // ListObjectVersions, ListMultipartUploads, GetBucketPolicy, GetBucketPolicyStatus,
-// GetBucketAcl, GetBucketOwnershipControls and the configuration reads of
-// configKinds.
+// GetBucketAcl, GetBucketOwnershipControls, GetBucketLifecycleConfiguration
+// and the configuration reads of configKinds.
 func (m *Module) getBucket(ctx gas.Context) error {
 	bucket := ctx.Param("bucket")
 	target := s3api.Target{Bucket: bucket}
@@ -104,6 +104,15 @@ func (m *Module) getSubresource(sub string) (func(gas.Context) error, bool) {
 		return m.listObjectVersions, true
 	case "uploads":
 		return m.listMultipartUploads, true
+	}
+	return m.getConfigSubresource(sub)
+}
+
+// getConfigSubresource returns the handler of the GET bucket operation
+// sub names among those reading a bucket's policy, ACL, Object Ownership
+// or lifecycle configuration, false for none of them.
+func (m *Module) getConfigSubresource(sub string) (func(gas.Context) error, bool) {
+	switch sub {
 	case "policy":
 		return m.getBucketPolicy, true
 	case "policyStatus":
@@ -112,6 +121,8 @@ func (m *Module) getSubresource(sub string) (func(gas.Context) error, bool) {
 		return m.getBucketACL, true
 	case "ownershipControls":
 		return m.getBucketOwnershipControls, true
+	case "lifecycle":
+		return m.getBucketLifecycle, true
 	}
 	return nil, false
 }
@@ -329,7 +340,8 @@ func (m *Module) headBucket(ctx gas.Context) error {
 
 // putBucket serves CreateBucket, PutBucketPolicy (?policy),
 // PutBucketVersioning (?versioning), PutBucketAcl (?acl),
-// PutBucketOwnershipControls (?ownershipControls) and the configuration
+// PutBucketOwnershipControls (?ownershipControls),
+// PutBucketLifecycleConfiguration (?lifecycle) and the configuration
 // writes of configKinds.
 //
 // CreateBucket of an existing bucket answers a principal of the owner's
@@ -386,13 +398,15 @@ func (m *Module) putSubresource(sub string) (func(gas.Context) error, bool) {
 		return m.putBucketACL, true
 	case "ownershipControls":
 		return m.putBucketOwnershipControls, true
+	case "lifecycle":
+		return m.putBucketLifecycle, true
 	}
 	return nil, false
 }
 
 // deleteBucket serves DeleteBucket, DeleteBucketPolicy (?policy),
-// DeleteBucketOwnershipControls (?ownershipControls) and the
-// configuration deletes of configKinds.
+// DeleteBucketOwnershipControls (?ownershipControls), DeleteBucketLifecycle
+// (?lifecycle) and the configuration deletes of configKinds.
 func (m *Module) deleteBucket(ctx gas.Context) error {
 	bucket := ctx.Param("bucket")
 
@@ -408,6 +422,8 @@ func (m *Module) deleteBucket(ctx gas.Context) error {
 		return m.deleteBucketPolicy(ctx)
 	case "ownershipControls":
 		return m.deleteBucketOwnershipControls(ctx)
+	case "lifecycle":
+		return m.deleteBucketLifecycle(ctx)
 	}
 	if err := s3api.CheckSubresource(ctx.Request()); err != nil {
 		return s3api.WriteError(ctx, s3api.Target{Bucket: bucket}, err)

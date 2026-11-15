@@ -237,10 +237,10 @@ func TestUnsupportedSubresources(t *testing.T) {
 	_, body := get(t, c, &s3.GetObjectInput{Bucket: bucket, Key: key})
 	requireEqual(t, string(body), "original", "object untouched by retention request")
 
-	_, err = c.DeleteBucketLifecycle(ctx, &s3.DeleteBucketLifecycleInput{Bucket: bucket})
+	_, err = c.DeleteBucketWebsite(ctx, &s3.DeleteBucketWebsiteInput{Bucket: bucket})
 	requireCode(t, err, "NotImplemented")
 	_, err = c.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: bucket})
-	requireNoErr(t, err, "bucket survives delete-lifecycle request")
+	requireNoErr(t, err, "bucket survives delete-website request")
 
 	_, err = c.GetObjectLegalHold(ctx, &s3.GetObjectLegalHoldInput{Bucket: bucket, Key: key})
 	requireCode(t, err, "NotImplemented")
