@@ -187,8 +187,10 @@ func scanNames(entries []fs.DirEntry, cursor string, n int) ([]string, bool) {
 // lists are removed, the current version is expired as DeleteObject
 // without a version does, with the plan's marker time, and a delete
 // marker left as the key's only version is removed if d says so; all in
-// one commit, after which the data of what was removed is. ctx must be
-// pinned to bucket.
+// one commit, after which the data of what was removed is. Each action
+// records the event S3 sends for it, as lifecycle's own (see
+// lifecycleEvents), whatever source ctx carries. ctx must be pinned to
+// bucket.
 func (s *Service) ApplyLifecycle(
 	ctx context.Context,
 	bucket, key string,
@@ -260,14 +262,30 @@ func (s *Service) applyUnversioned(
 	if plan.ExpireCurrentRule == "" {
 		return out, nil
 	}
-	if err = s.deleteLegacy(ctx, bucket, key); err != nil {
-		return nil, err
-	}
-	if err = s.at(stageCommitted); err != nil {
+	if err = s.expireLegacy(ctx, bucket, key, e); err != nil {
 		return nil, err
 	}
 	out.Deleted = []contracts.LifecycleDeletion{{RuleID: plan.ExpireCurrentRule}}
 	return out, nil
+}
+
+// expireLegacy deletes key, a key without a manifest whose object is e,
+// as lifecycle expires it in an Unversioned bucket, recording its
+// LifecycleExpiration:Delete. The caller holds the key's lock.
+func (s *Service) expireLegacy(ctx context.Context, bucket, key string, e *versionEntry) error {
+	p, err := s.event(lifecycleContext(ctx), contracts.BucketEvent{
+		Name: contracts.EventLifecycleExpirationDelete, Bucket: bucket, Key: key, Time: s.now(),
+	}, func(ev *contracts.BucketEvent) (witness, bool, error) {
+		ev.Sequence = s.nextSeq(e.Seq)
+		return witness{Kind: witnessGone}, true, nil
+	})
+	if err != nil {
+		return err
+	}
+	if err = s.deleteLegacy(ctx, bucket, key); err != nil {
+		return errors.Join(err, p.settle(ctx))
+	}
+	return s.committed(p, nil)
 }
 
 // applyVersioned is ApplyLifecycle in a bucket of versioning state st, not
@@ -420,8 +438,10 @@ func (s *Service) removeSoleMarker(
 
 // commitLifecycle commits m, changed as a records, if anything changed:
 // as the key's manifest, or when it lists no version left, by removing it
-// (see dropVersions). Then it removes the data of the entries removed,
-// logging a failure (see warnAfterCommit). The caller holds the key's lock.
+// (see dropVersions), with the intents of its events written first and
+// confirmed after (see lifecycleEvents). Then it removes the data of the
+// entries removed, logging a failure (see warnAfterCommit). The caller
+// holds the key's lock.
 func (s *Service) commitLifecycle(
 	ctx context.Context,
 	bucket string,
@@ -431,18 +451,22 @@ func (s *Service) commitLifecycle(
 	if !a.changed() {
 		return nil
 	}
+	ps, err := s.lifecycleEvents(ctx, bucket, m, a)
+	if err != nil {
+		return err
+	}
 	removed := a.removed
 	if len(m.Versions) == 0 {
 		last := removed[len(removed)-1]
 		removed = removed[:len(removed)-1]
-		if err := s.dropVersions(ctx, bucket, m.Key, &last, nil); err != nil {
+		if err = s.dropVersions(ctx, bucket, m.Key, &last, ps...); err != nil {
 			return err
 		}
 	} else {
-		if err := s.commit(bucket, m, false); err != nil {
-			return err
+		if err = s.commit(bucket, m, false); err != nil {
+			return errors.Join(err, settleAll(ctx, ps))
 		}
-		if err := s.at(stageCommitted); err != nil {
+		if err = s.committedAll(ps); err != nil {
 			return err
 		}
 	}
@@ -451,6 +475,85 @@ func (s *Service) commitLifecycle(
 			s.collect(ctx, bucket, m.Key, &removed[i]))
 	}
 	return nil
+}
+
+// lifecycleEvents records the intents of the events of a, the change of
+// m, the manifest of key m.Key, about to be committed, and returns them in
+// the order of its actions, nil ones for none: a
+// LifecycleExpiration:Delete for each version or marker removed, in the
+// order removed, then a LifecycleExpiration:DeleteMarkerCreated for the
+// marker added, if one was. Each takes a fresh sequence, greater than
+// every one m held and than the one before it, and its own source (see
+// lifecycleContext). A removal's witness is that its entry is gone, but
+// for one whose ID the added marker has, the null version a null marker
+// replaced, whose witness is the marker's: both are in the one commit.
+// The error is only the stageEventIntent hook's. The caller holds the
+// key's lock.
+func (s *Service) lifecycleEvents(
+	ctx context.Context,
+	bucket string,
+	m *versionManifest,
+	a *lifecycleChange,
+) ([]*pendingEvent, error) {
+	var floor int64
+	for _, v := range slices.Concat(m.Versions, a.removed) {
+		floor = max(floor, v.Seq)
+	}
+	var marker witness
+	if a.out.MarkerID != "" {
+		// applyPlan adds the marker to m, and removeSoleMarker never
+		// removes a marker this change added, so m holds it. Were it gone,
+		// its events would have no witness RecoverEvents could check: the
+		// change is refused before any intent is written.
+		i := m.find(a.out.MarkerID)
+		if i < 0 {
+			return nil, fmt.Errorf("%s: lifecycle of %q: the marker %s it adds is not in the "+
+				"manifest", s.Name(), m.Key, a.out.MarkerID)
+		}
+		marker = witness{Kind: witnessEntry, VersionID: a.out.MarkerID, Seq: m.Versions[i].Seq}
+	}
+	at := s.now()
+	record := func(name contracts.EventName, id string, w witness) (*pendingEvent, error) {
+		return s.event(lifecycleContext(ctx), contracts.BucketEvent{
+			Name: name, Bucket: bucket, Key: m.Key, Time: at, VersionID: id,
+		}, func(ev *contracts.BucketEvent) (witness, bool, error) {
+			ev.Sequence = s.nextSeq(floor)
+			return w, true, nil
+		})
+	}
+	ps := make([]*pendingEvent, 0, len(a.removed)+1)
+	for _, e := range a.removed {
+		w := witness{Kind: witnessNoEntry, VersionID: e.ID}
+		if a.out.MarkerID != "" && e.ID == a.out.MarkerID {
+			w = marker
+		}
+		p, err := record(contracts.EventLifecycleExpirationDelete, e.ID, w)
+		if err != nil {
+			return nil, err
+		}
+		ps = append(ps, p)
+	}
+	if a.out.MarkerID != "" {
+		p, err := record(contracts.EventLifecycleExpirationDeleteMarkerCreated, a.out.MarkerID,
+			marker)
+		if err != nil {
+			return nil, err
+		}
+		ps = append(ps, p)
+	}
+	return ps, nil
+}
+
+// lifecycleContext returns ctx carrying the source of an event lifecycle
+// rules cause: contracts.LifecyclePrincipal, and a request and host ID
+// pair of its own, which no response carries.
+func lifecycleContext(ctx context.Context) context.Context {
+	return contracts.WithEventSource(ctx, contracts.EventSource{
+		PrincipalID: contracts.LifecyclePrincipal,
+		SourceIP:    contracts.LifecyclePrincipal,
+		RequestID:   contracts.NewRequestID(),
+		HostID:      contracts.NewHostID(),
+	})
 }
 
 // lifecycleVersion returns e, a version of key reported as id, as lifecycle
@@ -509,9 +612,11 @@ func (s *Service) versionTags(
 // interleave with a completion in place, which reads the parts under it,
 // if it still is the upload initiated at initiated. It only tries the
 // lock, as ApplyLifecycle does, so a write holding it does not stall it:
-// the upload is then reported Busy. Aborted is set also with an error when
-// the upload is gone but its parts could not all be removed. ctx must be
-// pinned to bucket.
+// the upload is then reported Busy. It records no event: S3 has no event
+// type for an aborted upload (S3 User Guide, "Event notification types
+// and destinations"). Aborted is set
+// also with an error when the upload is gone but its parts could not all
+// be removed. ctx must be pinned to bucket.
 func (s *Service) AbortLifecycleUpload(
 	ctx context.Context,
 	bucket, key, uploadID string,

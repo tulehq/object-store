@@ -617,7 +617,8 @@ refused with `400 InvalidArgument`, which bounds the cost of evaluating it.
   PutBucketNotification and GetBucketNotification, which answered
   `501 NotImplemented`. They are evaluated as `s3:PutBucketNotification`
   and `s3:GetBucketNotification`. The events are delivered to queues
-  and functions ([Delivery](#delivery)).
+  and functions ([Delivery](#delivery)). Lifecycle expirations send the
+  `LifecycleExpiration` events ([Lifecycle events](#lifecycle-events)).
 - **Data directory:** events are recorded under `.tule/events/` and a
   write that records one adds `writeId` to its object's trailer, which
   v0.12.0 ignores; nothing is written for a bucket without a
@@ -1880,7 +1881,8 @@ request that fails or is refused, a precondition failure included:
 
 `versionId` is there whenever the bucket is not Unversioned, with the
 value of the response's `x-amz-version-id`. Lifecycle expirations send
-no event in this version. The other event types a configuration accepts
+the `LifecycleExpiration` events ([Lifecycle events](#lifecycle-events)).
+The other event types a configuration accepts
 (restore, replication, reduced redundancy, Intelligent-Tiering, object
 annotation and retention, `ObjectCreated:Post`, `LifecycleTransition`)
 never fire, as their features are not served. Overlapping configurations
@@ -1921,7 +1923,8 @@ chooses:
 | # | Case | Choice |
 |---|---|---|
 | N1 | `eventVersion` of each event type | `2.6` for all ("Starting with version 2.4, Amazon S3 uses a single unified version for all event types") |
-| N2 | `userIdentity.principalId` | The principal's unique ID, as `aws:userid` is (`AIDA...` for a user, `AROA...:<session>` for a role session), or the account ID for the root key; no `AWS:` prefix, as the User Guide's example has none |
+| N2 | `userIdentity.principalId` | The principal's unique ID, as `aws:userid` is (`AIDA...` for a user, `AROA...:<session>` for a role session), or the account ID for the root key; `s3.amazonaws.com` for a lifecycle event ([Lifecycle events](#lifecycle-events)); no `AWS:` prefix, as the User Guide's example has none |
+| N3 | `requestParameters.sourceIPAddress` of a lifecycle event, which no request causes | `s3.amazonaws.com` |
 | N4 | `ownerIdentity.principalId`, which the User Guide calls no longer used | A fixed ID per account: `A` and the first 13 characters of the base32 of the SHA-256 of `tule:<account>` |
 | N5 | The URL encoding of `key` beyond a space written `+` | Each `/`-separated segment form-encoded as Go's `url.QueryEscape` does, `/` kept: `a b/c+d=e.txt` is `a+b/c%2Bd%3De.txt`. `*` is `%2A` and `~` is kept, which S3 may write differently |
 | N6 | Whether filters match the key or its encoding | The encoding, since filter values must write a space `+` and other special characters URL-encoded |
@@ -1929,6 +1932,7 @@ chooses:
 | N8 | `versionId` when Unversioned or Suspended | Left out when Unversioned; `null` for the null version when Suspended |
 | N9 | A delete of a key or version that does not exist | No event |
 | N10 | A Suspended delete without a version ID, which replaces the null version | One `ObjectRemoved:DeleteMarkerCreated` |
+| N11 | A delete marker left as its key's only version, which lifecycle removes | One `LifecycleExpiration:Delete` with the marker's `versionId` |
 | N12 | Overlap across destination types | Refused as within one type ([The configuration document](#the-configuration-document)) |
 | N16 | A limit on the number of configurations | None; the document is at most 1 MiB |
 | N17 | Retries and giving up | [Delivery](#delivery) |
@@ -1990,6 +1994,43 @@ Notifications"). Here:
   after the next start, a duplicate S3 allows ("On rare occasions ...
   duplicate S3 Event Notifications"). A duplicate has the same
   `sequencer`.
+
+### Lifecycle events
+
+What lifecycle rules ([Lifecycle](#lifecycle)) do to a key records the
+events S3 sends for it: "The `s3:LifecycleExpiration:Delete` event type
+notifies you when an object in an unversioned bucket is deleted. It also
+notifies you when an object version is permanently deleted by an S3
+Lifecycle configuration. The `s3:LifecycleExpiration:DeleteMarkerCreated`
+event type notifies you when S3 Lifecycle creates a delete marker when a
+current version of an object in versioned bucket is deleted" ("Event
+notification types and destinations", S3 User Guide).
+
+| Action | Event | `versionId` |
+|---|---|---|
+| An object of an unversioned bucket expires | `LifecycleExpiration:Delete` | none |
+| A noncurrent version expires | `LifecycleExpiration:Delete` | the version's |
+| The current version expires, adding a delete marker | `LifecycleExpiration:DeleteMarkerCreated` | the marker's, `null` in a Suspended bucket |
+| A Suspended bucket's null version is replaced by that marker | `LifecycleExpiration:Delete` | `null` |
+| A delete marker left as the key's only version is removed | `LifecycleExpiration:Delete` | the marker's |
+
+The actions of one run on a key are committed together, and each records
+its own event, the removals in the order they were made, then the marker,
+each with its own sequencer, later than the one before it. They match
+`s3:LifecycleExpiration:*` and the two types above, never
+`s3:ObjectRemoved:*`: those "don't alert you for automatic deletes from
+lifecycle configurations". An incomplete multipart upload a rule aborts
+records nothing, as S3 has no event type for it, and transitions record
+nothing, since they change nothing here.
+
+A lifecycle event comes from S3 itself, not from a request:
+`userIdentity.principalId` and `requestParameters.sourceIPAddress` are
+`s3.amazonaws.com` (N2, N3), a choice, as S3's documentation does not
+give the values of a lifecycle event. `responseElements` carries a fresh
+`x-amz-request-id` and `x-amz-id-2` for each event, in the form of a
+response's ([Request IDs](#request-ids)), which no response carries. Its
+`eventTime` is the commit's time on the server's clock, like every
+event's.
 
 ## Health checks
 
