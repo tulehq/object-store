@@ -200,8 +200,8 @@ const MinRangeCopySource = 5 << 20
 //
 // The operations on a bucket's objects, uploads, listing and policy
 // (everything but ListBuckets, HeadBucket, CreateBucket, DeleteBucket,
-// GetBucketPolicy and the event outbox's PendingEvents, AckEvent and
-// RecoverEvents) require a context Pin returned for that bucket, and fail
+// GetBucketPolicy and the event outbox's PendingEvents, AckEvent,
+// RecoverEvents and ConfirmCommitted) require a context Pin returned for that bucket, and fail
 // without one.
 type StorageProvider interface {
 	ListBuckets(ctx context.Context) ([]BucketInfo, error)
@@ -426,6 +426,12 @@ type StorageProvider interface {
 	// one whose change was not is removed. It runs before the store
 	// serves, so nothing changes what it checks.
 	RecoverEvents(ctx context.Context) (RecoveredEvents, error)
+	// ConfirmCommitted confirms the events whose change was committed but
+	// whose confirm failed, as on a full disk, so they become pending, and
+	// returns how many it did; the others are tried again on the next
+	// call. It is safe while the store serves, and is called after
+	// RecoverEvents and on each poll of the deliverer.
+	ConfirmCommitted(ctx context.Context) (int, error)
 }
 
 // LifecycleAbort is what AbortLifecycleUpload did to an upload.

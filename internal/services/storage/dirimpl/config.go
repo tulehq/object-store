@@ -155,7 +155,13 @@ func (s *Service) writeFile(name string, doc []byte) error {
 // directory it creates, so a commit that returned survives a power loss,
 // and is not lost while a backend delete made after it, which the backend
 // syncs, is kept. It is for the commits of version manifests and of the
-// versioning state.
+// versioning state, and the files of the event outbox.
+//
+// Once the rename is done, readers see doc at name: the write has
+// happened. A failure to sync the directory after it is an error wrapping
+// errSyncAfterCommit, which callers take as written (see unsynced), not
+// as a write that did not happen. The stageDirSync hook stands for that
+// sync in tests.
 func (s *Service) writeDurable(name string, doc []byte) error {
 	dir := filepath.Dir(name)
 	if err := s.makeDurableDir(dir); err != nil {
@@ -168,7 +174,36 @@ func (s *Service) writeDurable(name string, doc []byte) error {
 	if err := s.root.Rename(tmp, name); err != nil {
 		return errors.Join(err, s.removeIfExists(tmp))
 	}
-	return s.syncDir(dir)
+	err := s.at(stageDirSync)
+	if err == nil {
+		err = s.syncDir(dir)
+	}
+	if err != nil {
+		return fmt.Errorf("%w: %w", errSyncAfterCommit, err)
+	}
+	return nil
+}
+
+// stageDirSync: writeDurable has renamed a file into place and is about
+// to sync its directory. An error the hook returns stands for a failed
+// sync.
+const stageDirSync = "dirSync"
+
+// errSyncAfterCommit is writeDurable's error for a directory that could
+// not be synced after the rename, which readers already see.
+var errSyncAfterCommit = errors.New("the directory was not synced after the rename")
+
+// unsynced returns err, writeDurable's error for name, unless it wraps
+// errSyncAfterCommit: name is written, which readers see, so that is
+// logged at Error, since the write may not survive a power loss, and nil
+// is returned.
+func (s *Service) unsynced(name string, err error) error {
+	if !errors.Is(err, errSyncAfterCommit) {
+		return err
+	}
+	s.logger.Error("a write is committed but may not survive a power loss").
+		Str("file", name).Err("error", err).Send()
+	return nil
 }
 
 // makeDurableDir creates dir, when it does not exist, and syncs its
@@ -283,7 +318,7 @@ func (s *Service) PutObjectACL(
 		Name: contracts.EventObjectACLPut, Bucket: ref.Bucket, Key: ref.Key, Time: s.now(),
 		VersionID: info.VersionID, ETag: info.ETag,
 	}, func(*contracts.BucketEvent) (witness, bool, error) {
-		return s.aclWitness(name, raw)
+		return s.aclWitness(name, info, doc, raw)
 	})
 	if err != nil {
 		return "", err
@@ -297,17 +332,33 @@ func (s *Service) PutObjectACL(
 	return info.VersionID, nil
 }
 
-// aclWitness returns the witness of storing raw as the ACL file name, or
-// false when name holds raw already: "An event is not generated when a
+// aclWitness returns the witness of storing raw, which encodes doc for the
+// object info describes, as its ACL file name, or false when doc is its
+// effective ACL already: the one name holds for it, or, when it has none
+// of its own, Events.ImplicitACL. "An event is not generated when a
 // request results in no change to an object's ACL" (S3 User Guide, "Event
 // notification types and destinations").
-func (s *Service) aclWitness(name string, raw []byte) (witness, bool, error) {
+func (s *Service) aclWitness(
+	name string,
+	info *contracts.ObjectInfo,
+	doc, raw []byte,
+) (witness, bool, error) {
+	effective := s.events.ImplicitACL
 	old, err := s.root.ReadFile(name)
-	if err == nil && bytes.Equal(old, raw) {
-		return witness{}, false, nil
-	}
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+	switch {
+	case err == nil:
+		var stored objectACL
+		if err = json.Unmarshal(old, &stored); err != nil {
+			return witness{}, false, fmt.Errorf("decode the ACL file %s: %w", name, err)
+		}
+		if stored.ETag == info.ETag && stored.LastModified.Equal(info.LastModified) {
+			effective = stored.ACL
+		}
+	case !errors.Is(err, fs.ErrNotExist):
 		return witness{}, false, fmt.Errorf("read the ACL file %s: %w", name, err)
+	}
+	if effective != nil && bytes.Equal(effective, doc) {
+		return witness{}, false, nil
 	}
 	return witness{Kind: witnessSideFile, File: name, SHA256: digest(raw)}, true, nil
 }

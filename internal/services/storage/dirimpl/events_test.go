@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -99,7 +100,9 @@ func newEventFixture(t *testing.T) *eventFixture {
 }
 
 func (f *eventFixture) events() Events {
-	return Events{Router: f.router, Signal: func() { f.signals.Add(1) }}
+	return Events{
+		Router: f.router, Signal: func() { f.signals.Add(1) }, ImplicitACL: []byte("<implicit/>"),
+	}
 }
 
 // restart closes the service and opens the root again, as a crash and a
@@ -188,10 +191,10 @@ func (f *eventFixture) pending() []contracts.BucketEvent {
 	return out
 }
 
-// stat returns the info of the current version of key.
-func (f *eventFixture) stat(key string) *contracts.ObjectInfo {
+// stat returns the info of the current version of "k".
+func (f *eventFixture) stat() *contracts.ObjectInfo {
 	f.t.Helper()
-	info, err := f.s.StatObject(f.ctx, oref("bucket", key))
+	info, err := f.s.StatObject(f.ctx, oref("bucket", "k"))
 	if err != nil {
 		f.t.Fatal(err)
 	}
@@ -211,7 +214,7 @@ func created(name contracts.EventName) func(*eventFixture, contracts.Versioning,
 	string) *contracts.BucketEvent {
 	return func(f *eventFixture, _ contracts.Versioning, vid string) *contracts.BucketEvent {
 		return &contracts.BucketEvent{
-			Name: name, Bucket: "bucket", Key: "k", VersionID: vid, ETag: f.stat("k").ETag,
+			Name: name, Bucket: "bucket", Key: "k", VersionID: vid, ETag: f.stat().ETag,
 			Size: 3, HasObject: true,
 		}
 	}
@@ -224,7 +227,7 @@ func onK(name contracts.EventName, etag bool) func(*eventFixture, contracts.Vers
 	return func(f *eventFixture, _ contracts.Versioning, vid string) *contracts.BucketEvent {
 		ev := &contracts.BucketEvent{Name: name, Bucket: "bucket", Key: "k", VersionID: vid}
 		if etag {
-			ev.ETag = f.stat("k").ETag
+			ev.ETag = f.stat().ETag
 		}
 		return ev
 	}
@@ -323,6 +326,12 @@ var eventOps = map[string]eventOp{
 			return f.s.PutObjectACL(f.ctx, oref("bucket", "k"), []byte("<changed/>"), nil)
 		},
 		want: onK(contracts.EventObjectACLPut, true),
+	},
+	"acl implicit": {
+		run: func(f *eventFixture) (string, error) {
+			return f.s.PutObjectACL(f.ctx, oref("bucket", "solo"), []byte("<implicit/>"), nil)
+		},
+		want: none,
 	},
 	"acl unchanged": {
 		run: func(f *eventFixture) (string, error) {
@@ -475,8 +484,8 @@ func TestNoConfigurationRecordsNothing(t *testing.T) {
 		if _, err := op.run(f); err != nil {
 			t.Fatal(err)
 		}
-		if got := f.outbox(); got != nil {
-			t.Fatalf("outbox %v", got)
+		if got := f.outbox(); got != nil || f.exists(seqLeaseFile) {
+			t.Fatalf("outbox %v, lease %v", got, f.exists(seqLeaseFile))
 		}
 		if f.signals.Load() != 0 {
 			t.Fatal("signaled")
@@ -485,7 +494,7 @@ func TestNoConfigurationRecordsNothing(t *testing.T) {
 
 	f := newEventFixture(t)
 	f.put("k", "v1")
-	raw := f.rawTrailer("k")
+	raw := f.rawTrailer()
 	if bytes.Contains(raw, []byte("writeId")) {
 		t.Fatalf("trailer %s", raw)
 	}
@@ -505,16 +514,16 @@ func TestNoConfigurationRecordsNothing(t *testing.T) {
 
 	f.configure()
 	f.put("k", "v2")
-	if !bytes.Contains(f.rawTrailer("k"), []byte(`"writeId":"`)) {
-		t.Fatalf("trailer of a write with an event: %s", f.rawTrailer("k"))
+	if !bytes.Contains(f.rawTrailer(), []byte(`"writeId":"`)) {
+		t.Fatalf("trailer of a write with an event: %s", f.rawTrailer())
 	}
 }
 
-// rawTrailer returns the trailer JSON of key's object in place.
-func (f *eventFixture) rawTrailer(key string) []byte {
+// rawTrailer returns the trailer JSON of "k"'s object in place.
+func (f *eventFixture) rawTrailer() []byte {
 	f.t.Helper()
 	obj, err := f.s.dir.GetObject(f.ctx, &storage.GetObjectInput{
-		HeadObjectInput: storage.HeadObjectInput{BaseObjectInput: dataInput("bucket", key, nil)},
+		HeadObjectInput: storage.HeadObjectInput{BaseObjectInput: dataInput("bucket", "k", nil)},
 	})
 	if err != nil {
 		f.t.Fatal(err)
@@ -608,35 +617,220 @@ func TestAnUnwritableOutboxNeverFailsTheWrite(t *testing.T) {
 	})
 }
 
-// With a message that cannot be rendered, the write commits, its intent
-// stays, and RecoverEvents confirms it once it can, reading the details of
-// a write in place back from the object.
-func TestARenderFailureLeavesTheIntent(t *testing.T) {
-	f := newEventFixture(t)
-	f.configure()
+// failRender runs change with a Render that fails, so its confirm does.
+func (f *eventFixture) failRender(change func()) {
+	f.t.Helper()
 	renderErr := errors.New("render")
 	f.router.renderErr.Store(&renderErr)
-	f.put("k", "v1")
+	change()
+	f.router.renderErr.Store(nil)
+}
+
+// confirmCommitted runs ConfirmCommitted, which must confirm n events.
+func (f *eventFixture) confirmCommitted(n int) {
+	f.t.Helper()
+	got, err := f.s.ConfirmCommitted(f.ctx)
+	if err != nil || got != n {
+		f.t.Fatalf("confirmed %d (%v), want %d", got, err, n)
+	}
+}
+
+// With a message that cannot be rendered, the write commits and its event
+// is marked committed, which ConfirmCommitted confirms once it can,
+// trying again after a failure.
+func TestARenderFailureMarksTheEventCommitted(t *testing.T) {
+	f := newEventFixture(t)
+	f.configure()
+	f.failRender(func() { f.put("k", "v1") })
 	if got := f.body(oref("bucket", "k")); got != "v1" {
 		t.Fatalf("body %q", got)
 	}
-	if len(f.intents()) != 1 || len(f.pending()) != 0 {
-		t.Fatalf("outbox %v", f.outbox())
+	if out := f.outbox(); len(out) != 1 || !strings.HasSuffix(out[0], committedExt) {
+		t.Fatalf("outbox %v", out)
 	}
-	if _, err := f.s.RecoverEvents(f.ctx); err == nil {
-		t.Fatal("recovered with a failing render")
+	f.failRender(func() {
+		if _, err := f.s.ConfirmCommitted(f.ctx); err == nil {
+			t.Fatal("confirmed with a failing render")
+		}
+	})
+	if len(f.outbox()) != 1 {
+		t.Fatal("a failed confirm dropped the mark")
 	}
-	if len(f.intents()) != 1 {
-		t.Fatal("a failed recovery dropped the intent")
-	}
-	f.router.renderErr.Store(nil)
-	out, err := f.s.RecoverEvents(f.ctx)
-	if err != nil || out != (contracts.RecoveredEvents{Confirmed: 1}) {
-		t.Fatalf("recovered %+v, %v", out, err)
-	}
+	f.confirmCommitted(1)
 	requireEvents(t, contracts.Unversioned, f.pending(), &contracts.BucketEvent{
 		Name: contracts.EventObjectCreatedPut, Bucket: "bucket", Key: "k",
-		ETag: f.stat("k").ETag, Size: 2, HasObject: true,
+		ETag: f.stat().ETag, Size: 2, HasObject: true,
+	})
+	f.confirmCommitted(0)
+}
+
+// laterChange is a case of TestACommittedEventSurvivesLaterChanges: change,
+// whose confirm fails, then second, which falsifies change's witness, on
+// a key setup leaves, and the events they cause.
+type laterChange struct {
+	setup          func(f *eventFixture)
+	change, second func(f *eventFixture)
+	want           [2]contracts.EventName
+}
+
+// tagK gives "k" the tag t=v.
+func tagK(f *eventFixture, v string) {
+	if _, err := f.s.PutObjectTagging(f.ctx, oref("bucket", "k"),
+		[]contracts.Tag{{Key: "t", Value: v}}, nil); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+// aclK gives "k" the ACL v.
+func aclK(f *eventFixture, v string) {
+	if _, err := f.s.PutObjectACL(f.ctx, oref("bucket", "k"), []byte(v), nil); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+// laterChanges are the cases of TestACommittedEventSurvivesLaterChanges.
+func laterChanges() map[string]laterChange {
+	return map[string]laterChange{
+		"unversioned overwrite": {
+			change: func(f *eventFixture) { f.put("k", "v1") },
+			second: func(f *eventFixture) { f.put("k", "v2") },
+			want: [2]contracts.EventName{
+				contracts.EventObjectCreatedPut,
+				contracts.EventObjectCreatedPut,
+			},
+		},
+		"put after a delete in place": {
+			setup:  func(f *eventFixture) { f.put("k", "v1") },
+			change: func(f *eventFixture) { f.del(oref("bucket", "k")) },
+			second: func(f *eventFixture) { f.put("k", "v2") },
+			want: [2]contracts.EventName{
+				contracts.EventObjectRemovedDelete,
+				contracts.EventObjectCreatedPut,
+			},
+		},
+		"suspended overwrite of the null version": {
+			setup: func(f *eventFixture) {
+				f.state(contracts.VersioningEnabled)
+				f.put("k", "v1")
+				f.state(contracts.VersioningSuspended)
+			},
+			change: func(f *eventFixture) { f.put("k", "null1") },
+			second: func(f *eventFixture) { f.put("k", "null2") },
+			want: [2]contracts.EventName{
+				contracts.EventObjectCreatedPut,
+				contracts.EventObjectCreatedPut,
+			},
+		},
+		"tag rewrite": {
+			setup:  func(f *eventFixture) { f.put("k", "v1") },
+			change: func(f *eventFixture) { tagK(f, "a") },
+			second: func(f *eventFixture) { tagK(f, "b") },
+			want: [2]contracts.EventName{
+				contracts.EventObjectTaggingPut,
+				contracts.EventObjectTaggingPut,
+			},
+		},
+		"ACL rewrite": {
+			setup:  func(f *eventFixture) { f.put("k", "v1") },
+			change: func(f *eventFixture) { aclK(f, "<a/>") },
+			second: func(f *eventFixture) { aclK(f, "<b/>") },
+			want: [2]contracts.EventName{
+				contracts.EventObjectACLPut,
+				contracts.EventObjectACLPut,
+			},
+		},
+	}
+}
+
+// An event whose confirm failed is confirmed, by recovery after a start,
+// also when the key changed since in a way that falsifies its witness, and
+// sorts before the event of that change.
+func TestACommittedEventSurvivesLaterChanges(t *testing.T) {
+	for name, tc := range laterChanges() {
+		t.Run(name, func(t *testing.T) {
+			f := newEventFixture(t)
+			if tc.setup != nil {
+				tc.setup(f)
+			}
+			f.configure()
+			f.failRender(func() { tc.change(f) })
+			tc.second(f)
+			f.restart()
+			if out, err := f.s.RecoverEvents(f.ctx); err != nil ||
+				out != (contracts.RecoveredEvents{}) {
+				t.Fatalf("recovered %+v, %v", out, err)
+			}
+			f.confirmCommitted(1)
+			evs := f.pending()
+			if len(evs) != 2 || evs[0].Name != tc.want[0] || evs[1].Name != tc.want[1] {
+				t.Fatalf("events %+v, want %v", evs, tc.want)
+			}
+		})
+	}
+}
+
+// An event whose confirm failed outlives its bucket: it is confirmed after
+// the bucket is deleted, and also once it is created again.
+func TestACommittedEventOutlivesItsBucket(t *testing.T) {
+	for _, recreate := range []bool{false, true} {
+		f := newEventFixture(t)
+		f.configure()
+		f.put("k", "v1")
+		f.failRender(func() { f.del(oref("bucket", "k")) })
+		f.pending()
+		if err := f.deleteBucket(); err != nil {
+			t.Fatal(err)
+		}
+		if recreate {
+			if _, err := f.s.CreateBucket(context.Background(), "bucket", nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+		f.release()
+		if err := f.s.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		f.s = openEventService(t, f.root, f.events())
+		f.ctx = context.Background()
+		if out, err := f.s.RecoverEvents(
+			f.ctx,
+		); err != nil ||
+			out != (contracts.RecoveredEvents{}) {
+			t.Fatalf("recovered %+v, %v", out, err)
+		}
+		f.confirmCommitted(1)
+		evs := f.pending()
+		if len(evs) != 1 || evs[0].Name != contracts.EventObjectRemovedDelete {
+			t.Fatalf("events %+v", evs)
+		}
+	}
+}
+
+// A committed mark that is the intent renamed, as when the mark could not
+// be written, has no details of a write in place: they are read back from
+// the object, as long as it is the one written.
+func TestARenamedMarkReadsItsDetailsBack(t *testing.T) {
+	f := newEventFixture(t)
+	f.configure()
+	crashAt(f.fixture, stageCommitted)
+	_, err := writeOps["put"](f.fixture)
+	requireIs(t, "the stopped put", err, errCrash)
+	intent := f.intents()
+	if len(intent) != 1 {
+		t.Fatalf("outbox %v", f.outbox())
+	}
+	dir := filepath.Join(eventsDir, "bucket")
+	id := strings.TrimSuffix(intent[0], intentExt)
+	if err = f.s.root.Rename(
+		filepath.Join(dir, intent[0]),
+		filepath.Join(dir, id+committedExt),
+	); err != nil {
+		t.Fatal(err)
+	}
+	f.confirmCommitted(1)
+	requireEvents(t, contracts.Unversioned, f.pending(), &contracts.BucketEvent{
+		Name: contracts.EventObjectCreatedPut, Bucket: "bucket", Key: "k",
+		ETag: f.stat().ETag, Size: 3, HasObject: true,
 	})
 }
 
@@ -709,51 +903,129 @@ func crashAndRecover(
 	requireEvents(t, st, evs, op.want(f, st, vid))
 }
 
-// RecoverEvents removes temp files, keeps pending events, and drops an
-// intent of a bucket of another generation, whose witness is not about
-// the bucket there now: here a delete in place, whose witness, no object
-// at the key, holds in the new bucket too.
+// RecoverEvents removes temp files and intents marked aborted, and keeps
+// pending events.
 func TestRecoverEventsLeftovers(t *testing.T) {
 	f := newEventFixture(t)
 	f.configure()
 	f.put("k", "v1")
-	renderErr := errors.New("render")
-	f.router.renderErr.Store(&renderErr)
-	f.del(oref("bucket", "k"))
-	f.router.renderErr.Store(nil)
-	if len(f.pending()) != 1 {
-		t.Fatal("the put recorded no event")
+	dir := filepath.Join(eventsDir, "bucket")
+	tmp := filepath.Join(dir, "x.json.tmp-ABC")
+	aborted := filepath.Join(dir, "00000000000000000001-"+strings.Repeat("A", 26)+abortedExt)
+	for _, name := range []string{tmp, aborted} {
+		if err := f.s.root.WriteFile(name, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
-	tmp := filepath.Join(eventsDir, "bucket", "x.json.tmp-ABC")
-	if err := f.s.root.WriteFile(tmp, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	f.recreate()
-	f.configure()
-	f.put("pending", "x")
-
 	out, err := f.s.RecoverEvents(f.ctx)
 	if err != nil || out != (contracts.RecoveredEvents{Dropped: 1}) {
 		t.Fatalf("recovered %+v, %v", out, err)
 	}
-	if f.exists(tmp) || len(f.intents()) != 0 {
+	if f.exists(tmp) || f.exists(aborted) {
 		t.Fatalf("outbox left %v", f.outbox())
 	}
-	if evs := f.pending(); len(evs) != 1 || evs[0].Key != "pending" {
+	if evs := f.pending(); len(evs) != 1 || evs[0].Key != "k" {
 		t.Fatalf("events %+v", evs)
 	}
 }
 
-// Concurrent writers to one key get strictly increasing sequencers, in the
-// order their versions were committed.
-func TestConcurrentWritersGetIncreasingSequencers(t *testing.T) {
+// A pending event that cannot be read is set aside, so it is not read,
+// nor logged, again.
+func TestAnUnreadableEventIsSetAside(t *testing.T) {
 	f := newEventFixture(t)
-	f.state(contracts.VersioningEnabled)
+	id := "00000000000000000001-" + strings.Repeat("A", 26)
+	if err := f.s.root.MkdirAll(filepath.Join(eventsDir, "bucket"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.s.root.WriteFile(
+		eventFile("bucket", id, eventExt),
+		[]byte("{"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if evs, err := f.s.PendingEvents(f.ctx, 10); err != nil || len(evs) != 0 {
+			t.Fatalf("pending %v, %v", evs, err)
+		}
+	}
+	if !f.exists(eventFile("bucket", id, badExt)) || f.exists(eventFile("bucket", id, eventExt)) {
+		t.Fatalf("outbox %v", f.outbox())
+	}
+}
+
+// A write in place sorts after the key's earlier events also after a
+// restart on a clock behind the one they were recorded on: its sequence
+// starts above the one its trailer holds, and so do the sequences of the
+// key's later changes, also once it has versions.
+func TestALegacyWriteSortsAfterTheKeysEvents(t *testing.T) {
+	f := newEventFixture(t)
 	f.configure()
-	const writers = 16
+	f.s.seq.Store(time.Now().Add(time.Hour).UnixNano())
+	var last int64
+	// next runs change, after a restart, which must record one event
+	// sequenced after the last.
+	next := func(change func()) {
+		t.Helper()
+		f.restart()
+		change()
+		evs := f.pending()
+		if len(evs) != 1 || evs[0].Sequence <= last {
+			t.Fatalf("events %+v after sequence %d", evs, last)
+		}
+		last = evs[0].Sequence
+	}
+	f.put("k", "v1")
+	last = f.pending()[0].Sequence
+	next(func() { f.put("k", "v2") })
+	next(func() { f.del(oref("bucket", "k")) })
+	next(func() { f.put("k", "v3") })
+	next(func() {
+		f.state(contracts.VersioningEnabled)
+		f.put("k", "v4")
+	})
+}
+
+// Concurrent writers to one key in place, in an Unversioned bucket and in
+// a Suspended one without a manifest, get strictly increasing sequencers,
+// the last the one the key's object holds.
+func TestConcurrentLegacyWritersGetIncreasingSequencers(t *testing.T) {
+	for _, st := range []contracts.Versioning{contracts.Unversioned, contracts.VersioningSuspended} {
+		t.Run(cmpName(st), func(t *testing.T) {
+			f := newEventFixture(t)
+			if st != contracts.Unversioned {
+				f.state(st)
+			}
+			f.configure()
+			const writers = 16
+			putConcurrently(t, f, writers)
+			evs := f.pending()
+			if len(evs) != writers || f.hasManifest() {
+				t.Fatalf("%d events, manifest %v", len(evs), f.hasManifest())
+			}
+			for i := 1; i < len(evs); i++ {
+				if evs[i].Sequence <= evs[i-1].Sequence {
+					t.Fatalf("sequence %d after %d", evs[i].Sequence, evs[i-1].Sequence)
+				}
+			}
+			var tr trailer
+			if err := json.Unmarshal(f.rawTrailer(), &tr); err != nil {
+				t.Fatal(err)
+			}
+			if tr.Seq != evs[len(evs)-1].Sequence {
+				t.Fatalf("the object holds sequence %d, the last event %d", tr.Seq,
+					evs[len(evs)-1].Sequence)
+			}
+		})
+	}
+}
+
+// putConcurrently runs n puts of "k" at once.
+func putConcurrently(t *testing.T, f *eventFixture, n int) {
+	t.Helper()
 	var wg sync.WaitGroup
-	errs := make(chan error, writers)
-	for range writers {
+	errs := make(chan error, n)
+	for range n {
 		wg.Go(func() {
 			_, err := f.s.PutObject(f.ctx, "bucket", "k", strings.NewReader("x"),
 				contracts.PutObjectInput{}, contracts.Precondition{})
@@ -765,20 +1037,6 @@ func TestConcurrentWritersGetIncreasingSequencers(t *testing.T) {
 	for err := range errs {
 		if err != nil {
 			t.Fatal(err)
-		}
-	}
-	evs := f.pending()
-	committed := f.ids("k")
-	slices.Reverse(committed)
-	if len(evs) != writers {
-		t.Fatalf("%d events", len(evs))
-	}
-	for i, ev := range evs {
-		if i > 0 && ev.Sequence <= evs[i-1].Sequence {
-			t.Fatalf("sequence %d after %d", ev.Sequence, evs[i-1].Sequence)
-		}
-		if ev.VersionID != committed[i] {
-			t.Fatalf("event %d is of version %s, committed %s", i, ev.VersionID, committed[i])
 		}
 	}
 }
@@ -927,5 +1185,207 @@ func requireOpened(f *eventFixture, v1 string) {
 	}
 	if f.body(oref("bucket", "legacy")) != "l" || f.body(vref("k", v1)) != "v1" {
 		f.t.Fatal("the data did not read back")
+	}
+}
+
+// A directory sync that fails after writeDurable's rename does not undo
+// the write readers already see: a fresh key's version stays readable and
+// indexed, its manifest lists it, its event is confirmed, a delete of it
+// and a change of the versioning state happen too.
+func TestAFailedSyncAfterTheRenameIsCommitted(t *testing.T) {
+	f := newEventFixture(t)
+	f.state(contracts.VersioningEnabled)
+	f.configure()
+	errSync := errors.New("sync")
+	f.s.hook = func(stage string) error {
+		if stage == stageDirSync {
+			return errSync
+		}
+		return nil
+	}
+	v1 := f.put("k", "v1")
+	if f.body(vref("k", v1.VersionID)) != "v1" || !f.exists(indexEntry("bucket", "k")) {
+		t.Fatal("the committed version did not read back")
+	}
+	f.requireIDs(v1.VersionID)
+	if len(f.intents()) != 0 {
+		t.Fatalf("outbox %v", f.outbox())
+	}
+	requireEvents(t, contracts.VersioningEnabled, f.pending(), &contracts.BucketEvent{
+		Name: contracts.EventObjectCreatedPut, Bucket: "bucket", Key: "k",
+		VersionID: v1.VersionID, ETag: v1.ETag, Size: 2, HasObject: true,
+	})
+
+	f.del(vref("k", v1.VersionID))
+	if f.hasManifest() || len(f.ids("k")) != 0 {
+		t.Fatal("the deleted version is left")
+	}
+	requireEvents(t, contracts.VersioningEnabled, f.pending(), &contracts.BucketEvent{
+		Name: contracts.EventObjectRemovedDelete, Bucket: "bucket", Key: "k",
+		VersionID: v1.VersionID,
+	})
+
+	f.state(contracts.VersioningSuspended)
+	st, err := f.s.GetBucketVersioning(f.ctx, "bucket")
+	if err != nil || st.Status != contracts.VersioningSuspended {
+		t.Fatalf("versioning %+v, %v", st, err)
+	}
+}
+
+// onlyIntent returns the id of the one intent of "bucket"'s outbox.
+func (f *eventFixture) onlyIntent() string {
+	f.t.Helper()
+	intents := f.intents()
+	if len(intents) != 1 {
+		f.t.Fatalf("outbox %v", f.outbox())
+	}
+	return strings.TrimSuffix(intents[0], intentExt)
+}
+
+// An intent marked aborted is removed at recovery without its witness
+// checked, also when a later change made the witness hold.
+func TestAnAbortedIntentIsRemoved(t *testing.T) {
+	f := newEventFixture(t)
+	f.put("k", "v1")
+	f.configure()
+	tags := []contracts.Tag{{Key: "t", Value: "a"}}
+	crashAt(f.fixture, stageEventIntent)
+	_, err := f.s.PutObjectTagging(f.ctx, oref("bucket", "k"), tags, nil)
+	requireIs(t, "the stopped tagging", err, errCrash)
+	id := f.onlyIntent()
+	if err = f.s.root.Rename(eventFile("bucket", id, intentExt),
+		eventFile("bucket", id, abortedExt)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.s.PutObjectTagging(f.ctx, oref("bucket", "k"), tags, nil); err != nil {
+		t.Fatal(err)
+	}
+	f.restart()
+	out, err := f.s.RecoverEvents(f.ctx)
+	if err != nil || out != (contracts.RecoveredEvents{Dropped: 1}) {
+		t.Fatalf("recovered %+v, %v", out, err)
+	}
+	if evs := f.pending(); len(evs) != 1 || len(f.outbox()) != 0 {
+		t.Fatalf("events %+v, outbox %v", evs, f.outbox())
+	}
+}
+
+// A stop between writing an event's committed mark and removing its
+// intent leaves both: recovery removes the intent, and ConfirmCommitted
+// confirms the mark, once.
+func TestACrashAfterTheCommittedMark(t *testing.T) {
+	f := newEventFixture(t)
+	f.configure()
+	crashAt(f.fixture, stageCommitted)
+	_, err := writeOps["put"](f.fixture)
+	requireIs(t, "the stopped put", err, errCrash)
+	id := f.onlyIntent()
+	rec, err := f.s.readIntent(eventFile("bucket", id, intentExt), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.Witness = witness{Kind: witnessCommitted}
+	rec.Event.ETag, rec.Event.Size = f.stat().ETag, 3
+	raw, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = f.s.root.WriteFile(eventFile("bucket", id, committedExt), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.restart()
+	out, err := f.s.RecoverEvents(f.ctx)
+	if err != nil || out != (contracts.RecoveredEvents{}) || len(f.intents()) != 0 {
+		t.Fatalf("recovered %+v, %v; outbox %v", out, err, f.outbox())
+	}
+	f.confirmCommitted(1)
+	f.confirmCommitted(0)
+	requireEvents(t, contracts.Unversioned, f.pending(), &contracts.BucketEvent{
+		Name: contracts.EventObjectCreatedPut, Bucket: "bucket", Key: "k",
+		ETag: f.stat().ETag, Size: 3, HasObject: true,
+	})
+}
+
+// A renamed mark of a write in place whose object was written over since
+// cannot read its details back: its event leaves the object's size and
+// ETag out rather than report wrong ones.
+func TestARenamedMarkWithoutItsObject(t *testing.T) {
+	f := newEventFixture(t)
+	f.configure()
+	crashAt(f.fixture, stageCommitted)
+	_, err := writeOps["put"](f.fixture)
+	requireIs(t, "the stopped put", err, errCrash)
+	id := f.onlyIntent()
+	if err = f.s.root.Rename(eventFile("bucket", id, intentExt),
+		eventFile("bucket", id, committedExt)); err != nil {
+		t.Fatal(err)
+	}
+	f.put("k", "later")
+	f.confirmCommitted(1)
+	evs := f.pending()
+	if len(evs) != 2 {
+		t.Fatalf("events %+v", evs)
+	}
+	requireEvent(t, &evs[0], &contracts.BucketEvent{
+		Name: contracts.EventObjectCreatedPut, Bucket: "bucket", Key: "k",
+	})
+}
+
+// The sequence lease resumes across a restart: on a clock behind the one
+// events were recorded on, a key never written before still sorts after
+// them.
+func TestTheLeaseResumesAcrossARestart(t *testing.T) {
+	f := newEventFixture(t)
+	f.configure()
+	f.s.seq.Store(time.Now().Add(time.Hour).UnixNano())
+	f.put("a", "x")
+	first := f.pending()[0].Sequence
+	f.restart()
+	if got := f.s.seq.Load(); got < first+seqLeaseAhead {
+		t.Fatalf("resumed at %d, the lease is %d", got, first+seqLeaseAhead)
+	}
+	f.put("b", "x")
+	if evs := f.pending(); len(evs) != 1 || evs[0].Sequence <= first {
+		t.Fatalf("events %+v after sequence %d", evs, first)
+	}
+}
+
+// A lease that cannot be read or decoded does not keep the store from
+// starting: it resumes from the clock, and the next event stores a new
+// lease.
+func TestADamagedLeaseDoesNotBlockTheStart(t *testing.T) {
+	f := newEventFixture(t)
+	f.configure()
+	f.put("a", "x")
+	f.pending()
+	if err := f.s.root.WriteFile(seqLeaseFile, []byte("damaged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.restart()
+	if f.s.leased.Load() != 0 {
+		t.Fatal("resumed from a damaged lease")
+	}
+	f.put("b", "x")
+	if len(f.pending()) != 1 {
+		t.Fatal("no event after a damaged lease")
+	}
+	raw, err := f.s.root.ReadFile(seqLeaseFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = strconv.ParseInt(string(raw), 10, 64); err != nil {
+		t.Fatalf("lease %q: %v", raw, err)
+	}
+
+	if err = f.s.root.Remove(seqLeaseFile); err != nil {
+		t.Fatal(err)
+	}
+	if err = f.s.root.Mkdir(seqLeaseFile, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	f.restart() // an unreadable lease
+	f.put("c", "x")
+	if len(f.pending()) != 1 {
+		t.Fatal("no event after an unreadable lease")
 	}
 }

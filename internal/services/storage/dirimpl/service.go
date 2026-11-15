@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -37,18 +38,24 @@ type Service struct {
 	// versions and of a read of one (see versions.go), and an error it
 	// returns fails the change or read there, as a crash would stop it.
 	// Tests set it.
-	hook func(stage string) error
-	// events routes and renders the bucket events s records (see
-	// events.go).
-	events Events
-	locks  keyLocks
+	hook  func(stage string) error
+	locks keyLocks
 	// bucketLocks order creating and deleting a bucket, which change its
 	// generation, against the operations pinned to it and the reads of its
 	// policy.
 	bucketLocks bucketLocks
+	// events routes and renders the bucket events s records (see
+	// events.go).
+	events Events
+	// committedMu serializes ConfirmCommitted.
+	committedMu sync.Mutex
+	// leaseMu serializes the writes of the sequence lease, and leased is
+	// the one stored (see leaseSeq).
+	leaseMu sync.Mutex
 	// deleteWait bounds how long DeleteBucket waits for the operations
 	// pinned to its bucket.
 	deleteWait time.Duration
+	leased     atomic.Int64
 	// seq is the last commit sequence nextSeq returned.
 	seq atomic.Int64
 }
@@ -104,6 +111,7 @@ func (s *Service) Init(ctx context.Context) (err error) {
 	if err = s.removeOrphanUploads(); err != nil {
 		return fmt.Errorf("%s: %w", s.Name(), errors.Join(err, s.root.Close()))
 	}
+	s.resumeSeq()
 
 	s.dir, err = dir.New(
 		dir.WithRoot(s.root),

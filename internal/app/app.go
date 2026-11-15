@@ -38,6 +38,10 @@ func New(cfg *Config, extra ...gas.Option) (*gas.App, error) {
 	if pErr != nil {
 		return nil, pErr
 	}
+	implicitACL, aErr := object.ImplicitACL(cfg.Auth.AccountID)
+	if aErr != nil {
+		return nil, aErr
+	}
 
 	// S3 requests are authenticated by signature, not cookies, so the
 	// cross-origin protection meant for browser sessions only gets in the way
@@ -56,7 +60,7 @@ func New(cfg *Config, extra ...gas.Option) (*gas.App, error) {
 
 	registerInfraServices(app, cfg, logger)
 	ready := make(chan struct{})
-	registerAppServices(app, cfg, verifier, bound, ready)
+	registerAppServices(app, cfg, verifier, bound, ready, implicitACL)
 	registerAppModules(app, cfg)
 	installMiddleware(app.Router(), cfg, logger, verifier)
 	app.ReadyFunc(createBuckets(cfg.Storage.Buckets))
@@ -82,12 +86,14 @@ func registerInfraServices(app *gas.App, cfg *Config, logger gas.Logger) {
 // authorizer the modules evaluate each operation with, which reads bucket
 // policies from the storage, and how bucket policies' principals are bound;
 // and the lifecycle sweep, which applies no rule before ready is closed.
+// implicitACL is the ACL document of an object without one of its own.
 func registerAppServices(
 	app *gas.App,
 	cfg *Config,
 	verifier *sigv4.Verifier,
 	bound contracts.PolicyPrincipals,
 	ready <-chan struct{},
+	implicitACL []byte,
 ) {
 	clock := cfg.clockOrSystem()
 	app.RegisterServiceInstance[*sigv4.Verifier](verifier)
@@ -96,7 +102,8 @@ func registerAppServices(
 	// anywhere and the storage records none.
 	app.RegisterSingletonService[contracts.StorageProvider](
 		dirimpl.NewService(cfg.Storage, clock, dirimpl.Events{
-			Router: notification.NewRouter(cfg.Auth.AccountID, nil),
+			Router:      notification.NewRouter(cfg.Auth.AccountID, nil),
+			ImplicitACL: implicitACL,
 		}),
 	)
 	// It depends on the storage, so gas closes it, stopping its sweeps,
@@ -144,7 +151,8 @@ func createBuckets(names []string) func(*gas.ServiceContainer) error {
 }
 
 // recoverEvents returns a ready hook that settles the bucket events a stop
-// left recorded but not confirmed (see StorageProvider's RecoverEvents),
+// left recorded but not confirmed (see StorageProvider's RecoverEvents,
+// then ConfirmCommitted),
 // before the server listens and before the sweep runs, so nothing changes
 // what it checks. A failure is logged and does not fail the start: the
 // intents it could not settle are kept for the next one.
@@ -158,9 +166,13 @@ func recoverEvents(logger gas.Logger) func(*gas.ServiceContainer) error {
 		if err != nil {
 			logger.Error("failed to recover bucket events").Err("error", err).Send()
 		}
-		if out.Confirmed > 0 || out.Dropped > 0 {
+		committed, err := storage.ConfirmCommitted(context.Background())
+		if err != nil {
+			logger.Error("failed to confirm committed bucket events").Err("error", err).Send()
+		}
+		if out.Confirmed > 0 || out.Dropped > 0 || committed > 0 {
 			logger.Info("recovered bucket events").
-				Int("confirmed", out.Confirmed).Int("dropped", out.Dropped).Send()
+				Int("confirmed", out.Confirmed+committed).Int("dropped", out.Dropped).Send()
 		}
 		return nil
 	}

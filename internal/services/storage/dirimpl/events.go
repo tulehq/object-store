@@ -37,6 +37,15 @@ import (
 // event whose change was committed is confirmed, and the intent of one
 // that was not is removed, so a committed change never loses its event.
 //
+// A confirm that fails in a running store, once the change is committed,
+// marks the event committed, "<id>.committed" (see markCommitted): later
+// changes to the key may falsify the witness before the next start, so
+// that event is confirmed without one, by ConfirmCommitted. An abort whose
+// removal of the intent fails marks it "<id>.aborted", which recovery
+// removes without checking its witness. Should that rename fail too, the
+// intent stays, and its witness, once a later change makes it hold, gives
+// a duplicate event, which delivery at least once allows.
+//
 // A failure to record an event never fails the change: it is logged, and
 // the change goes on without its event. Only the hook a test sets (see
 // Service.at) can stop a change at the new stages, as a crash would.
@@ -49,6 +58,11 @@ type Events struct {
 	// Signal, when set, is called once an event is confirmed, to wake its
 	// deliverer. It must not block.
 	Signal func()
+	// ImplicitACL is the ACL document of an object version without one of
+	// its own, as PutObjectACL is given documents: a PutObjectACL of it on
+	// such a version changes nothing, so it causes no event. Nil counts
+	// every ACL stored on such a version as a change.
+	ImplicitACL []byte
 }
 
 // Stages of recording an event that Service.hook is called at.
@@ -65,6 +79,9 @@ const (
 const (
 	intentExt     = ".intent"
 	eventExt      = ".json"
+	committedExt  = ".committed"
+	abortedExt    = ".aborted"
+	badExt        = ".bad"
 	recordVersion = 1
 )
 
@@ -178,17 +195,14 @@ func (s *Service) event(
 		return nil, nil
 	}
 	ev.Source, _ = contracts.EventSourceFrom(ctx)
-	seq := ev.Sequence
-	if seq == 0 {
-		seq = s.nextSeq(0)
-	}
 	p := &pendingEvent{s: s, bucket: ev.Bucket, rec: intentRecord{
-		V: recordVersion, ID: fmt.Sprintf("%020d-%s", seq, rand.Text()), Created: time.Now(),
+		V: recordVersion, ID: s.eventID(&ev), Created: time.Now(),
 		Generation: gen, Event: ev, Destination: d, Witness: w,
 	}}
 	raw, err := json.Marshal(&p.rec)
 	if err == nil {
-		err = s.writeDurable(eventFile(p.bucket, p.rec.ID, intentExt), raw)
+		name := eventFile(p.bucket, p.rec.ID, intentExt)
+		err = s.unsynced(name, s.writeDurable(name, raw))
 	}
 	if err != nil {
 		s.eventFailed("record", &ev, err)
@@ -198,6 +212,29 @@ func (s *Service) event(
 		return nil, err
 	}
 	return p, nil
+}
+
+// eventID returns a new id for ev, from its sequence, or a fresh one for
+// an event without a sequencer, leased first (see leaseSeq): a failure to
+// lease is logged, and leaves the order after a start on a clock that
+// went back to the key's trailer (see legacyEntry).
+func (s *Service) eventID(ev *contracts.BucketEvent) string {
+	seq := ev.Sequence
+	if seq == 0 {
+		seq = s.nextSeq(0)
+	}
+	if err := s.leaseSeq(seq); err != nil {
+		s.eventFailed("lease the sequence of", ev, err)
+	}
+	return fmt.Sprintf("%020d-%s", seq, rand.Text())
+}
+
+// stamp sets, in tr, the trailer of the write in place p is for, the
+// witness's write ID and the event's sequence; nil sets nothing.
+func (p *pendingEvent) stamp(tr *trailer) {
+	if p != nil {
+		tr.WriteID, tr.Seq = p.rec.Witness.WriteID, p.rec.Event.Sequence
+	}
 }
 
 // routeEvent returns the destination the notification configuration of
@@ -239,9 +276,10 @@ func (s *Service) eventFailed(step string, ev *contracts.BucketEvent, err error)
 
 // confirm records p's event as committed: fill, when set, completes the
 // event first; then its message is rendered and written as pending, the
-// intent removed and the deliverer signaled. A failure is logged, and
-// leaves the intent for RecoverEvents. The error is only the
-// stageEventConfirmed hook's. The caller holds the key's lock.
+// intent removed and the deliverer signaled. It is called only once the
+// change is committed: a failure is logged, and marks the event committed
+// (see markCommitted). The error is only the stageEventConfirmed hook's.
+// The caller holds the key's lock.
 func (p *pendingEvent) confirm(fill func(ev *contracts.BucketEvent)) error {
 	if p == nil {
 		return nil
@@ -252,6 +290,7 @@ func (p *pendingEvent) confirm(fill func(ev *contracts.BucketEvent)) error {
 	s := p.s
 	if err := s.writeEvent(p.bucket, &p.rec); err != nil {
 		s.eventFailed("confirm", &p.rec.Event, err)
+		p.markCommitted()
 		return nil
 	}
 	if err := s.at(stageEventConfirmed); err != nil {
@@ -274,14 +313,21 @@ func (s *Service) committed(p *pendingEvent, fill func(ev *contracts.BucketEvent
 }
 
 // abort removes p's intent, for a change that was not committed. A
-// failure is logged, and leaves the intent for RecoverEvents, whose
-// witness check removes it.
+// failure is logged, and the intent is renamed "<id>.aborted", which
+// RecoverEvents removes; should that fail too, it is left for
+// RecoverEvents' witness check.
 func (p *pendingEvent) abort() {
 	if p == nil {
 		return
 	}
-	if err := p.s.removeIfExists(eventFile(p.bucket, p.rec.ID, intentExt)); err != nil {
-		p.s.eventFailed("abort", &p.rec.Event, err)
+	name := eventFile(p.bucket, p.rec.ID, intentExt)
+	err := p.s.removeIfExists(name)
+	if err == nil {
+		return
+	}
+	p.s.eventFailed("abort", &p.rec.Event, err)
+	if err = p.s.root.Rename(name, eventFile(p.bucket, p.rec.ID, abortedExt)); err != nil {
+		p.s.eventFailed("mark aborted", &p.rec.Event, err)
 	}
 }
 
@@ -330,7 +376,8 @@ func (s *Service) writeEvent(bucket string, rec *intentRecord) error {
 	if err != nil {
 		return fmt.Errorf("encode the event: %w", err)
 	}
-	if err = s.writeDurable(eventFile(bucket, rec.ID, eventExt), raw); err != nil {
+	name := eventFile(bucket, rec.ID, eventExt)
+	if err = s.unsynced(name, s.writeDurable(name, raw)); err != nil {
 		return fmt.Errorf("store the event: %w", err)
 	}
 	return nil
@@ -400,26 +447,12 @@ func (s *Service) witnessedWrite(
 	rec *intentRecord,
 ) (bool, error) {
 	key := rec.Event.Key
-	obj, err := s.dir.GetObject(ctx, &storage.GetObjectInput{
-		HeadObjectInput: storage.HeadObjectInput{BaseObjectInput: dataInput(bucket, key, nil)},
-	})
+	tr, size, err := s.legacyTrailer(ctx, bucket, key)
 	if errors.Is(err, storage.ErrObjectNotFound) {
 		return false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("open %q: %w", key, err)
-	}
-	rs, ok := obj.Body.(io.ReadSeekCloser)
-	if !ok {
-		return false, errors.Join(fmt.Errorf("open %q: backend body %T is not seekable",
-			key, obj.Body), obj.Body.Close())
-	}
-	tr, size, err := readTrailer(rs, obj.Size)
-	if cErr := rs.Close(); cErr != nil {
-		err = errors.Join(err, cErr)
-	}
-	if err != nil {
-		return false, fmt.Errorf("read the trailer of %q: %w", key, err)
+		return false, err
 	}
 	if tr.WriteID != rec.Witness.WriteID {
 		return false, nil
@@ -432,12 +465,42 @@ func (s *Service) witnessedWrite(
 	return true, nil
 }
 
+// legacyTrailer returns the trailer of the object at keyHash of key, and
+// the length of its bytes: an error wrapping storage.ErrObjectNotFound
+// when there is none.
+func (s *Service) legacyTrailer(
+	ctx context.Context,
+	bucket, key string,
+) (*trailer, int64, error) {
+	obj, err := s.dir.GetObject(ctx, &storage.GetObjectInput{
+		HeadObjectInput: storage.HeadObjectInput{BaseObjectInput: dataInput(bucket, key, nil)},
+	})
+	if err != nil {
+		return nil, 0, fmt.Errorf("%s: stat %q: %w", s.Name(), key, err)
+	}
+	rs, ok := obj.Body.(io.ReadSeekCloser)
+	if !ok {
+		return nil, 0, errors.Join(fmt.Errorf("%s: stat %q: backend body %T is not seekable",
+			s.Name(), key, obj.Body), obj.Body.Close())
+	}
+	tr, size, err := readTrailer(rs, obj.Size)
+	if cErr := rs.Close(); cErr != nil {
+		err = errors.Join(err, cErr)
+	}
+	if err != nil {
+		return nil, 0, fmt.Errorf("%s: stat %q: %w", s.Name(), key, err)
+	}
+	return tr, size, nil
+}
+
 // RecoverEvents settles every intent left in the outboxes: an intent whose
 // witness holds is confirmed, rendered again from what it and the store
 // hold, and one whose witness does not, or whose bucket is of another
 // generation now, is removed. An intent whose event was written already
-// is removed, and counted as confirmed. Temp files left by an interrupted
-// write are removed. A failure leaves the intent for the next start, and
+// is removed, and counted as confirmed; one marked aborted is removed, and
+// counted as dropped; one marked committed is left to ConfirmCommitted,
+// which the caller runs after. Temp files left by an interrupted write
+// are removed. A failure leaves the intent for the next start, and
 // is returned, joined with the others, once every intent was tried. It
 // runs before the store serves, so no change moves a witness meanwhile.
 func (s *Service) RecoverEvents(ctx context.Context) (contracts.RecoveredEvents, error) {
@@ -478,22 +541,43 @@ func (s *Service) recoverBucket(
 	}
 	var errs []error
 	for _, e := range entries {
-		name := e.Name()
-		if strings.Contains(name, ".tmp-") {
-			if rmErr := s.removeIfExists(filepath.Join(dir, name)); rmErr != nil {
-				errs = append(errs, fmt.Errorf("remove %s of bucket %s: %w", name, bucket, rmErr))
-			}
-			continue
-		}
-		id, ok := strings.CutSuffix(name, intentExt)
-		if !ok || !eventIDRe.MatchString(id) {
-			continue
-		}
-		if rErr := s.recoverIntent(ctx, bucket, id, names[id+eventExt], out); rErr != nil {
-			errs = append(errs, fmt.Errorf("event %s of bucket %s: %w", id, bucket, rErr))
+		if rErr := s.recoverEntry(ctx, bucket, e.Name(), names, out); rErr != nil {
+			errs = append(errs, fmt.Errorf("%s of bucket %s: %w", e.Name(), bucket, rErr))
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// recoverEntry is RecoverEvents for the file name of bucket's outbox,
+// which holds names: a temp file and an intent marked aborted are
+// removed, the latter counted as dropped; an intent its committed mark
+// supersedes is removed, for ConfirmCommitted to confirm and count; and
+// any other intent is settled.
+func (s *Service) recoverEntry(
+	ctx context.Context,
+	bucket, name string,
+	names map[string]bool,
+	out *contracts.RecoveredEvents,
+) error {
+	file := filepath.Join(eventsDir, bucket, name)
+	if strings.Contains(name, ".tmp-") {
+		return s.removeIfExists(file)
+	}
+	if id, ok := strings.CutSuffix(name, abortedExt); ok && eventIDRe.MatchString(id) {
+		if err := s.removeIfExists(file); err != nil {
+			return err
+		}
+		out.Dropped++
+		return nil
+	}
+	id, ok := strings.CutSuffix(name, intentExt)
+	if !ok || !eventIDRe.MatchString(id) {
+		return nil
+	}
+	if names[id+committedExt] {
+		return s.removeIfExists(file)
+	}
+	return s.recoverIntent(ctx, bucket, id, names[id+eventExt], out)
 }
 
 // recoverIntent settles intent id of bucket, whose event was written
@@ -536,7 +620,8 @@ func (s *Service) recoverIntent(
 	return nil
 }
 
-// readIntent reads the intent file name, of event id.
+// readIntent reads the intent file name, of event id, or its committed
+// mark.
 func (s *Service) readIntent(name, id string) (*intentRecord, error) {
 	raw, err := s.root.ReadFile(name)
 	if err != nil {
@@ -581,8 +666,8 @@ func (s *Service) recoveredWitness(
 // PendingEvents returns up to n of the pending events, each bucket's in
 // name order, which is the order they were recorded in, the buckets taken
 // in turn. An event acknowledged while they are read is left out. One
-// that cannot be read or decoded is logged and left out, and stays in the
-// outbox, so it can be looked at.
+// that cannot be read or decoded is logged and left out (see
+// readPending).
 func (s *Service) PendingEvents(_ context.Context, n int) ([]contracts.PendingEvent, error) {
 	if n <= 0 {
 		return nil, nil
@@ -659,9 +744,11 @@ func (s *Service) pendingIDs(bucket string) ([]string, error) {
 }
 
 // readPending returns pending event id of bucket, false when it is gone or
-// cannot be read, which is logged.
+// cannot be read, which is logged once: the file is renamed "<id>.bad",
+// which PendingEvents does not read again, so it can be looked at.
 func (s *Service) readPending(bucket, id string) (contracts.PendingEvent, bool) {
-	raw, err := s.root.ReadFile(eventFile(bucket, id, eventExt))
+	name := eventFile(bucket, id, eventExt)
+	raw, err := s.root.ReadFile(name)
 	if errors.Is(err, fs.ErrNotExist) {
 		return contracts.PendingEvent{}, false
 	}
@@ -673,6 +760,9 @@ func (s *Service) readPending(bucket, id string) (contracts.PendingEvent, bool) 
 		err = fmt.Errorf("the event is of version %d, id %q", rec.V, rec.ID)
 	}
 	if err != nil {
+		if rnErr := s.root.Rename(name, eventFile(bucket, id, badExt)); rnErr != nil {
+			err = errors.Join(err, fmt.Errorf("set it aside: %w", rnErr))
+		}
 		s.logger.Error("failed to read a pending bucket event").
 			Str("bucket", bucket).Str("id", id).Err("error", err).Send()
 		return contracts.PendingEvent{}, false

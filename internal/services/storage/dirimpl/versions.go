@@ -165,14 +165,16 @@ func (s *Service) readVersions(bucket, key string) (*versionManifest, []byte, er
 	return &m, raw, nil
 }
 
-// writeVersions commits m as the manifest of its key in bucket. The caller
-// holds the key's lock.
+// writeVersions commits m as the manifest of its key in bucket. A
+// directory sync that fails once m is renamed into place does not fail
+// it: m is committed (see unsynced). The caller holds the key's lock.
 func (s *Service) writeVersions(bucket string, m *versionManifest) error {
 	raw, err := json.Marshal(m)
 	if err != nil {
 		return fmt.Errorf("%s: failed to encode the versions of %q: %w", s.Name(), m.Key, err)
 	}
-	if err = s.writeDurable(versionsFile(bucket, m.Key), raw); err != nil {
+	name := versionsFile(bucket, m.Key)
+	if err = s.unsynced(name, s.writeDurable(name, raw)); err != nil {
 		return fmt.Errorf("%s: failed to store the versions of %q: %w", s.Name(), m.Key, err)
 	}
 	return nil
@@ -239,18 +241,24 @@ func (m *versionManifest) live() *versionEntry {
 
 // legacyEntry returns the entry of the null version of key, a key without
 // a manifest, read from the backend object at keyHash: nil when there is
-// none.
+// none. Its sequence is its LastModified in nanoseconds, or the sequence of
+// the event its write recorded, its trailer's Seq, when that is greater,
+// so the key's later changes sort after that event.
 func (s *Service) legacyEntry(ctx context.Context, bucket, key string) (*versionEntry, error) {
-	info, err := s.statData(ctx, "stat", bucket, key, nil)
+	tr, size, err := s.legacyTrailer(ctx, bucket, key)
 	if errors.Is(err, storage.ErrObjectNotFound) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
+	info, err := objectInfo(key, tr, size)
+	if err != nil {
+		return nil, fmt.Errorf("%s: stat %q: %w", s.Name(), key, err)
+	}
 	return &versionEntry{
 		ID: contracts.VersionNull, Legacy: true, ETag: info.ETag, Size: info.Size,
-		LastModified: info.LastModified, Seq: info.LastModified.UnixNano(),
+		LastModified: info.LastModified, Seq: max(info.LastModified.UnixNano(), tr.Seq),
 	}, nil
 }
 
@@ -540,7 +548,7 @@ func (s *Service) writeLegacy(
 	if err := s.checkPrecondition(ctx, bucket, key, w.cond); err != nil {
 		return nil, false, err
 	}
-	p, writeID, err := s.legacyWriteEvent(ctx, bucket, key, w.event)
+	p, err := s.legacyWriteEvent(ctx, bucket, key, w.event)
 	if err != nil {
 		return nil, false, err
 	}
@@ -549,7 +557,7 @@ func (s *Service) writeLegacy(
 		p.abort()
 		return nil, false, w.fail(err)
 	}
-	tr.WriteID = writeID
+	p.stamp(tr)
 	info, err := s.putObject(ctx, bucket, key, body, tr, w.fail)
 	if cErr := closeBody(); cErr != nil {
 		err = errors.Join(err, cErr)
@@ -570,28 +578,35 @@ func (s *Service) writeLegacy(
 }
 
 // legacyWriteEvent records the intent of event, caused by a write in place
-// at key about to be made, and returns it with the write ID its trailer is
-// to hold, its witness, "" for none: the event's ETag, size and time are
-// filled in once the write is made. The caller holds the key's lock.
+// at key about to be made, and returns it, nil for none: its trailer is to
+// hold the witness's write ID and the event's sequence, and the event's
+// ETag, size and time are filled in once the write is made. The sequence
+// is above the one of the object it replaces (see legacyEntry), so it
+// sorts after that object's event also after a restart on a clock that
+// went back. The caller holds the key's lock.
 func (s *Service) legacyWriteEvent(
 	ctx context.Context,
 	bucket, key string,
 	event contracts.EventName,
-) (*pendingEvent, string, error) {
-	p, err := s.event(ctx, contracts.BucketEvent{
+) (*pendingEvent, error) {
+	return s.event(ctx, contracts.BucketEvent{
 		Name: event, Bucket: bucket, Key: key, Time: s.now(), HasObject: true,
 	}, func(ev *contracts.BucketEvent) (witness, bool, error) {
 		id, err := s.versionIDOf(bucket, nil)
 		if err != nil {
 			return witness{}, false, err
 		}
-		ev.VersionID, ev.Sequence = id, s.nextSeq(0)
+		prior, err := s.legacyEntry(ctx, bucket, key)
+		if err != nil {
+			return witness{}, false, err
+		}
+		var floor int64
+		if prior != nil {
+			floor = prior.Seq
+		}
+		ev.VersionID, ev.Sequence = id, s.nextSeq(floor)
 		return witness{Kind: witnessWrite, WriteID: rand.Text()}, true, nil
 	})
-	if p == nil || err != nil {
-		return nil, "", err
-	}
-	return p, p.rec.Witness.WriteID, nil
 }
 
 // finishLegacy stores w's ACL as the one of info's object, written in
