@@ -8,51 +8,18 @@ import (
 	"tule.dev/object-store/internal/contracts"
 )
 
-// Version, Key and Plan are field for field the storage contract's
-// LifecycleVersion, LifecycleKey and LifecyclePlan, and Decider implements
-// its LifecycleDecider (decider below has the same method set), so that
-// they can become aliases of the contract's types.
+// Version, Key and Plan are the storage contract's types, so that
+// storage hands a key's versions to a Decider and applies its Plan.
+type (
+	// Version is a version or delete marker as lifecycle rules see it.
+	Version = contracts.LifecycleVersion
+	// Key is a key's versions, newest first, read under its lock.
+	Key = contracts.LifecycleKey
+	// Plan is what lifecycle rules do to a key now.
+	Plan = contracts.LifecyclePlan
+)
 
-// Version is a version or delete marker as lifecycle rules see it.
-//
-//nolint:govet // fieldalignment: the contract's field order, for the alias
-type Version struct {
-	LastModified    time.Time
-	NoncurrentSince time.Time // zero for the current version
-	VersionID       string    // "null", an ID, or "" in an Unversioned bucket
-	Size            int64     // 0 for a marker
-	Marker          bool
-	Tags            func() ([]contracts.Tag, error) // read on first call; nil-result for a marker
-}
-
-// Key is a key's versions, newest first, read under its lock.
-type Key struct {
-	Key        string
-	Versioning contracts.Versioning
-	Versions   []Version
-}
-
-// Plan is what lifecycle rules do to a key now.
-//
-//nolint:govet // fieldalignment: the contract's field order, for the alias
-type Plan struct {
-	// ExpireCurrentRule, when set, expires the current version, as a
-	// DeleteObject without a version does, any marker dated MarkerTime.
-	ExpireCurrentRule string
-	MarkerTime        time.Time
-	// Remove maps noncurrent version IDs to delete permanently to the rule.
-	Remove map[string]string
-}
-
-// decider is the storage contract's LifecycleDecider.
-type decider interface {
-	Plan(k *Key) (Plan, error)
-	// RemoveSoleMarker is asked once the plan is applied, when the key's only
-	// version left is a delete marker; it returns the rule ID, "" for no.
-	RemoveSoleMarker(key string, marker Version) (string, error)
-}
-
-var _ decider = (*Decider)(nil)
+var _ contracts.LifecycleDecider = (*Decider)(nil)
 
 // Decider evaluates a configuration's rules against the versions of one
 // key at one time.
