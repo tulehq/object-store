@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -173,7 +174,11 @@ type pendingEvent struct {
 // only once ev is routed, fills in the rest and returns the change's
 // witness, or false for a change that causes no event after all. A failure
 // to record is logged and records none. The error is only the
-// stageEventIntent hook's. The caller holds the key's lock.
+// stageEventIntent hook's. The caller holds the key's lock, and the
+// bucket's read lock: ctx's Pin must not be released before the event is
+// confirmed or aborted, since RemoveEmptyOutboxes relies on that lock, not
+// on the pinned context, to keep the outbox from being removed under the
+// write.
 func (s *Service) event(
 	ctx context.Context,
 	ev contracts.BucketEvent,
@@ -663,28 +668,31 @@ func (s *Service) recoveredWitness(
 	return s.witnessed(ctx, bucket, rec)
 }
 
-// PendingEvents returns up to n of the pending events, each bucket's in
-// name order, which is the order they were recorded in, the buckets taken
-// in turn. An event acknowledged while they are read is left out. One
-// that cannot be read or decoded is logged and left out (see
-// readPending).
-func (s *Service) PendingEvents(_ context.Context, n int) ([]contracts.PendingEvent, error) {
+// PendingEvents returns up to n of the pending events q does not skip,
+// each bucket's in name order, which is the order they were recorded in,
+// the buckets taken in turn, by name, from the one after q.After. An event
+// acknowledged while they are read is left out. One that cannot be read or
+// decoded is logged and left out (see readPending).
+func (s *Service) PendingEvents(
+	_ context.Context, n int, q contracts.PendingQuery,
+) ([]contracts.PendingEvent, error) {
 	if n <= 0 {
 		return nil, nil
 	}
-	queues, err := s.outboxes()
+	queues, err := s.outboxes(q.Skip)
 	if err != nil {
 		return nil, err
 	}
+	queues = rotateOutboxes(queues, q.After)
 	var out []contracts.PendingEvent
 	for round := 0; len(out) < n; round++ {
 		taken := false
-		for _, q := range queues {
-			if round >= len(q.ids) || len(out) == n {
+		for _, o := range queues {
+			if round >= len(o.ids) || len(out) == n {
 				continue
 			}
 			taken = true
-			if ev, ok := s.readPending(q.bucket, q.ids[round]); ok {
+			if ev, ok := s.readPending(o.bucket, o.ids[round]); ok {
 				out = append(out, ev)
 			}
 		}
@@ -695,6 +703,17 @@ func (s *Service) PendingEvents(_ context.Context, n int) ([]contracts.PendingEv
 	return out, nil
 }
 
+// rotateOutboxes returns queues, in bucket name order, starting with the
+// first after after and wrapping around.
+func rotateOutboxes(queues []outbox, after string) []outbox {
+	i, _ := slices.BinarySearchFunc(queues, after,
+		func(o outbox, name string) int { return strings.Compare(o.bucket, name) })
+	if i < len(queues) && queues[i].bucket == after {
+		i++
+	}
+	return append(queues[i:], queues[:i]...)
+}
+
 // outbox is a bucket's outbox, with the ids of its pending events in name
 // order.
 type outbox struct {
@@ -702,9 +721,9 @@ type outbox struct {
 	ids    []string
 }
 
-// outboxes returns the outboxes that hold pending events, in bucket name
-// order.
-func (s *Service) outboxes() ([]outbox, error) {
+// outboxes returns the outboxes that hold pending events skip, when set,
+// does not leave out, with those events' ids, in bucket name order.
+func (s *Service) outboxes(skip func(bucket, id string) bool) ([]outbox, error) {
 	buckets, err := fs.ReadDir(s.root.FS(), eventsDir)
 	if err != nil {
 		return nil, fmt.Errorf("%s: read the event outboxes: %w", s.Name(), err)
@@ -717,6 +736,9 @@ func (s *Service) outboxes() ([]outbox, error) {
 		ids, lErr := s.pendingIDs(b.Name())
 		if lErr != nil {
 			return nil, lErr
+		}
+		if skip != nil {
+			ids = slices.DeleteFunc(ids, func(id string) bool { return skip(b.Name(), id) })
 		}
 		if len(ids) > 0 {
 			out = append(out, outbox{bucket: b.Name(), ids: ids})

@@ -42,8 +42,8 @@ Settings come from environment variables prefixed with `TULE_`, and from a
 | `TULE_Server_Port` | `9000` | Listen port |
 | `TULE_Storage_RootDir` | `./data` (`/data` in the image) | Where buckets and objects are stored |
 | `TULE_Storage_Buckets` | unset | Comma-separated buckets to create at startup, if missing |
-| `TULE_Storage_QueuesEndpoint` | unset | The [queues](https://github.com/tulehq/queues) service's base URL, such as `http://localhost:9050`, whose service send endpoint queue destinations of event notifications are validated through ([Event notifications](#event-notifications)). Must be an absolute `http` or `https` URL; needs queues v0.6.0 or later. Unset, a queue destination is refused |
-| `TULE_Storage_FunctionsEndpoint` | unset | The [functions](https://github.com/tulehq/functions) service's base URL, such as `http://localhost:9060`, whose service invoke endpoint function destinations are validated through. Must be an absolute `http` or `https` URL; needs functions v0.6.1 or later. Unset, a function destination is refused |
+| `TULE_Storage_QueuesEndpoint` | unset | The [queues](https://github.com/tulehq/queues) service's base URL, such as `http://localhost:9050`, whose service send endpoint queue destinations of event notifications are validated and delivered through ([Event notifications](#event-notifications)). Must be an absolute `http` or `https` URL; needs queues v0.6.0 or later. Unset, a queue destination is refused |
+| `TULE_Storage_FunctionsEndpoint` | unset | The [functions](https://github.com/tulehq/functions) service's base URL, such as `http://localhost:9060`, whose service invoke endpoint function destinations are validated and invoked through. Must be an absolute `http` or `https` URL; needs functions v0.6.1 or later. Unset, a function destination is refused |
 | `TULE_HSTS_MaxAge` | unset | `Strict-Transport-Security` max age; the header is only sent when set |
 | `TULE_Server_Domain` | `localhost` | Enables virtual-hosted-style requests to `<bucket>.<domain>` |
 | `TULE_Auth_AccessKeyID` | required | The access key clients sign requests with |
@@ -616,8 +616,13 @@ refused with `400 InvalidArgument`, which bounds the cost of evaluating it.
   GetBucketNotificationConfiguration, and the deprecated
   PutBucketNotification and GetBucketNotification, which answered
   `501 NotImplemented`. They are evaluated as `s3:PutBucketNotification`
-  and `s3:GetBucketNotification`. Events are recorded but not yet
-  delivered.
+  and `s3:GetBucketNotification`. The events are delivered to queues
+  and functions ([Delivery](#delivery)).
+- **Data directory:** events are recorded under `.tule/events/` and a
+  write that records one adds `writeId` to its object's trailer, which
+  v0.12.0 ignores; nothing is written for a bucket without a
+  configuration. Moving back to v0.12.0, the events not yet delivered are
+  never delivered, and configurations are ignored.
 - **New settings:** `TULE_Storage_QueuesEndpoint` and
   `TULE_Storage_FunctionsEndpoint`.
 - **Behavior:** `aws:PrincipalIsAWSService` is `false` for every
@@ -1734,12 +1739,10 @@ taken, and `Content-MD5` and the checksum headers are accepted and
 ignored. A document over 1 MiB is refused with
 `400 MaxMessageLengthExceeded`.
 
-**Events are recorded but not yet delivered.** With an endpoint set, the
-events of a bucket configured for a queue or function destination are
-recorded in a durable outbox under `.tule/events/<bucket>/` in the
-storage root, as they will be delivered; this version sends none of them,
-and they stay there until a version that delivers them does. Validation,
-below, does call the destinations.
+The events a configuration matches are sent to its queue or function as
+S3 sends them, as `s3.amazonaws.com`, in the background: a write never
+waits for a destination, and a destination that fails or does not answer
+never fails a write ([Delivery](#delivery)).
 
 ### The configuration document
 
@@ -1858,6 +1861,136 @@ A destination in another account works when that service runs as that
 account and its policy names `aws:SourceAccount` `TULE_Auth_AccountID`.
 Each call waits at most 10 seconds.
 
+### Events and their messages
+
+An event is recorded when the change is committed, and never for a
+request that fails or is refused, a precondition failure included:
+
+| Operation | Event | Object fields |
+|---|---|---|
+| PutObject, presigned PUTs included | `ObjectCreated:Put` | `key`, `size`, `eTag`, `versionId`, `sequencer` |
+| CopyObject (the destination bucket's configuration) | `ObjectCreated:Copy` | as Put, and `"hasObjectAnnotation": false` |
+| CompleteMultipartUpload, UploadPartCopy parts included | `ObjectCreated:CompleteMultipartUpload` | as Put; `eTag` is `<md5>-<parts>` |
+| DeleteObject, or a key of DeleteObjects, in an Unversioned bucket, of an object that existed | `ObjectRemoved:Delete` | `key`, `sequencer` |
+| A delete without a version ID, Enabled or Suspended | `ObjectRemoved:DeleteMarkerCreated` | `key`, `versionId` (the marker's; `null` when Suspended), `sequencer` |
+| A delete of a version or marker that existed | `ObjectRemoved:Delete` | `key`, `versionId`, `sequencer` |
+| PutObjectTagging | `ObjectTagging:Put` | `key`, `eTag`, `versionId` |
+| DeleteObjectTagging | `ObjectTagging:Delete` | `key`, `eTag`, `versionId` |
+| PutObjectAcl that changes the stored ACL | `ObjectAcl:Put` | `key`, `eTag`, `versionId` |
+
+`versionId` is there whenever the bucket is not Unversioned, with the
+value of the response's `x-amz-version-id`. Lifecycle expirations send
+no event in this version. The other event types a configuration accepts
+(restore, replication, reduced redundancy, Intelligent-Tiering, object
+annotation and retention, `ObjectCreated:Post`, `LifecycleTransition`)
+never fire, as their features are not served. Overlapping configurations
+are refused, so an event matches at most one configuration and is sent
+once.
+
+A message is `{"Records":[...]}` with one record, in the field order of
+the S3 User Guide ("Event message structure"); a queue gets it as the
+message body, and a function as the payload, which aws-lambda-go's
+`events.S3Event` decodes. The PUT of `uploads/red flower.jpg` into the
+Enabled bucket `photos` by an IAM user, through the configuration
+`uploads-to-queue`:
+
+```json
+{"Records":[{"eventVersion":"2.6","eventSource":"aws:s3","awsRegion":"us-east-1",
+ "eventTime":"2026-11-15T10:30:00.123Z","eventName":"ObjectCreated:Put",
+ "userIdentity":{"principalId":"AIDAQ3EGRSXBEXAMPLE1"},
+ "requestParameters":{"sourceIPAddress":"127.0.0.1"},
+ "responseElements":{"x-amz-request-id":"9F2C61B05D3E4A17","x-amz-id-2":"..."},
+ "s3":{"s3SchemaVersion":"1.0","configurationId":"uploads-to-queue",
+  "bucket":{"name":"photos","ownerIdentity":{"principalId":"A2Q7W5ZK3XEXMP"},
+   "arn":"arn:aws:s3:::photos"},
+  "object":{"key":"uploads/red+flower.jpg","size":1024,
+   "eTag":"d41d8cd98f00b204e9800998ecf8427e","versionId":"0PHV8M1J4K2TG5A7Q3RS9MNOPB",
+   "sequencer":"1879A3F2C4B5D600"}}}]}
+```
+
+`eventTime` is the commit's time; `x-amz-request-id` and `x-amz-id-2`
+are the response headers of the request that caused the event. The
+`sequencer` is the change's commit sequence, 16 upper-case hex digits:
+of two events of one key, the one with the greater sequencer happened
+later, as the S3 User Guide gives it; it does not order events of
+different keys.
+
+Where S3's documentation leaves a field or a case open, this service
+chooses:
+
+| # | Case | Choice |
+|---|---|---|
+| N1 | `eventVersion` of each event type | `2.6` for all ("Starting with version 2.4, Amazon S3 uses a single unified version for all event types") |
+| N2 | `userIdentity.principalId` | The principal's unique ID, as `aws:userid` is (`AIDA...` for a user, `AROA...:<session>` for a role session), or the account ID for the root key; no `AWS:` prefix, as the User Guide's example has none |
+| N4 | `ownerIdentity.principalId`, which the User Guide calls no longer used | A fixed ID per account: `A` and the first 13 characters of the base32 of the SHA-256 of `tule:<account>` |
+| N5 | The URL encoding of `key` beyond a space written `+` | Each `/`-separated segment form-encoded as Go's `url.QueryEscape` does, `/` kept: `a b/c+d=e.txt` is `a+b/c%2Bd%3De.txt`. `*` is `%2A` and `~` is kept, which S3 may write differently |
+| N6 | Whether filters match the key or its encoding | The encoding, since filter values must write a space `+` and other special characters URL-encoded |
+| N7 | The object fields of removal, tagging and ACL events | Removal: `key`, `versionId`, `sequencer`. Tagging and ACL: `key`, `eTag`, `versionId`, no `size` and no `sequencer`, which the User Guide says is "only used with PUT and DELETE requests" |
+| N8 | `versionId` when Unversioned or Suspended | Left out when Unversioned; `null` for the null version when Suspended |
+| N9 | A delete of a key or version that does not exist | No event |
+| N10 | A Suspended delete without a version ID, which replaces the null version | One `ObjectRemoved:DeleteMarkerCreated` |
+| N12 | Overlap across destination types | Refused as within one type ([The configuration document](#the-configuration-document)) |
+| N16 | A limit on the number of configurations | None; the document is at most 1 MiB |
+| N17 | Retries and giving up | [Delivery](#delivery) |
+| N18 | The SQS `SenderId` of an event message | `s3.amazonaws.com` |
+| N22 | A DeleteObjectTagging of an object without tags, a PutObjectTagging of the tags it has | An event each time: S3 documents no "no change" rule for tags, as it does for ACLs |
+
+The other choices are those of the configuration and its validation
+above: event types, filter rules, ARNs and the reasons a destination is
+refused (N13, N14, N15, N19, N20, N21, N23, N24, N25).
+
+### Delivery
+
+S3 says event notifications are "designed to be delivered at least
+once. Typically, event notifications are delivered in seconds but can
+sometimes take a minute or longer" (S3 User Guide, "Amazon S3 Event
+Notifications"). Here:
+
+- **Recording.** Each event is recorded under the key's lock, in a
+  durable outbox in the storage root, `.tule/events/<bucket>/`, before
+  the write answers: an intent before the change is committed and the
+  event once it is, so a stop at any point loses no committed change's
+  event, and records none for a change that did not happen. A failure to
+  record is logged at Error and never fails the write. A bucket's events
+  are delivered after it is deleted, and a deleted bucket's outbox is
+  removed once it is empty; a live bucket's is kept.
+- **When.** The deliverer starts once the server is ready, after the
+  events a stop left are settled. A recorded event wakes it at once, and
+  it reads the outbox every 5 seconds besides.
+- **Order.** Up to 4 buckets are delivered at once, each one event at a
+  time, in the order its events were recorded. The outbox is read 100
+  events at a time, the buckets in turn, each read starting after the
+  bucket the previous full one reached, and leaving out the events
+  waiting for a retry and the buckets being delivered: so events waiting
+  for retries, however many, never hold back their bucket's later events,
+  and many buckets never hold back the others. Under retries events can
+  arrive out of order, which S3 allows: they "aren't guaranteed to arrive
+  in the same order". The `sequencer` orders the events of one key.
+- **Retries.** A failed delivery is retried 1 second later, then after
+  twice the wait before, up to 60 seconds, until 10 deliveries failed: a
+  destination that does not exist or whose policy refuses
+  `s3.amazonaws.com` is retried too, as it may be fixed meanwhile. Each
+  delivery waits at most 10 seconds. An event delivered or dropped whose
+  removal from the outbox fails, as on a read-only disk, is removed again
+  on the same schedule, and not delivered again.
+- **Drops.** An event is dropped after its 10th failed delivery; at once
+  when the destination refuses its content, as a queue does a message
+  over its `MaximumMessageSize` ("Amazon SQS rejects the notification and
+  doesn't deliver the event", S3 User Guide), or when its service has no
+  endpoint any more; and when it is read more than 24 hours after it was
+  recorded. Drops are logged at Warn, one line per bucket, reason and
+  destination with their count and the first event's key, event name
+  and error: a group's first drop at once, and those after it at most
+  once every 5 seconds, so neither a backlog dropped at once nor a steady
+  trickle logs a line per event; a stop logs those left. Each drop is
+  logged at Debug.
+- **Restarts.** The failures are counted in memory, so after a restart an
+  event gets another 10 deliveries; the 24 hours bound that. An event in
+  flight when the server stops stays in the outbox and is delivered again
+  after the next start, a duplicate S3 allows ("On rare occasions ...
+  duplicate S3 Event Notifications"). A duplicate has the same
+  `sequencer`.
+
 ## Health checks
 
 `GET /_health` (liveness) and `GET /_ready` (readiness) answer without a
@@ -1930,8 +2063,8 @@ as on S3. Treat both as opaque; their format may change.
   PutBucketNotificationConfiguration and
   GetBucketNotificationConfiguration, and the deprecated
   PutBucketNotification and GetBucketNotification, with destinations
-  validated through the queues and functions services. Events are
-  recorded but not yet delivered.
+  validated through the queues and functions services, and events
+  delivered to queues and functions.
 - **Lifecycle** ([above](#lifecycle)): PutBucketLifecycleConfiguration,
   GetBucketLifecycleConfiguration and DeleteBucketLifecycle, and the
   deprecated PutBucketLifecycle and GetBucketLifecycle, with expiration,

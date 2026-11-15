@@ -9,9 +9,12 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 	"tule.dev/identity/keysource"
 	"tule.dev/sigv4"
 
+	"tule.dev/object-store/internal/contracts"
+	"tule.dev/object-store/internal/httpx"
 	"tule.dev/object-store/internal/modules/health"
 	"tule.dev/object-store/internal/s3api"
 )
@@ -174,6 +177,42 @@ func verifySignature(v *sigv4.Verifier, domain string) func(http.Handler) http.H
 			next.ServeHTTP(w, verified)
 		})
 	}
+}
+
+// eventSource puts on each verified request's context the source of the
+// bucket events it causes (contracts.WithEventSource), which the storage
+// records with each event and its message reports:
+//
+//   - the principal ID, the principal's unique ID (aws:userid: AIDA... for
+//     a user, AROA...:<session> for a role session), or its account ID for
+//     a root key without one;
+//   - the source IP, the TCP peer's address, as aws:SourceIp is (never
+//     X-Forwarded-For, which any client can set);
+//   - the request's x-amz-request-id and x-amz-id-2, as RequestID put them
+//     on the context and the response.
+//
+// It runs after httpx.RequestID and verifySignature. A request without a
+// verified principal, a health probe, gets none.
+func eventSource(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p, ok := sigv4.PrincipalFrom(r.Context())
+		if !ok {
+			next.ServeHTTP(w, r)
+			return
+		}
+		src := contracts.EventSource{
+			PrincipalID: p.UserID,
+			RequestID:   middleware.GetReqID(r.Context()),
+			HostID:      httpx.HostID(r.Context()),
+		}
+		if src.PrincipalID == "" {
+			src.PrincipalID = p.AccountID
+		}
+		if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+			src.SourceIP = host
+		}
+		next.ServeHTTP(w, r.WithContext(contracts.WithEventSource(r.Context(), src)))
+	})
 }
 
 // virtualHost rewrites virtual-hosted-style requests, addressed to

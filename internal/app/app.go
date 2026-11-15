@@ -24,6 +24,7 @@ import (
 	"tule.dev/object-store/internal/notification"
 	"tule.dev/object-store/internal/s3api"
 	"tule.dev/object-store/internal/services/destinations"
+	"tule.dev/object-store/internal/services/notify"
 	"tule.dev/object-store/internal/services/storage/dirimpl"
 	"tule.dev/object-store/internal/services/sweep"
 )
@@ -74,8 +75,9 @@ func New(cfg *Config, extra ...gas.Option) (*gas.App, error) {
 	installMiddleware(app.Router(), cfg, logger, verifier)
 	app.ReadyFunc(createBuckets(cfg.Storage.Buckets))
 	app.ReadyFunc(recoverEvents(logger))
-	// Last, so no lifecycle rule applies before every service and ready
-	// hook has succeeded.
+	// Last, so no lifecycle rule applies and no event is delivered before
+	// every service and ready hook has succeeded, the events' recovery
+	// included.
 	app.ReadyFunc(func(*gas.ServiceContainer) error {
 		close(ready)
 		return nil
@@ -95,8 +97,9 @@ func registerInfraServices(app *gas.App, cfg *Config, logger gas.Logger) {
 // authorizer the modules evaluate each operation with, which reads bucket
 // policies from the storage, and how bucket policies' principals are bound;
 // the notification destinations, through queues and functions, either nil
-// for a service without an endpoint; and the lifecycle sweep, which applies
-// no rule before ready is closed. implicitACL is the ACL document of an
+// for a service without an endpoint; the lifecycle sweep, which applies
+// no rule before ready is closed; and the event deliverer, which delivers
+// nothing before it either. implicitACL is the ACL document of an
 // object without one of its own.
 func registerAppServices(
 	app *gas.App,
@@ -109,6 +112,9 @@ func registerAppServices(
 	functions *serviceinvoke.Client,
 ) {
 	clock := cfg.clockOrSystem()
+	// The storage wakes the deliverer through signal once it confirms an
+	// event; a wake-up already waiting stands for this one too.
+	signal := make(chan struct{}, 1)
 	app.RegisterServiceInstance[*sigv4.Verifier](verifier)
 	app.RegisterServiceInstance[contracts.PolicyPrincipals](bound)
 	app.RegisterServiceInstance[contracts.Destinations](destinations.New(queues, functions))
@@ -123,6 +129,12 @@ func registerAppServices(
 		dirimpl.NewService(cfg.Storage, clock, dirimpl.Events{
 			Router:      notification.NewRouter(cfg.Auth.AccountID, available),
 			ImplicitACL: implicitACL,
+			Signal: func() {
+				select {
+				case signal <- struct{}{}:
+				default:
+				}
+			},
 		}),
 	)
 	// It depends on the storage, so gas closes it, stopping its sweeps,
@@ -130,6 +142,17 @@ func registerAppServices(
 	app.RegisterSingletonService[*sweep.Service](
 		sweep.NewService(sweep.Settings{Clock: clock, Ready: ready}),
 	)
+	// The deliverer depends on the storage too, so it stops, leaving the
+	// events in flight in the outbox, before the storage closes. It runs
+	// on the system's clock, never the storage's (the event notifications
+	// design, section 2.3): an event's PendingEvent.Created is the wall
+	// time it was recorded at, which its 24-hour age bound is measured
+	// against, and its retries wait in wall time, as the destination
+	// calls' timeouts do.
+	timing := cfg.notifyTiming
+	timing.Clock, timing.Ready, timing.Signal = contracts.SystemClock, ready, signal
+	timing.Account = cfg.Auth.AccountID
+	app.RegisterSingletonService[*notify.Service](notify.NewService(timing))
 	app.RegisterSingletonService[*authz.Authorizer](
 		func(storage contracts.StorageProvider) *authz.Authorizer {
 			return authz.New(cfg.Auth.AccountID, storage)
@@ -255,6 +278,8 @@ func installMiddleware(r *gas.Router, cfg *Config, logger gas.Logger, verifier *
 	r.UseMiddlewareFunc(nil, bucketCORS(cfg.Server.Domain))
 
 	r.UseMiddlewareFunc(nil, verifySignature(verifier, cfg.Server.Domain))
+	// After the request IDs and the signature, whose values it records.
+	r.UseMiddlewareFunc(nil, eventSource)
 	if cfg.Server.Domain != "" {
 		r.UseMiddlewareFunc(nil, virtualHost(cfg.Server.Domain))
 	}
