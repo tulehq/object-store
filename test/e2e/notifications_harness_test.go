@@ -36,9 +36,11 @@ import (
 // The notification tests run object-store against real queues and
 // functions services, built from their checkouts and run as processes,
 // as secret-store's rotation tests run functions. The functions service
-// runs on the local Docker daemon. These tests only validate destinations,
-// which never runs a function (a dry run), so the function image is built
-// FROM scratch around a single file, and nothing is pulled.
+// runs on the local Docker daemon. A function that is only validated, which
+// never runs it (a dry run), is made from an image built FROM scratch
+// around a single file; one events are delivered to runs testdata/recorder,
+// built for linux on the host's architecture into an image FROM scratch.
+// Nothing is pulled.
 
 // The directories of the queues and functions checkouts to build, for a
 // layout where they are not object-store's siblings.
@@ -65,12 +67,62 @@ var functionImageBuild struct {
 	done bool
 }
 
+// recorderImage is the image of testdata/recorder.
+var recorderImage = "tule-object-store-e2e/recorder:" + runID
+
+// recorderImageBuild builds it once, for the first test that needs it.
+var recorderImageBuild struct {
+	err  error
+	once sync.Once
+	done bool
+}
+
 func TestMain(m *testing.M) {
 	code := m.Run()
 	if functionImageBuild.done {
-		removeFunctionImage()
+		removeImage(functionImage)
+	}
+	if recorderImageBuild.done {
+		removeImage(recorderImage)
 	}
 	os.Exit(code)
+}
+
+// requireRecorderImage builds the recorder image, once.
+func requireRecorderImage(t *testing.T) {
+	t.Helper()
+	recorderImageBuild.once.Do(func() {
+		recorderImageBuild.done = true
+		recorderImageBuild.err = buildRecorderImage()
+	})
+	requireNoErr(t, recorderImageBuild.err, "build the recorder image")
+}
+
+// buildRecorderImage builds testdata/recorder as a static linux binary,
+// with lambda.norpc since it speaks only the Runtime API, and the image
+// FROM scratch around it, never pulling. The recorder is a module of its
+// own, so its dependencies are not object-store's.
+func buildRecorderImage() error {
+	dir, err := os.MkdirTemp("", "tule-object-store-e2e-")
+	if err != nil {
+		return fmt.Errorf("temp dir: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+	//nolint:gosec // G204: go build of this suite's own testdata
+	build := exec.Command("go", "build", "-tags", "lambda.norpc", "-trimpath",
+		"-o", filepath.Join(dir, "bootstrap"), ".")
+	build.Dir = filepath.Join("testdata", "recorder")
+	build.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+runtime.GOARCH, "CGO_ENABLED=0")
+	if out, bErr := build.CombinedOutput(); bErr != nil {
+		return fmt.Errorf("build the recorder: %w\n%s", bErr, out)
+	}
+	dockerfile := "FROM scratch\nCOPY bootstrap /bootstrap\nENTRYPOINT [\"/bootstrap\"]\n"
+	if err = os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte(dockerfile), 0o600); err != nil {
+		return fmt.Errorf("Dockerfile: %w", err)
+	}
+	_, err = docker(context.Background(), "build", "--pull=false", "-q",
+		"--label", "dev.tule.e2e.run="+runID, "-t", recorderImage, dir)
+	return err
 }
 
 // requireFunctionImage builds the function image, once.
@@ -105,15 +157,15 @@ func buildFunctionImage() error {
 	return err
 }
 
-// removeFunctionImage removes the image, and any container left from it.
-func removeFunctionImage() {
+// removeImage removes image, and any container left from it.
+func removeImage(image string) {
 	ctx := context.Background()
-	ids, _ := docker(ctx, "ps", "-a", "-q", "--filter", "ancestor="+functionImage)
+	ids, _ := docker(ctx, "ps", "-a", "-q", "--filter", "ancestor="+image)
 	if f := strings.Fields(ids); len(f) > 0 {
-		fmt.Fprintf(os.Stderr, "e2e: removing %d containers left from %s\n", len(f), functionImage)
+		fmt.Fprintf(os.Stderr, "e2e: removing %d containers left from %s\n", len(f), image)
 		_, _ = docker(ctx, append([]string{"rm", "-f"}, f...)...)
 	}
-	_, _ = docker(ctx, "rmi", "-f", functionImage)
+	_, _ = docker(ctx, "rmi", "-f", image)
 }
 
 // docker runs the docker CLI against the local daemon and returns its
@@ -137,25 +189,53 @@ type notificationStack struct {
 	s3        *s3.Client
 	sqs       *sqs.Client
 	lambda    *lambda.Client
+	queues    *sibling
 	functions *sibling
+	// env and live are what object-store was started with, which
+	// restartObjectStore starts it with again.
+	env  map[string]string
+	live liveOptions
+}
+
+// stackOptions are the settings of a notification stack.
+type stackOptions struct {
+	// queuesEnv is the queues service's extra environment.
+	queuesEnv []string
+	// queuesEndpoint, when set, is object-store's queues endpoint, in
+	// place of the queues service.
+	queuesEndpoint string
+	// live are object-store's options.
+	live liveOptions
 }
 
 // startNotificationStack starts queues and functions standalone, and
 // object-store pointed at both.
 func startNotificationStack(t *testing.T) *notificationStack {
 	t.Helper()
-	queues := startSibling(t, "queues", queuesDirEnv)
+	return startNotificationStackWith(t, stackOptions{})
+}
+
+// startNotificationStackWith is startNotificationStack with opts.
+func startNotificationStackWith(t *testing.T, opts stackOptions) *notificationStack {
+	t.Helper()
+	queues := startSibling(t, "queues", queuesDirEnv, opts.queuesEnv...)
 	functions := startSibling(t, "functions", functionsDirEnv,
 		"TULE_Functions_RuntimeAPIPort=0")
-	srv := startLive(t, map[string]string{
+	endpoint := queues.URL
+	if opts.queuesEndpoint != "" {
+		endpoint = opts.queuesEndpoint
+	}
+	env := map[string]string{
 		"TULE_Auth_AccessKeyID":          rootKeyID,
 		"TULE_Auth_SecretAccessKey":      rootSecret,
-		"TULE_Storage_QueuesEndpoint":    queues.URL,
+		"TULE_Storage_QueuesEndpoint":    endpoint,
 		"TULE_Storage_FunctionsEndpoint": functions.URL,
-	})
+	}
+	srv := startLiveWith(t, env, opts.live)
 	creds := credentials.StaticCredentialsProvider{Value: rootCreds()}
 	return &notificationStack{
-		srv: srv, s3: srv.client(rootCreds()), functions: functions,
+		srv: srv, s3: srv.client(rootCreds()), functions: functions, queues: queues,
+		env: env, live: opts.live,
 		sqs: sqs.New(sqs.Options{
 			Region: "us-east-1", BaseEndpoint: aws.String(queues.URL), Credentials: creds,
 			HTTPClient: &http.Client{Timeout: serviceTimeout}, RetryMaxAttempts: 1,
@@ -165,6 +245,24 @@ func startNotificationStack(t *testing.T) *notificationStack {
 			HTTPClient: &http.Client{Timeout: serviceTimeout}, RetryMaxAttempts: 1,
 		}),
 	}
+}
+
+// restartObjectStore stops object-store and starts it again on the same
+// storage root, with the same settings, on a new port.
+func (s *notificationStack) restartObjectStore(t *testing.T) {
+	t.Helper()
+	s.srv.stop()
+	live := s.live
+	live.root = s.srv.Root
+	s.srv = startLiveWith(t, s.env, live)
+	s.s3 = s.srv.client(rootCreds())
+}
+
+// restartQueues starts the stopped queues service again, on the same port
+// and store.
+func (s *notificationStack) restartQueues(t *testing.T) {
+	t.Helper()
+	s.queues = s.queues.restart(t)
 }
 
 // queueARN is the ARN of the queue name.
@@ -179,11 +277,11 @@ func functionARN(name string) string {
 
 // s3QueuePolicy is the queue policy the S3 User Guide gives ("Granting
 // permissions to publish event notification messages to a destination"),
-// for queue and bucket.
+// for the queue of ARN queue and bucket.
 func s3QueuePolicy(queue, bucket string) string {
 	return `{"Version":"2012-10-17","Statement":[{"Effect":"Allow",` +
 		`"Principal":{"Service":"s3.amazonaws.com"},"Action":["SQS:SendMessage"],` +
-		`"Resource":"` + queueARN(queue) + `","Condition":{` +
+		`"Resource":"` + queue + `","Condition":{` +
 		`"ArnLike":{"aws:SourceArn":"arn:aws:s3:*:*:` + bucket + `"},` +
 		`"StringEquals":{"aws:SourceAccount":"` + account + `"}}}]}`
 }
@@ -220,6 +318,21 @@ func (s *notificationStack) receiveAll(t *testing.T, queueURL string) []sqstypes
 func (s *notificationStack) createFunction(t *testing.T, name string) {
 	t.Helper()
 	requireFunctionImage(t)
+	s.createFunctionFrom(t, name, functionImage)
+}
+
+// createRecorder creates the function name from the recorder image and
+// waits until it is Active.
+func (s *notificationStack) createRecorder(t *testing.T, name string) {
+	t.Helper()
+	requireRecorderImage(t)
+	s.createFunctionFrom(t, name, recorderImage)
+}
+
+// createFunctionFrom creates the function name from image and waits until
+// it is Active.
+func (s *notificationStack) createFunctionFrom(t *testing.T, name, image string) {
+	t.Helper()
 	arch := lambdatypes.ArchitectureX8664
 	if runtime.GOARCH == "arm64" {
 		arch = lambdatypes.ArchitectureArm64
@@ -228,7 +341,7 @@ func (s *notificationStack) createFunction(t *testing.T, name string) {
 		FunctionName:  aws.String(name),
 		Role:          aws.String("arn:aws:iam::" + account + ":role/function"),
 		PackageType:   lambdatypes.PackageTypeImage,
-		Code:          &lambdatypes.FunctionCode{ImageUri: aws.String(functionImage)},
+		Code:          &lambdatypes.FunctionCode{ImageUri: aws.String(image)},
 		Architectures: []lambdatypes.Architecture{arch},
 	})
 	requireNoErr(t, err, "create function "+name)
@@ -290,27 +403,61 @@ func (s *notificationStack) allowS3(t *testing.T, function, bucket string) {
 // service's retrieval API holds, read with the root key.
 func (s *notificationStack) invocations(t *testing.T, function string) int {
 	t.Helper()
-	u := s.functions.URL + "/_functions/invocations?" + url.Values{
-		"function": {function}, "limit": {"100"},
-	}.Encode()
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, u, http.NoBody)
-	requireNoErr(t, err, "build the invocations request")
+	return len(s.listInvocations(t, url.Values{"function": {function}, "limit": {"100"}}))
+}
+
+// invocation is an item of the functions service's retrieval API.
+type invocation struct {
+	RequestID    string `json:"requestId"`
+	Function     string `json:"function"`
+	Source       string `json:"source"`
+	Status       string `json:"status"`
+	ErrorMessage string `json:"errorMessage"`
+	Payload      string `json:"payload"`
+	Result       string `json:"result"`
+}
+
+// listInvocations returns the invocations the retrieval API lists for
+// query, newest first.
+func (s *notificationStack) listInvocations(t *testing.T, query url.Values) []invocation {
+	t.Helper()
+	var page struct {
+		Items []invocation `json:"items"`
+	}
+	requireNoErr(t, json.Unmarshal(s.functionsGet(t, "/_functions/invocations?"+query.Encode()),
+		&page), "decode the invocations")
+	return page.Items
+}
+
+// readInvocation returns the invocation requestID, with its payload and
+// result.
+func (s *notificationStack) readInvocation(t *testing.T, requestID string) invocation {
+	t.Helper()
+	var inv invocation
+	requireNoErr(t, json.Unmarshal(s.functionsGet(t,
+		"/_functions/invocations/"+url.PathEscape(requestID)), &inv), "decode the invocation")
+	return inv
+}
+
+// functionsGet GETs path of the functions service, signed with the root
+// key, and returns the body of its 200.
+func (s *notificationStack) functionsGet(t *testing.T, path string) []byte {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, s.functions.URL+path,
+		http.NoBody)
+	requireNoErr(t, err, "build the request")
 	sum := sha256.Sum256(nil)
 	requireNoErr(t, v4.NewSigner().SignHTTP(t.Context(), rootCreds(), req,
 		hex.EncodeToString(sum[:]), "lambda", "us-east-1", time.Now()), "sign the request")
 	res, err := (&http.Client{Timeout: serviceTimeout}).Do(req)
-	requireNoErr(t, err, "GET the invocations")
+	requireNoErr(t, err, "GET "+path)
 	defer func() { _ = res.Body.Close() }()
 	body, err := io.ReadAll(res.Body)
-	requireNoErr(t, err, "read the invocations")
+	requireNoErr(t, err, "read "+path)
 	if res.StatusCode != http.StatusOK {
-		t.Fatalf("GET the invocations: %d %s", res.StatusCode, body)
+		t.Fatalf("GET %s: %d %s", path, res.StatusCode, body)
 	}
-	var page struct {
-		Items []json.RawMessage `json:"items"`
-	}
-	requireNoErr(t, json.Unmarshal(body, &page), "decode the invocations")
-	return len(page.Items)
+	return body
 }
 
 // notifyBucket is the bucket the notification tests configure.

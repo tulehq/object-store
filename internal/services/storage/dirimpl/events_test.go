@@ -172,7 +172,7 @@ func (f *eventFixture) intents() []string {
 // and acknowledges them.
 func (f *eventFixture) pending() []contracts.BucketEvent {
 	f.t.Helper()
-	evs, err := f.s.PendingEvents(f.ctx, 1000)
+	evs, err := f.s.PendingEvents(f.ctx, 1000, contracts.PendingQuery{})
 	if err != nil {
 		f.t.Fatal(err)
 	}
@@ -586,7 +586,7 @@ func runRouterCase(t *testing.T, cfg *notification.Configuration, tc routerCase)
 	}
 	f.put("k", "v1")
 	f.del(oref("bucket", "k")) // not configured
-	evs, err := s.PendingEvents(f.ctx, 10)
+	evs, err := s.PendingEvents(f.ctx, 10, contracts.PendingQuery{})
 	if err != nil || len(evs) != tc.events {
 		t.Fatalf("events %d (%v), want %d", len(evs), err, tc.events)
 	}
@@ -945,7 +945,12 @@ func TestAnUnreadableEventIsSetAside(t *testing.T) {
 		t.Fatal(err)
 	}
 	for range 2 {
-		if evs, err := f.s.PendingEvents(f.ctx, 10); err != nil || len(evs) != 0 {
+		if evs, err := f.s.PendingEvents(
+			f.ctx,
+			10,
+			contracts.PendingQuery{},
+		); err != nil ||
+			len(evs) != 0 {
 			t.Fatalf("pending %v, %v", evs, err)
 		}
 	}
@@ -1098,7 +1103,7 @@ func twoBuckets(t *testing.T) *eventFixture {
 // PendingEvents takes each bucket's events in order, the buckets in turn.
 func TestPendingEventsTakeTheBucketsInTurn(t *testing.T) {
 	f := twoBuckets(t)
-	evs, err := f.s.PendingEvents(f.ctx, 3)
+	evs, err := f.s.PendingEvents(f.ctx, 3, contracts.PendingQuery{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1109,8 +1114,46 @@ func TestPendingEventsTakeTheBucketsInTurn(t *testing.T) {
 	if want := []string{"bucket/a", "other/z", "bucket/b"}; !slices.Equal(got, want) {
 		t.Fatalf("pending %v, want %v", got, want)
 	}
-	if evs, err = f.s.PendingEvents(f.ctx, 0); err != nil || evs != nil {
+	if evs, err = f.s.PendingEvents(f.ctx, 0, contracts.PendingQuery{}); err != nil || evs != nil {
 		t.Fatalf("pending %v, %v for n = 0", evs, err)
+	}
+}
+
+// PendingEvents leaves out the events Skip reports before it reads them,
+// so they do not count toward n.
+func TestPendingEventsSkipAndStartAfter(t *testing.T) {
+	f := twoBuckets(t)
+	all, err := f.s.PendingEvents(f.ctx, 10, contracts.PendingQuery{})
+	if err != nil || len(all) != 4 {
+		t.Fatalf("%d pending (%v)", len(all), err)
+	}
+	skipped := map[string]bool{all[0].ID: true, all[2].ID: true} // bucket/a, bucket/b
+	evs, err := f.s.PendingEvents(f.ctx, 2, contracts.PendingQuery{
+		Skip: func(bucket, id string) bool { return bucket == "bucket" && skipped[id] },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, 0, len(evs))
+	for _, ev := range evs {
+		got = append(got, ev.Bucket+"/"+keyOf(t, ev))
+	}
+	if want := []string{"bucket/c", "other/z"}; !slices.Equal(got, want) {
+		t.Fatalf("pending with a, b skipped %v, want %v", got, want)
+	}
+}
+
+// PendingEvents starts the turns with the bucket after After, wrapping
+// around.
+func TestPendingEventsStartAfter(t *testing.T) {
+	f := twoBuckets(t)
+	for after, want := range map[string]string{
+		"bucket": "other", "other": "bucket", "zzz": "bucket", "a": "bucket",
+	} {
+		evs, err := f.s.PendingEvents(f.ctx, 1, contracts.PendingQuery{After: after})
+		if err != nil || len(evs) != 1 || evs[0].Bucket != want {
+			t.Fatalf("after %q: %+v (%v), want the first of %s", after, evs, err, want)
+		}
 	}
 }
 
@@ -1118,7 +1161,7 @@ func TestPendingEventsTakeTheBucketsInTurn(t *testing.T) {
 // be an event's.
 func TestAckEvent(t *testing.T) {
 	f := twoBuckets(t)
-	evs, err := f.s.PendingEvents(f.ctx, 10)
+	evs, err := f.s.PendingEvents(f.ctx, 10, contracts.PendingQuery{})
 	if err != nil || len(evs) != 4 {
 		t.Fatalf("%d pending (%v)", len(evs), err)
 	}
@@ -1132,7 +1175,12 @@ func TestAckEvent(t *testing.T) {
 			t.Fatalf("acknowledged %q of %q", bad[1], bad[0])
 		}
 	}
-	if evs, err = f.s.PendingEvents(f.ctx, 10); err != nil || len(evs) != 3 {
+	if evs, err = f.s.PendingEvents(
+		f.ctx,
+		10,
+		contracts.PendingQuery{},
+	); err != nil ||
+		len(evs) != 3 {
 		t.Fatalf("%d pending after an ack (%v)", len(evs), err)
 	}
 }

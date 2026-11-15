@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 
 	"tule.dev/object-store/internal/app"
 	"tule.dev/object-store/internal/contracts"
+	"tule.dev/object-store/internal/services/notify"
 )
 
 // liveServer is object-store run as the binary runs it: the app's own
@@ -24,11 +26,15 @@ import (
 // network.
 type liveServer struct {
 	httpClient *http.Client
+	// stop stops the server, once; the test's end calls it too.
+	stop func()
 
 	// URL is the server's base URL.
 	URL string
 	// Addr is the host:port URL points at.
 	Addr string
+	// Root is the storage root it serves.
+	Root string
 }
 
 // Client returns an HTTP client for l, which trusts its certificate when
@@ -41,6 +47,12 @@ type liveOptions struct {
 	// clock, when set, is the clock the app stamps what it stores with
 	// and runs the lifecycle on (app.Config.SetClock).
 	clock contracts.Clock
+	// root, when set, is the storage root to serve, rather than a fresh
+	// one.
+	root string
+	// notifyTiming is the event deliverer's timing
+	// (app.Config.SetNotificationTiming).
+	notifyTiming notify.Settings
 }
 
 // startLive starts the app on a fresh storage root and a free port, with
@@ -56,8 +68,12 @@ func startLiveWith(t *testing.T, env map[string]string, opts liveOptions) *liveS
 	t.Helper()
 
 	port := freePort(t)
+	root := opts.root
+	if root == "" {
+		root = t.TempDir()
+	}
 	t.Setenv("TULE_GasEnv", "testing")
-	t.Setenv("TULE_Storage_RootDir", t.TempDir())
+	t.Setenv("TULE_Storage_RootDir", root)
 	t.Setenv("TULE_Auth_AccessKeyID", "test")
 	t.Setenv("TULE_Auth_SecretAccessKey", "test")
 	t.Setenv("TULE_Server_Port", strconv.Itoa(port))
@@ -73,25 +89,33 @@ func startLiveWith(t *testing.T, env map[string]string, opts liveOptions) *liveS
 	if opts.clock != nil {
 		cfg.SetClock(opts.clock)
 	}
+	cfg.SetNotificationTiming(opts.notifyTiming)
 	a, err := app.New(cfg)
 	requireNoErr(t, err, "new app")
 	requireNoErr(t, a.Start(context.Background()), "start app")
 
 	served := make(chan error, 1)
 	go func() { served <- a.Serve() }()
-	t.Cleanup(func() {
-		if sErr := a.Stop(context.Background()); sErr != nil {
-			t.Errorf("stop: %v", sErr)
-		}
-		if sErr := <-served; sErr != nil {
-			t.Errorf("serve: %v", sErr)
-		}
-	})
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() {
+			if sErr := a.Stop(context.Background()); sErr != nil {
+				t.Errorf("stop: %v", sErr)
+			}
+			if sErr := <-served; sErr != nil {
+				t.Errorf("serve: %v", sErr)
+			}
+		})
+	}
+	t.Cleanup(stop)
 
 	addr := "127.0.0.1:" + strconv.Itoa(port)
 	tr := &http.Transport{}
 	t.Cleanup(tr.CloseIdleConnections)
-	l := &liveServer{URL: "http://" + addr, Addr: addr, httpClient: &http.Client{Transport: tr}}
+	l := &liveServer{
+		URL: "http://" + addr, Addr: addr, Root: root, stop: stop,
+		httpClient: &http.Client{Transport: tr},
+	}
 	l.waitReady(t, served)
 	return l
 }

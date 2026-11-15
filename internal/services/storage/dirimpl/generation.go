@@ -169,7 +169,9 @@ func (s *Service) Pin(
 
 // requirePin returns the generation ctx pins bucket to, or an error when it
 // pins none: an operation on a bucket must run under a Pin, so it acts on
-// the bucket its caller looked up.
+// the bucket its caller looked up. It cannot tell a Pin already released:
+// the operation must finish, its events recorded, before the caller
+// releases it (see RemoveEmptyOutboxes).
 func requirePin(ctx context.Context, bucket string) (string, error) {
 	gen, ok := pinnedGenerations(ctx)[bucket]
 	if !ok {

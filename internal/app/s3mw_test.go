@@ -13,6 +13,8 @@ import (
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"tule.dev/sigv4"
 
+	"tule.dev/object-store/internal/contracts"
+	"tule.dev/object-store/internal/httpx"
 	"tule.dev/object-store/internal/s3api"
 )
 
@@ -209,5 +211,53 @@ func TestVerifierFailsClosedWhenIdentityHangs(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Fatalf("the lookup took %v, want about the 100ms timeout", elapsed)
+	}
+}
+
+// The source of a verified request's events is its principal's ID, the
+// account's for the root key, its peer's address, and the request and host
+// IDs its response carries; a request without a principal gets none.
+func TestEventSourceRecordsTheRequest(t *testing.T) {
+	v, err := newVerifier(&authSettings{
+		AccessKeyID: "root", SecretAccessKey: "secret", AccountID: "123456789012",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got contracts.EventSource
+	var found bool
+	h := httpx.RequestID(verifySignature(v, "")(eventSource(http.HandlerFunc(
+		func(_ http.ResponseWriter, r *http.Request) {
+			got, found = contracts.EventSourceFrom(r.Context())
+		}))))
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet,
+		"http://localhost:9000/", http.NoBody)
+	req.RemoteAddr = "192.0.2.7:51234"
+	req.Header.Set("X-Forwarded-For", "198.51.100.1")
+	const emptyHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	req.Header.Set("X-Amz-Content-Sha256", emptyHash)
+	if err = v4.NewSigner().SignHTTP(context.Background(),
+		aws.Credentials{AccessKeyID: "root", SecretAccessKey: "secret"},
+		req, emptyHash, "s3", "us-east-1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	want := contracts.EventSource{
+		PrincipalID: "123456789012", SourceIP: "192.0.2.7",
+		RequestID: rec.Header().Get(httpx.RequestIDHeader),
+		HostID:    rec.Header().Get(httpx.HostIDHeader),
+	}
+	if !found || got != want || want.RequestID == "" || want.HostID == "" {
+		t.Fatalf("source %+v (%t), want %+v", got, found, want)
+	}
+
+	found = false
+	probe := httptest.NewRequestWithContext(t.Context(), http.MethodGet,
+		"http://localhost:9000/_health", http.NoBody)
+	h.ServeHTTP(httptest.NewRecorder(), probe)
+	if found {
+		t.Fatalf("a probe got a source: %+v", got)
 	}
 }

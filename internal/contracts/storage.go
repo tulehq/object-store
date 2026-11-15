@@ -201,8 +201,8 @@ const MinRangeCopySource = 5 << 20
 // The operations on a bucket's objects, uploads, listing and policy
 // (everything but ListBuckets, HeadBucket, CreateBucket, DeleteBucket,
 // GetBucketPolicy and the event outbox's PendingEvents, AckEvent,
-// RecoverEvents and ConfirmCommitted) require a context Pin returned for that bucket, and fail
-// without one.
+// RecoverEvents, ConfirmCommitted and RemoveEmptyOutboxes) require a
+// context Pin returned for that bucket, and fail without one.
 type StorageProvider interface {
 	ListBuckets(ctx context.Context) ([]BucketInfo, error)
 	ListObjects(ctx context.Context, bucket string, in ListObjectsInput) (*ListObjectsOutput, error)
@@ -415,9 +415,10 @@ type StorageProvider interface {
 	) (*LifecycleAbort, error)
 
 	// PendingEvents returns up to n of the recorded events not yet
-	// acknowledged: each bucket's in the order they were recorded, the
-	// buckets taken in turn.
-	PendingEvents(ctx context.Context, n int) ([]PendingEvent, error)
+	// acknowledged that q does not skip: each bucket's in the order they
+	// were recorded, the buckets taken in turn, by name, from the one
+	// after q.After.
+	PendingEvents(ctx context.Context, n int, q PendingQuery) ([]PendingEvent, error)
 	// AckEvent removes the pending event id of bucket, once it was
 	// delivered or dropped. An event already removed is not an error.
 	AckEvent(ctx context.Context, bucket, id string) error
@@ -432,6 +433,24 @@ type StorageProvider interface {
 	// call. It is safe while the store serves, and is called after
 	// RecoverEvents and on each poll of the deliverer.
 	ConfirmCommitted(ctx context.Context) (int, error)
+	// RemoveEmptyOutboxes removes the outboxes of buckets that no longer
+	// exist once they hold no event, and returns how many it removed; a
+	// live bucket's is kept. It never removes one a write is recording an
+	// event in, and is safe while the store serves.
+	RemoveEmptyOutboxes(ctx context.Context) (int, error)
+}
+
+// PendingQuery narrows StorageProvider's PendingEvents. Its zero value
+// reads every pending event, from the first bucket by name.
+type PendingQuery struct {
+	// Skip, when set, reports the events to leave out, by bucket and ID,
+	// before they are read: they do not count toward the limit, so events
+	// a reader is not ready for do not hold back the others.
+	Skip func(bucket, id string) bool
+	// After, when set, is the bucket the turns start after, wrapping
+	// around: a reader that passes the bucket of the last event it got
+	// reads every bucket in turn, however many hold events.
+	After string
 }
 
 // LifecycleAbort is what AbortLifecycleUpload did to an upload.

@@ -10,6 +10,7 @@ import (
 	"tule.dev/sigv4"
 
 	"tule.dev/object-store/internal/contracts"
+	"tule.dev/object-store/internal/services/notify"
 	"tule.dev/object-store/internal/services/storage/dirimpl"
 )
 
@@ -66,6 +67,18 @@ type Config struct {
 	// waited on, nil for the system's (SetClock).
 	clock contracts.Clock
 	Env   config.Environment
+	// notifyTiming is the event deliverer's timing and bounds, zero for
+	// its defaults (SetNotificationTiming).
+	notifyTiming notify.Settings
+}
+
+// SetNotificationTiming sets the event deliverer's timing and bounds: its
+// Backoff, MaxBackoff, MaxAge, Poll, CallTimeout, MaxAttempts, Workers and
+// Batch, a zero one keeping its default, so a test can run out the retries
+// without waiting minutes. Its other fields are ignored: the app sets
+// them. It is not configurable from the environment.
+func (c *Config) SetNotificationTiming(s notify.Settings) {
+	c.notifyTiming = s
 }
 
 // SetClock makes stored timestamps and the lifecycle read and wait on clock

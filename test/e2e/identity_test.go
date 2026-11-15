@@ -72,11 +72,17 @@ func (b *syncBuffer) String() string {
 
 // sibling is a Tule service built from its checkout and run as a process.
 type sibling struct {
-	cmd     *exec.Cmd
-	exited  chan error
-	out     *syncBuffer
-	name    string
-	URL     string
+	cmd    *exec.Cmd
+	exited chan error
+	out    *syncBuffer
+	name   string
+	URL    string
+	// bin, dir, port and env are what it was run with, which restart
+	// runs it with again.
+	bin     string
+	dir     string
+	env     []string
+	port    int
 	stopped bool
 }
 
@@ -86,11 +92,20 @@ type sibling struct {
 // stopped it.
 func startSibling(t *testing.T, name, dirEnv string, env ...string) *sibling {
 	t.Helper()
+	return runSibling(t, buildSibling(t, name, dirEnv), name, t.TempDir(), freePort(t), env)
+}
 
-	bin := buildSibling(t, name, dirEnv)
-	port := freePort(t)
-	dir := t.TempDir()
+// restart runs a stopped sibling again: the same binary on the same port
+// and store, with the same environment.
+func (s *sibling) restart(t *testing.T) *sibling {
+	t.Helper()
+	return runSibling(t, s.bin, s.name, s.dir, s.port, s.env)
+}
 
+// runSibling runs bin, the service name, in dir, with its store there, on
+// port with the root key and env, and waits until it is ready.
+func runSibling(t *testing.T, bin, name, dir string, port int, env []string) *sibling {
+	t.Helper()
 	cmd := exec.Command(bin) //nolint:gosec // G204: the binary this test just built
 	cmd.Dir = dir
 	cmd.Env = append(envWithoutTule(),
@@ -107,6 +122,7 @@ func startSibling(t *testing.T, name, dirEnv string, env ...string) *sibling {
 		out:    &syncBuffer{},
 		name:   name,
 		URL:    "http://127.0.0.1:" + strconv.Itoa(port),
+		bin:    bin, dir: dir, env: env, port: port,
 	}
 	cmd.Stdout = s.out
 	cmd.Stderr = s.out

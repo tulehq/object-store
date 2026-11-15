@@ -167,6 +167,9 @@ func (s *Service) writeDurable(name string, doc []byte) error {
 	if err := s.makeDurableDir(dir); err != nil {
 		return err
 	}
+	if err := s.at(stageDurableDir); err != nil {
+		return err
+	}
 	tmp := name + ".tmp-" + rand.Text()
 	if err := s.writeSynced(tmp, doc); err != nil {
 		return errors.Join(err, s.removeIfExists(tmp))
@@ -183,6 +186,11 @@ func (s *Service) writeDurable(name string, doc []byte) error {
 	}
 	return nil
 }
+
+// stageDurableDir: writeDurable has found or created the directory it
+// writes into, and is about to create its temp file there. An error the
+// hook returns fails the write.
+const stageDurableDir = "durableDir"
 
 // stageDirSync: writeDurable has renamed a file into place and is about
 // to sync its directory. An error the hook returns stands for a failed

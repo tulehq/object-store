@@ -481,7 +481,7 @@ func TestDestinationValidation(t *testing.T) {
 // skipped, they are stored and sent nothing.
 func checkQueueValidation(t *testing.T, s *notificationStack) {
 	t.Helper()
-	eventsURL := s.createQueue(t, "events", s3QueuePolicy("events", notifyBucket))
+	eventsURL := s.createQueue(t, "events", s3QueuePolicy(queueARN("events"), notifyBucket))
 	closedURL := s.createQueue(t, "closed", "")
 
 	res := s.put(t, `<NotificationConfiguration>`+
