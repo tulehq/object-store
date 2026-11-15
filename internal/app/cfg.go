@@ -9,6 +9,7 @@ import (
 	"github.com/gasmod/gas/config"
 	"tule.dev/sigv4"
 
+	"tule.dev/object-store/internal/contracts"
 	"tule.dev/object-store/internal/services/storage/dirimpl"
 )
 
@@ -61,7 +62,25 @@ type Config struct {
 	Storage *dirimpl.Settings `validate:"required"`
 
 	store gas.ConfigProvider
+	// clock is the clock stored timestamps and the lifecycle are read and
+	// waited on, nil for the system's (SetClock).
+	clock contracts.Clock
 	Env   config.Environment
+}
+
+// SetClock makes stored timestamps and the lifecycle read and wait on clock
+// rather than the system's clock, so a test can move expiration forward
+// without waiting for it. It is not configurable from the environment.
+func (c *Config) SetClock(clock contracts.Clock) {
+	c.clock = clock
+}
+
+// clockOrSystem returns the clock SetClock set, or the system's.
+func (c *Config) clockOrSystem() contracts.Clock {
+	if c.clock == nil {
+		return contracts.SystemClock
+	}
+	return c.clock
 }
 
 const (
