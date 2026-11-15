@@ -138,7 +138,7 @@ func createBuckets(names []string) func(*gas.ServiceContainer) error {
 }
 
 func installMiddleware(r *gas.Router, cfg *Config, logger gas.Logger, verifier *sigv4.Verifier) {
-	r.UseMiddlewareFunc(nil, httpx.RequestID(cfg.Env))
+	r.UseMiddlewareFunc(nil, httpx.RequestID)
 
 	r.UseMiddlewareFunc(nil, middleware.ClientIPFromXFFTrustedProxies(1))
 

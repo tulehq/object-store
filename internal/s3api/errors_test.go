@@ -3,18 +3,24 @@ package s3api
 import (
 	"encoding/xml"
 	"net/http"
+	"net/http/httptest"
 	"testing"
+
+	"github.com/gasmod/gas/storage"
+
+	"tule.dev/object-store/internal/httpx"
 )
 
 func TestErrorMarshalsWithoutArguments(t *testing.T) {
 	e := ErrInvalidArgument("bad")
-	e.BucketName, e.Resource, e.RequestID = "b", "/b", "r1"
+	e.BucketName, e.Resource, e.RequestID, e.HostID = "b", "/b", "r1", "h1"
 	got, err := xml.Marshal(e)
 	if err != nil {
 		t.Fatal(err)
 	}
 	const want = `<Error><Code>InvalidArgument</Code><Message>bad</Message>` +
-		`<BucketName>b</BucketName><Resource>/b</Resource><RequestId>r1</RequestId></Error>`
+		`<BucketName>b</BucketName><Resource>/b</Resource><RequestId>r1</RequestId>` +
+		`<HostId>h1</HostId></Error>`
 	if string(got) != want {
 		t.Errorf("%s\nwant\n%s", got, want)
 	}
@@ -54,5 +60,25 @@ func TestToErrorKeepsArguments(t *testing.T) {
 	cp := toS3Error(src)
 	if cp == src || len(cp.Arguments) != 1 || cp.Arguments[0].Name != "n" {
 		t.Errorf("%+v", cp)
+	}
+}
+
+// The error body's RequestId and HostId are the pair the response's
+// headers carry.
+func TestWriteHTTPErrorCarriesTheResponsesIDs(t *testing.T) {
+	h := httpx.RequestID(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		WriteHTTPError(w, r, Target{Bucket: "b"}, storage.ErrBucketNotFound)
+	}))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/b", nil))
+
+	var body Error
+	if err := xml.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	id, host := rec.Header().Get(httpx.RequestIDHeader), rec.Header().Get(httpx.HostIDHeader)
+	if rec.Code != http.StatusNotFound || body.Code != "NoSuchBucket" || id == "" || host == "" ||
+		body.RequestID != id || body.HostID != host {
+		t.Errorf("%d %s; headers (%q, %q)", rec.Code, rec.Body, id, host)
 	}
 }

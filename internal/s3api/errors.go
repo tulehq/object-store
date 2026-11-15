@@ -28,6 +28,7 @@ type Error struct {
 	Key        string          `xml:"Key,omitempty"`
 	Resource   string          `xml:"Resource,omitempty"`
 	RequestID  string          `xml:"RequestId,omitempty"`
+	HostID     string          `xml:"HostId,omitempty"`
 	Arguments  []ErrorArgument `xml:"-"`
 	Status     int             `xml:"-"`
 }
@@ -49,7 +50,7 @@ func (e *Error) MarshalXML(enc *xml.Encoder, _ xml.StartElement) error {
 	if err := enc.EncodeToken(start); err != nil {
 		return err //nolint:wrapcheck // encoding/xml's error, as Marshal returns it
 	}
-	elems := make([][2]string, 0, 6+2*len(e.Arguments))
+	elems := make([][2]string, 0, 7+2*len(e.Arguments))
 	elems = append(elems, [2]string{"Code", e.Code}, [2]string{"Message", e.Message})
 	for i, a := range e.Arguments {
 		n := strconv.Itoa(i + 1)
@@ -61,6 +62,7 @@ func (e *Error) MarshalXML(enc *xml.Encoder, _ xml.StartElement) error {
 		{"Key", e.Key},
 		{"Resource", e.Resource},
 		{"RequestId", e.RequestID},
+		{"HostId", e.HostID},
 	} {
 		if opt[1] != "" {
 			elems = append(elems, opt)
@@ -186,6 +188,7 @@ func errorFor(r *http.Request, t Target, err error) (int, *Error) {
 	s3Err.Key = t.Key
 	s3Err.Resource = r.URL.Path
 	s3Err.RequestID = middleware.GetReqID(r.Context())
+	s3Err.HostID = httpx.HostID(r.Context())
 
 	return s3Err.Status, s3Err
 }

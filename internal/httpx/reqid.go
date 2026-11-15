@@ -4,29 +4,65 @@ package httpx
 
 import (
 	"context"
-	"fmt"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
 	"net/http"
-	"sync/atomic"
+	"strings"
 
-	"github.com/gasmod/gas/config"
 	"github.com/go-chi/chi/v5/middleware"
 )
 
-// RequestID returns middleware that puts a request ID on the request context.
-// Production-like environments get chi's random IDs; everywhere else the IDs
-// are short and sequential ("dev-1", "dev-2", ...), which is easier to follow
-// when reading logs by hand.
-func RequestID(env config.Environment) func(http.Handler) http.Handler {
-	if env.IsProductionLike() {
-		return middleware.RequestID
-	}
+// The response headers that carry a request's ID pair, as S3 names them.
+const (
+	RequestIDHeader = "x-amz-request-id"
+	HostIDHeader    = "x-amz-id-2"
+)
 
-	var reqID atomic.Uint64
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			id := fmt.Sprintf("dev-%d", reqID.Add(1))
-			ctx := context.WithValue(r.Context(), middleware.RequestIDKey, id)
-			next.ServeHTTP(w, r.WithContext(ctx))
-		})
-	}
+// hostIDBytes is how many random bytes a host ID encodes: 48, which base64
+// writes as 64 characters, the length of the x-amz-id-2 values S3 answers.
+const hostIDBytes = 48
+
+type hostIDKey struct{}
+
+// RequestID is middleware that gives each request an ID pair, as S3 does,
+// and answers it on every response, errors included:
+//
+//   - the request ID, 8 random bytes as 16 uppercase hex characters, in
+//     x-amz-request-id and on the context under chi's middleware.RequestIDKey,
+//     so the request logger and middleware.GetReqID read the same value;
+//   - the host ID, base64 of 48 random bytes, in x-amz-id-2 and on the
+//     context for HostID.
+//
+// Both are random in every environment, so an ID never repeats across a
+// restart, and a request's X-Request-Id header is ignored, as S3 never takes
+// a request ID from the client. Both values are opaque to clients.
+func RequestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id, hostID := newRequestID(), newHostID()
+		w.Header().Set(RequestIDHeader, id)
+		w.Header().Set(HostIDHeader, hostID)
+		ctx := context.WithValue(r.Context(), middleware.RequestIDKey, id)
+		ctx = context.WithValue(ctx, hostIDKey{}, hostID)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// HostID returns the host ID RequestID gave the request ctx belongs to, the
+// value its response carries in x-amz-id-2, or "" outside one.
+func HostID(ctx context.Context) string {
+	id, _ := ctx.Value(hostIDKey{}).(string)
+	return id
+}
+
+func newRequestID() string {
+	var b [8]byte
+	_, _ = rand.Read(b[:]) // never fails: crypto/rand.Read crashes the program instead
+	return strings.ToUpper(hex.EncodeToString(b[:]))
+}
+
+func newHostID() string {
+	b := make([]byte, hostIDBytes)
+	_, _ = rand.Read(b) // never fails, as above
+	return base64.StdEncoding.EncodeToString(b)
 }
