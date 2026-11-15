@@ -30,12 +30,16 @@ type Module struct {
 	// principals binds a bucket policy's principals before it is stored
 	// and shows a stored one as S3 shows it.
 	principals contracts.PolicyPrincipals
+	// destinations validates the destinations of a notification
+	// configuration before it is stored.
+	destinations contracts.Destinations
 }
 
 // NewModule returns a Module serving from storage, reading request
 // documents through verifier, authorizing operations with az and binding
-// bucket policies' principals with bound. It registers its routes when the
-// app initializes it.
+// bucket policies' principals with bound, and validating notification
+// destinations with dests. It registers its routes when the app
+// initializes it.
 func NewModule(
 	router *gas.Router,
 	logger gas.Logger,
@@ -43,14 +47,16 @@ func NewModule(
 	verifier *sigv4.Verifier,
 	az *authz.Authorizer,
 	bound contracts.PolicyPrincipals,
+	dests contracts.Destinations,
 ) *Module {
 	return &Module{
-		router:     router,
-		logger:     logger.With().Str("module", moduleName).Logger(),
-		storage:    storage,
-		verifier:   verifier,
-		authz:      az,
-		principals: bound,
+		router:       router,
+		logger:       logger.With().Str("module", moduleName).Logger(),
+		storage:      storage,
+		verifier:     verifier,
+		authz:        az,
+		principals:   bound,
+		destinations: dests,
 	}
 }
 

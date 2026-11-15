@@ -439,3 +439,36 @@ func TestTheDeprecatedLifecycleOperationsShareTheirActions(t *testing.T) {
 		}
 	}
 }
+
+// The deprecated PutBucketNotification and GetBucketNotification share the
+// request lines of PutBucketNotificationConfiguration and
+// GetBucketNotificationConfiguration, so they are served as those and
+// evaluated as their entries. The reference authorizes
+// GetBucketNotification with exactly the actions of the operation it is
+// served as, and PutBucketNotification with none, so evaluating it as
+// s3:PutBucketNotification asks for no less than the reference does.
+func TestTheDeprecatedNotificationOperationsShareTheirActions(t *testing.T) {
+	ref := loadReference(t)
+	for v1, served := range map[string]Operation{
+		"PutBucketNotification": PutBucketNotificationConfiguration,
+		"GetBucketNotification": GetBucketNotificationConfiguration,
+	} {
+		v1Actions, ok := ref.Operations[v1]
+		if !ok {
+			t.Errorf("%s is not an operation of the reference", v1)
+			continue
+		}
+		if len(v1Actions) == 0 && v1 == "PutBucketNotification" {
+			continue
+		}
+		var checkedActions []string
+		for _, a := range Actions(served) {
+			checkedActions = append(checkedActions, strings.TrimPrefix(a, "s3:"))
+		}
+		if !slices.Equal(slices.Sorted(slices.Values(v1Actions)),
+			slices.Sorted(slices.Values(checkedActions))) {
+			t.Errorf("%s is authorized with %v, %s is evaluated as %v",
+				v1, v1Actions, served, checkedActions)
+		}
+	}
+}

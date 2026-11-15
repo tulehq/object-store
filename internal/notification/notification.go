@@ -29,12 +29,6 @@ const (
 	HeaderSkip       = "X-Amz-Skip-Destination-Validation"
 )
 
-// bucketRegion is the region every bucket is in and every destination
-// must be in: object-store has no region setting, and every bucket reports
-// us-east-1 (README "Connecting a client"). A region setting would replace
-// it.
-const bucketRegion = "us-east-1"
-
 const xmlns = "http://s3.amazonaws.com/doc/2006-03-01/"
 
 // The filter rule names, as GET answers them.

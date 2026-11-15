@@ -17,9 +17,6 @@ import (
 	"tule.dev/object-store/internal/s3api"
 )
 
-// region is the region every bucket is in.
-const region = "us-east-1"
-
 // maxContextValue bounds the length of a condition key's value taken from
 // the request. tule.dev/policy's cost grows with the values' length times
 // the policies' patterns, so callers must cap what they pass. S3's longest
@@ -166,7 +163,7 @@ func globalKeys(r *http.Request, p sigv4.Principal, now time.Time) map[string][]
 		"aws:CurrentTime":     {now.UTC().Format(time.RFC3339)},
 		"aws:EpochTime":       {strconv.FormatInt(now.Unix(), 10)},
 		"aws:SecureTransport": {strconv.FormatBool(r.TLS != nil)},
-		"aws:RequestedRegion": {region},
+		"aws:RequestedRegion": {contracts.Region},
 	}
 	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
 		keys["aws:SourceIp"] = []string{host}

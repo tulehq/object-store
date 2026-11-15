@@ -6,6 +6,12 @@ import (
 	"time"
 )
 
+// Region is the region every bucket is in, and so the region every
+// notification destination must be in and the destination services' calls
+// are signed for: object-store has no region setting, and every bucket
+// reports us-east-1.
+const Region = "us-east-1"
+
 // EventName is the eventName of a bucket event message: an event type
 // without its "s3:" prefix (S3 User Guide, "Event message structure").
 type EventName string

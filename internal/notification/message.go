@@ -119,7 +119,7 @@ func render(owner, configurationID string, ev *contracts.BucketEvent) ([]byte, e
 	return marshal(message{Records: []record{{
 		EventVersion:      EventVersion,
 		EventSource:       eventSource,
-		AWSRegion:         bucketRegion,
+		AWSRegion:         contracts.Region,
 		EventTime:         ev.Time.UTC().Format(timeFormat),
 		EventName:         string(ev.Name),
 		UserIdentity:      principal{PrincipalID: ev.Source.PrincipalID},

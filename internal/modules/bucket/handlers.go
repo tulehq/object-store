@@ -109,8 +109,8 @@ func (m *Module) getSubresource(sub string) (func(gas.Context) error, bool) {
 }
 
 // getConfigSubresource returns the handler of the GET bucket operation
-// sub names among those reading a bucket's policy, ACL, Object Ownership
-// or lifecycle configuration, false for none of them.
+// sub names among those reading a bucket's policy, ACL, Object Ownership,
+// lifecycle or notification configuration, false for none of them.
 func (m *Module) getConfigSubresource(sub string) (func(gas.Context) error, bool) {
 	switch sub {
 	case "policy":
@@ -123,6 +123,8 @@ func (m *Module) getConfigSubresource(sub string) (func(gas.Context) error, bool
 		return m.getBucketOwnershipControls, true
 	case "lifecycle":
 		return m.getBucketLifecycle, true
+	case "notification":
+		return m.getBucketNotification, true
 	}
 	return nil, false
 }
@@ -400,6 +402,8 @@ func (m *Module) putSubresource(sub string) (func(gas.Context) error, bool) {
 		return m.putBucketOwnershipControls, true
 	case "lifecycle":
 		return m.putBucketLifecycle, true
+	case "notification":
+		return m.putBucketNotification, true
 	}
 	return nil, false
 }
