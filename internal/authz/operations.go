@@ -86,7 +86,13 @@ const (
 // check is one evaluation an operation needs: an action on one resource.
 type check struct {
 	action string
-	kind   resourceKind
+	// versionAction is the action evaluated instead of action on a target
+	// that names a version (s3api.Target's VersionID), "" for a check that
+	// has none: only the version action is checked, never both ("Either
+	// s3:GetObject or s3:GetObjectVersion", "Required permissions for
+	// Amazon S3 API operations", S3 User Guide).
+	versionAction string
+	kind          resourceKind
 	// implied marks a check the operation implies rather than requests,
 	// such as s3:ListBucket for a read that found no object, which takes
 	// none of the request's action-specific keys: a GetObject's ?prefix is
@@ -138,14 +144,28 @@ type check struct {
 // reference), where the reference's operation entry lists only
 // s3:GetObject and s3:GetObjectVersion.
 //
+// A check on an object a request names a version of is evaluated as its
+// versionAction: s3:GetObjectVersion for GetObject, HeadObject and a
+// copy's source, s3:DeleteObjectVersion for DeleteObject and each key of
+// DeleteObjects, and the Version actions of the tagging and ACL
+// operations, as the reference and the S3 User Guide's "Required
+// permissions for Amazon S3 API operations" list them. HeadObject's
+// s3:GetObjectVersion is beyond the reference's entry, which lists only
+// s3:GetObject, but its API reference asks for "the relevant read object
+// (or version) permission", and "A HEAD request has the same options as a
+// GET". GetObjectAttributes of a version needs s3:GetObjectVersion and
+// s3:GetObjectVersionAttributes ("you need both the s3:GetObjectVersion
+// and s3:GetObjectVersionAttributes permissions"), the second beyond the
+// reference's entry as s3:GetObjectAttributes is.
+//
 // A write that sets an ACL, tags or an Object Ownership needs more
 // actions, which headerChecks adds. The actions the reference lists for
-// features this server does not implement (object lock, versions) are not
-// checked. Requests for their subresources (?versionId, ?retention and the
-// like) are refused with NotImplemented before they are evaluated, but the
-// object lock headers of a write (x-amz-object-lock-*) are accepted and
-// ignored, so a write carrying them needs only s3:PutObject here, where S3
-// would also need s3:PutObjectRetention and the like.
+// object lock, which this server does not implement, are not checked.
+// Requests for its subresources (?retention and the like) are refused
+// with NotImplemented before they are evaluated, but the object lock
+// headers of a write (x-amz-object-lock-*) are accepted and ignored, so a
+// write carrying them needs only s3:PutObject here, where S3 would also
+// need s3:PutObjectRetention and the like.
 //
 // operations_test.go holds every entry to the reference, and the app's
 // tests drive every operation through its handler.
@@ -159,15 +179,23 @@ var operations = map[Operation][]check{
 	ListObjects:          {{action: "s3:ListBucket", kind: bucketResource}},
 	ListObjectsV2:        {{action: "s3:ListBucket", kind: bucketResource}},
 	ListMultipartUploads: {{action: "s3:ListBucketMultipartUploads", kind: bucketResource}},
-	DeleteObjects:        {{action: "s3:DeleteObject", kind: objectResource}},
-	GetObject:            {{action: "s3:GetObject", kind: objectResource}},
-	HeadObject:           {{action: "s3:GetObject", kind: objectResource}},
-	PutObject:            {{action: "s3:PutObject", kind: objectResource}},
+	DeleteObjects: {
+		{action: "s3:DeleteObject", versionAction: "s3:DeleteObjectVersion", kind: objectResource},
+	},
+	GetObject: {
+		{action: "s3:GetObject", versionAction: "s3:GetObjectVersion", kind: objectResource},
+	},
+	HeadObject: {
+		{action: "s3:GetObject", versionAction: "s3:GetObjectVersion", kind: objectResource},
+	},
+	PutObject: {{action: "s3:PutObject", kind: objectResource}},
 	CopyObject: {
 		{action: "s3:PutObject", kind: objectResource},
-		{action: "s3:GetObject", kind: objectResource},
+		{action: "s3:GetObject", versionAction: "s3:GetObjectVersion", kind: objectResource},
 	},
-	DeleteObject:            {{action: "s3:DeleteObject", kind: objectResource}},
+	DeleteObject: {
+		{action: "s3:DeleteObject", versionAction: "s3:DeleteObjectVersion", kind: objectResource},
+	},
 	CreateMultipartUpload:   {{action: "s3:PutObject", kind: objectResource}},
 	UploadPart:              {{action: "s3:PutObject", kind: objectResource}},
 	CompleteMultipartUpload: {{action: "s3:PutObject", kind: objectResource}},
@@ -209,8 +237,12 @@ var operations = map[Operation][]check{
 	},
 	PutBucketACL: {{action: "s3:PutBucketAcl", kind: bucketResource}},
 	GetBucketACL: {{action: "s3:GetBucketAcl", kind: bucketResource}},
-	PutObjectACL: {{action: "s3:PutObjectAcl", kind: objectResource}},
-	GetObjectACL: {{action: "s3:GetObjectAcl", kind: objectResource}},
+	PutObjectACL: {
+		{action: "s3:PutObjectAcl", versionAction: "s3:PutObjectVersionAcl", kind: objectResource},
+	},
+	GetObjectACL: {
+		{action: "s3:GetObjectAcl", versionAction: "s3:GetObjectVersionAcl", kind: objectResource},
+	},
 	PutBucketEncryption: {
 		{action: "s3:PutEncryptionConfiguration", kind: bucketResource},
 	},
@@ -220,16 +252,28 @@ var operations = map[Operation][]check{
 	DeleteBucketEncryption: {
 		{action: "s3:PutEncryptionConfiguration", kind: bucketResource},
 	},
-	PutObjectTagging:    {{action: "s3:PutObjectTagging", kind: objectResource}},
-	GetObjectTagging:    {{action: "s3:GetObjectTagging", kind: objectResource}},
-	DeleteObjectTagging: {{action: "s3:DeleteObjectTagging", kind: objectResource}},
+	PutObjectTagging: {{
+		action: "s3:PutObjectTagging", versionAction: "s3:PutObjectVersionTagging",
+		kind: objectResource,
+	}},
+	GetObjectTagging: {{
+		action: "s3:GetObjectTagging", versionAction: "s3:GetObjectVersionTagging",
+		kind: objectResource,
+	}},
+	DeleteObjectTagging: {{
+		action: "s3:DeleteObjectTagging", versionAction: "s3:DeleteObjectVersionTagging",
+		kind: objectResource,
+	}},
 	UploadPartCopy: {
 		{action: "s3:PutObject", kind: objectResource},
-		{action: "s3:GetObject", kind: objectResource},
+		{action: "s3:GetObject", versionAction: "s3:GetObjectVersion", kind: objectResource},
 	},
 	GetObjectAttributes: {
-		{action: "s3:GetObject", kind: objectResource},
-		{action: "s3:GetObjectAttributes", kind: objectResource},
+		{action: "s3:GetObject", versionAction: "s3:GetObjectVersion", kind: objectResource},
+		{
+			action: "s3:GetObjectAttributes", versionAction: "s3:GetObjectVersionAttributes",
+			kind: objectResource,
+		},
 	},
 }
 
@@ -316,7 +360,9 @@ func objectWriteChecks(op Operation, r *http.Request) []check {
 // the closed one. tags are the source's (see requestTagsOf), and a source
 // without tags needs neither. The s3:PutObjectTagging check is on the
 // object the copy replaces, so takes no s3:ExistingObjectTag keys (see
-// onWrite); the s3:GetObjectTagging check takes the source's. Both take
+// onWrite); the s3:GetObjectTagging check takes the source's, and is
+// s3:GetObjectVersionTagging for a source named by version, as a
+// GetObjectTagging of it would be. Both take
 // the source's tags as s3:RequestObjectTag and s3:RequestObjectTagKeys
 // where the reference lists them, on s3:PutObjectTagging.
 func copyTagChecks(op Operation, r *http.Request, tags []contracts.Tag) []check {
@@ -324,7 +370,10 @@ func copyTagChecks(op Operation, r *http.Request, tags []contracts.Tag) []check 
 		return nil
 	}
 	return []check{
-		{action: "s3:GetObjectTagging", kind: objectResource, onSource: true},
+		{
+			action: "s3:GetObjectTagging", versionAction: "s3:GetObjectVersionTagging",
+			kind: objectResource, onSource: true,
+		},
 		{action: "s3:PutObjectTagging", kind: objectResource, onWrite: true},
 	}
 }
@@ -383,9 +432,9 @@ func Operations() []Operation {
 	return ops
 }
 
-// Actions returns the actions op is evaluated as, in the order they are
-// evaluated, CopyObject's source first (see evaluateCopy), for tests that
-// check a denial names the right one.
+// Actions returns the actions op is evaluated as on targets that name no
+// version, in the order they are evaluated, CopyObject's source first (see
+// evaluateCopy), for tests that check a denial names the right one.
 func Actions(op Operation) []string {
 	checks := operations[op]
 	actions := make([]string, len(checks))

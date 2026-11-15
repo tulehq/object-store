@@ -87,10 +87,13 @@ func ErrPreconditionFailed() *Error {
 }
 
 // Target names the bucket and key an error is about. Key is empty for bucket
-// operations.
+// operations. VersionID is the version the request names, as given
+// ("null" for the null version), and empty for one that names none, which
+// acts on the current version.
 type Target struct {
-	Bucket string
-	Key    string
+	Bucket    string
+	Key       string
+	VersionID string
 }
 
 // WriteError renders err as an S3 error response. Storage sentinels map to
