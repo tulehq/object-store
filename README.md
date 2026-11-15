@@ -622,7 +622,10 @@ refused with `400 InvalidArgument`, which bounds the cost of evaluating it.
 - **Data directory:** events are recorded under `.tule/events/` and a
   write that records one adds `writeId` to its object's trailer, which
   v0.12.0 ignores; nothing is written for a bucket without a
-  configuration. Moving back to v0.12.0, the events not yet delivered are
+  configuration. A v0.12.0 data directory loads unchanged: the first start
+  adds an empty `.tule/events/`, and the first event recorded adds
+  `.tule/eventseq`, which keeps the events recorded after a restart in
+  order. Moving back to v0.12.0, the events not yet delivered are
   never delivered, and configurations are ignored.
 - **New settings:** `TULE_Storage_QueuesEndpoint` and
   `TULE_Storage_FunctionsEndpoint`.
