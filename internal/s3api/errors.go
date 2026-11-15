@@ -5,6 +5,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"net/http"
+	"strconv"
 
 	"github.com/gasmod/gas"
 	"github.com/gasmod/gas/storage"
@@ -16,19 +17,64 @@ import (
 
 // Error is an S3 error response. It implements error so handlers and services
 // can return one directly for conditions that have no storage-layer sentinel.
+// Arguments are written after Message as ArgumentName1, ArgumentValue1,
+// ArgumentName2 and so on, as S3 answers an InvalidArgument about named
+// values.
 type Error struct {
-	XMLName    xml.Name `xml:"Error"`
-	Code       string   `xml:"Code"`
-	Message    string   `xml:"Message"`
-	BucketName string   `xml:"BucketName,omitempty"`
-	Key        string   `xml:"Key,omitempty"`
-	Resource   string   `xml:"Resource,omitempty"`
-	RequestID  string   `xml:"RequestId,omitempty"`
-	Status     int      `xml:"-"`
+	XMLName    xml.Name        `xml:"Error"`
+	Code       string          `xml:"Code"`
+	Message    string          `xml:"Message"`
+	BucketName string          `xml:"BucketName,omitempty"`
+	Key        string          `xml:"Key,omitempty"`
+	Resource   string          `xml:"Resource,omitempty"`
+	RequestID  string          `xml:"RequestId,omitempty"`
+	Arguments  []ErrorArgument `xml:"-"`
+	Status     int             `xml:"-"`
+}
+
+// ErrorArgument is one numbered argument of an Error.
+type ErrorArgument struct {
+	Name  string
+	Value string
 }
 
 func (e *Error) Error() string {
 	return e.Code + ": " + e.Message
+}
+
+// MarshalXML implements xml.Marshaler: the element order of the struct
+// tags, with the numbered arguments after Message.
+func (e *Error) MarshalXML(enc *xml.Encoder, _ xml.StartElement) error {
+	start := xml.StartElement{Name: xml.Name{Local: "Error"}}
+	if err := enc.EncodeToken(start); err != nil {
+		return err //nolint:wrapcheck // encoding/xml's error, as Marshal returns it
+	}
+	elems := make([][2]string, 0, 6+2*len(e.Arguments))
+	elems = append(elems, [2]string{"Code", e.Code}, [2]string{"Message", e.Message})
+	for i, a := range e.Arguments {
+		n := strconv.Itoa(i + 1)
+		elems = append(elems, [2]string{"ArgumentName" + n, a.Name},
+			[2]string{"ArgumentValue" + n, a.Value})
+	}
+	for _, opt := range [][2]string{
+		{"BucketName", e.BucketName},
+		{"Key", e.Key},
+		{"Resource", e.Resource},
+		{"RequestId", e.RequestID},
+	} {
+		if opt[1] != "" {
+			elems = append(elems, opt)
+		}
+	}
+	for _, el := range elems {
+		if err := enc.EncodeElement(
+			el[1],
+			xml.StartElement{Name: xml.Name{Local: el[0]}},
+		); err != nil {
+			return err //nolint:wrapcheck // encoding/xml's error, as Marshal returns it
+		}
+	}
+	return enc.EncodeToken(start.End()) //nolint:wrapcheck // as above
 }
 
 // NewError builds an S3 error response with the given status and code.
@@ -39,6 +85,16 @@ func NewError(status int, code, message string) *Error {
 // ErrInvalidArgument is a 400 InvalidArgument error.
 func ErrInvalidArgument(msg string) *Error {
 	return NewError(http.StatusBadRequest, "InvalidArgument", msg)
+}
+
+// ErrUnableToValidate is the 400 InvalidArgument PutBucketNotificationConfiguration
+// answers when a destination fails validation; each argument names a
+// destination ARN and why it failed. The message is one S3 was seen to
+// answer, not documentation.
+func ErrUnableToValidate(args []ErrorArgument) *Error {
+	e := ErrInvalidArgument("Unable to validate the following destination configurations")
+	e.Arguments = args
+	return e
 }
 
 // ErrNotImplemented is a 501 NotImplemented error.
