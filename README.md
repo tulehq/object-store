@@ -599,6 +599,13 @@ refused with `400 InvalidArgument`, which bounds the cost of evaluating it.
   evaluated principal, where it was absent, and `aws:PrincipalServiceName`
   is absent whatever the request carries (tule.dev/policy v0.4.0). A `Bool`
   `Deny` on `aws:PrincipalIsAWSService` being `false` now applies.
+- **Behavior:** every response, errors included, answers
+  `x-amz-request-id` and `x-amz-id-2`, and an error body's `<RequestId>`
+  and `<HostId>` are the same pair, which SDKs report as the request ID
+  and extended request ID ([Request IDs](#request-ids)). The request ID
+  was `dev-1`, `dev-2` and so on outside production-like environments and
+  only reached error bodies; it is now random everywhere, and a client's
+  `X-Request-Id` header no longer sets it.
 
 ### Changes in v0.12.0
 
@@ -1724,6 +1731,18 @@ Browsers can upload to and download from presigned URLs directly once the
 bucket has a CORS configuration allowing the page's origin
 ([CORS](#cors)); without one, a browser's cross-origin requests to the
 bucket are refused, as on S3.
+
+### Request IDs
+
+Every response, errors and CORS preflights included, carries the pair S3
+answers: `x-amz-request-id`, 16 uppercase hex characters (8 random bytes),
+and `x-amz-id-2`, the standard base64 of 48 random bytes (64 characters).
+An error body's `<RequestId>` and `<HostId>` are the same pair, and the
+request ID is the `request_id` of the request's log line, so a failure an
+SDK reports can be found in the logs. Both are random in every
+environment, so neither repeats across a restart, and the server never
+takes a request ID from the client: an `X-Request-Id` header is ignored,
+as on S3. Treat both as opaque; their format may change.
 
 ## Supported operations
 
