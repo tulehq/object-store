@@ -1,14 +1,16 @@
 //go:build ignore
 
-// Command genroot writes test/e2e/testdata/v0.10.1-root.tar.gz, a storage
-// root written by object-store v0.10.1, which TestDataDirFromV0_10_1 loads.
-// Run it from the repository root, once, by hand:
+// Command genroot writes a storage root written by an earlier release of
+// object-store, which a TestDataDirFrom test loads. Run it from the
+// repository root, once per fixture, by hand:
 //
-//	go run test/e2e/testdata/genroot/main.go
+//	go run test/e2e/testdata/genroot/main.go                  # v0.10.1
+//	go run test/e2e/testdata/genroot/main.go -tag v0.12.0
 //
-// It builds v0.10.1 from its tag in a temporary git worktree, runs it on an
-// empty root, writes the objects described in README.md with the SDK,
-// stops the server and tars the root with fixture.json beside it.
+// It builds the release from its tag in a temporary git worktree, runs it
+// on an empty root, writes the objects README.md describes for that tag
+// with the SDK, stops the server and tars the root with fixture.json
+// beside it.
 package main
 
 import (
@@ -20,15 +22,18 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"io/fs"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -41,13 +46,56 @@ import (
 )
 
 const (
-	tag    = "v0.10.1"
-	output = "test/e2e/testdata/v0.10.1-root.tar.gz"
-	mib    = 1 << 20
+	tag = "v0.10.1"
+	mib = 1 << 20
 )
 
-// Fixture is fixture.json: what the test cannot know before the generator
-// runs.
+// scenario is what genroot writes for a tag.
+type scenario struct {
+	// populate writes the root, through the servers it starts with run,
+	// and returns its fixture.json, given the commit the tag names.
+	populate func(run runFunc, commit string) (any, error)
+	// output is the tarball, from the repository root.
+	output string
+	// keyID and secret are the server's key, which c signs with.
+	keyID, secret string
+	// clock builds the server as clockMain, whose storage clock runs
+	// ahead of the system's by the offset run is given, in place of
+	// ./cmd, which ignores it.
+	clock bool
+}
+
+// runFunc runs the server on the root, with its storage clock offset
+// ahead, calls fn with a client for it, and stops it.
+type runFunc func(offset time.Duration, fn func(c *s3.Client) error) error
+
+// scenarios are the fixtures genroot writes, by tag.
+var scenarios = map[string]scenario{
+	tag: {
+		output: "test/e2e/testdata/v0.10.1-root.tar.gz", keyID: "test", secret: "test",
+		populate: func(run runFunc, commit string) (any, error) {
+			fx := &Fixture{Tag: tag, Commit: commit, Objects: map[string]Object{}}
+			return fx, run(0, func(c *s3.Client) error { return populate(c, fx) })
+		},
+	},
+	// The e2e notification stack's root key, so that the test serves the
+	// root with the key that wrote it.
+	tagV0_12_0: {
+		output: "test/e2e/testdata/v0.12.0-root.tar.gz",
+		keyID:  "AKIAIOSFODNN7EXAMPLE", secret: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+		clock: true,
+		populate: func(run runFunc, commit string) (any, error) {
+			fx := &VersionedFixture{
+				Tag: tagV0_12_0, Commit: commit, Versions: map[string]Version{},
+				NoncurrentSince: map[string]time.Time{},
+			}
+			return fx, populateV0_12_0(run, fx)
+		},
+	},
+}
+
+// Fixture is the v0.10.1 fixture.json: what the test cannot know before
+// the generator runs.
 type Fixture struct {
 	Objects map[string]Object `json:"objects"` // by "bucket/key"
 	Upload  Upload            `json:"upload"`
@@ -80,6 +128,17 @@ func main() {
 }
 
 func run() error {
+	name := flag.String("tag", tag, "the release whose root to write")
+	out := flag.String("o", "", "the tarball to write, absolute or from the repository "+
+		"root, instead of the fixture's own")
+	flag.Parse()
+	sc, ok := scenarios[*name]
+	if !ok {
+		return fmt.Errorf("no fixture for tag %q", *name)
+	}
+	if *out != "" {
+		sc.output = *out
+	}
 	repo, err := output1("git", "rev-parse", "--show-toplevel")
 	if err != nil {
 		return err
@@ -91,7 +150,7 @@ func run() error {
 	defer func() { _ = os.RemoveAll(tmp) }()
 
 	src := filepath.Join(tmp, "src")
-	if err = runIn(repo, "git", "worktree", "add", "--detach", src, tag); err != nil {
+	if err = runIn(repo, "git", "worktree", "add", "--detach", src, *name); err != nil {
 		return err
 	}
 	defer func() {
@@ -104,7 +163,13 @@ func run() error {
 		return err
 	}
 	bin := filepath.Join(tmp, "tule-object-store")
-	if err = runIn(src, "go", "build", "-o", bin, "./cmd"); err != nil {
+	pkg := "./cmd"
+	if sc.clock {
+		if pkg, err = writeClockMain(src); err != nil {
+			return err
+		}
+	}
+	if err = runIn(src, "go", "build", "-o", bin, pkg); err != nil {
 		return err
 	}
 
@@ -112,15 +177,78 @@ func run() error {
 	if err = os.Mkdir(root, 0o750); err != nil {
 		return err
 	}
-	fx := Fixture{Tag: tag, Commit: commit, Objects: map[string]Object{}}
-	if err = serve(bin, root, func(c *s3.Client) error { return populate(c, &fx) }); err != nil {
+	fx, err := sc.populate(func(offset time.Duration, fn func(c *s3.Client) error) error {
+		return serve(bin, root, sc, offset, fn)
+	}, commit)
+	if err != nil {
 		return err
 	}
-	return writeTarball(filepath.Join(repo, output), root, &fx)
+	dest := sc.output
+	if !filepath.IsAbs(dest) {
+		dest = filepath.Join(repo, dest)
+	}
+	return writeTarball(dest, root, fx)
 }
 
-// serve runs bin on root, calls fn with a client for it, and stops it.
-func serve(bin, root string, fn func(c *s3.Client) error) error {
+// clockOffsetEnv is the variable clockMain reads its clock offset from.
+const clockOffsetEnv = "GENROOT_CLOCK_OFFSET"
+
+// clockMain is the tag's ./cmd with its storage clock set, through the
+// app's SetClock, to the system's moved ahead by GENROOT_CLOCK_OFFSET, so
+// that the root holds times days apart. Waits keep the system clock.
+const clockMain = `// Command genrootclock is ./cmd with its storage clock moved ahead.
+package main
+
+import (
+	"context"
+	"log"
+	"os"
+	"time"
+
+	"tule.dev/object-store/internal/app"
+)
+
+type offsetClock time.Duration
+
+func (c offsetClock) Now() time.Time { return time.Now().Add(time.Duration(c)) }
+
+func (offsetClock) After(d time.Duration) <-chan time.Time { return time.After(d) }
+
+func main() {
+	offset, err := time.ParseDuration(os.Getenv("` + clockOffsetEnv + `"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	cfg, err := app.LoadConfig()
+	if err != nil {
+		log.Fatal(err)
+	}
+	cfg.SetClock(offsetClock(offset))
+	a, err := app.New(cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err = a.Run(context.Background()); err != nil {
+		log.Fatal(err)
+	}
+}
+`
+
+// writeClockMain writes clockMain into the checkout src and returns the
+// package to build.
+func writeClockMain(src string) (string, error) {
+	dir := filepath.Join(src, "cmd", "genrootclock")
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return "", err
+	}
+	return "./cmd/genrootclock", os.WriteFile(filepath.Join(dir, "main.go"), []byte(clockMain), 0o600)
+}
+
+// serve runs bin on root with sc's key, and its storage clock offset ahead
+// when sc builds clockMain, calls fn with a client for it, and stops it.
+func serve(
+	bin, root string, sc scenario, offset time.Duration, fn func(c *s3.Client) error,
+) error {
 	port, err := freePort()
 	if err != nil {
 		return err
@@ -129,10 +257,15 @@ func serve(bin, root string, fn func(c *s3.Client) error) error {
 	cmd.Env = append(os.Environ(),
 		"TULE_GasEnv=testing",
 		"TULE_Storage_RootDir="+root,
-		"TULE_Auth_AccessKeyID=test",
-		"TULE_Auth_SecretAccessKey=test",
+		"TULE_Auth_AccessKeyID="+sc.keyID,
+		"TULE_Auth_SecretAccessKey="+sc.secret,
 		"TULE_Server_Port="+strconv.Itoa(port),
 	)
+	if sc.clock {
+		cmd.Env = append(cmd.Env, clockOffsetEnv+"="+offset.String())
+	} else if offset != 0 {
+		return fmt.Errorf("a clock offset of %v for a build without clockMain", offset)
+	}
 	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
 	if err = cmd.Start(); err != nil {
 		return err
@@ -147,7 +280,7 @@ func serve(bin, root string, fn func(c *s3.Client) error) error {
 			Region:       "us-east-1",
 			BaseEndpoint: aws.String(url),
 			UsePathStyle: true,
-			Credentials:  credentials.NewStaticCredentialsProvider("test", "test", ""),
+			Credentials:  credentials.NewStaticCredentialsProvider(sc.keyID, sc.secret, ""),
 		}))
 	}
 	if sErr := cmd.Process.Signal(syscall.SIGTERM); sErr != nil {
@@ -190,7 +323,7 @@ const legacyPolicy = `{"Version":"2012-10-17","Statement":[{"Sid":"ReadLegacy",`
 	`"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::000000000000:root"},` +
 	`"Action":"s3:GetObject","Resource":"arn:aws:s3:::legacy/*"}]}`
 
-// populate writes the objects README.md lists.
+// populate writes the objects README.md lists for v0.10.1.
 func populate(c *s3.Client, fx *Fixture) error {
 	ctx := context.Background()
 	if _, err := c.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String("legacy")}); err != nil {
@@ -366,9 +499,366 @@ func pendingUpload(ctx context.Context, c *s3.Client, fx *Fixture) error {
 	return nil
 }
 
+// tagV0_12_0 is the last release before event notifications.
+const tagV0_12_0 = "v0.12.0"
+
+// VersionedFixture is the v0.12.0 fixture.json: what the test cannot know
+// before the generator runs.
+type VersionedFixture struct {
+	// Written is a time after the last write, on the server's storage
+	// clock.
+	Written  time.Time          `json:"written"`
+	Versions map[string]Version `json:"versions"` // by the label README.md gives
+	// NoncurrentSince is when the versions labeled became noncurrent, as
+	// the server recorded it: the LastModified of the successor they had
+	// then, since deleted.
+	NoncurrentSince map[string]time.Time `json:"noncurrentSince"`
+	Upload          Upload               `json:"upload"`
+	Commit          string               `json:"commit"`
+	Tag             string               `json:"tag"`
+}
+
+// Version is a version or delete marker written: a marker has no body.
+type Version struct {
+	LastModified time.Time `json:"lastModified"`
+	Bucket       string    `json:"bucket"`
+	Key          string    `json:"key"`
+	VersionID    string    `json:"versionId"`
+	SHA256       string    `json:"sha256,omitempty"`
+	ETag         string    `json:"etag,omitempty"`
+	Size         int64     `json:"size"`
+}
+
+// lifecycleRulesV0_12_0 is the lifecycle configuration of "history": a
+// rule that expires reports/ a day after they are written, one that
+// expires the noncurrent versions of archive/ 4 days after they became
+// noncurrent, and one, Disabled, that would expire everything.
+func lifecycleRulesV0_12_0() []types.LifecycleRule {
+	return []types.LifecycleRule{
+		{
+			ID: aws.String("expire-reports"), Status: types.ExpirationStatusEnabled,
+			Filter:     &types.LifecycleRuleFilter{Prefix: aws.String("reports/")},
+			Expiration: &types.LifecycleExpiration{Days: aws.Int32(1)},
+			NoncurrentVersionExpiration: &types.NoncurrentVersionExpiration{
+				NoncurrentDays: aws.Int32(30),
+			},
+		},
+		{
+			ID: aws.String("expire-archive"), Status: types.ExpirationStatusEnabled,
+			Filter: &types.LifecycleRuleFilter{Prefix: aws.String("archive/")},
+			NoncurrentVersionExpiration: &types.NoncurrentVersionExpiration{
+				NoncurrentDays: aws.Int32(4),
+			},
+		},
+		{
+			ID: aws.String("disabled-all"), Status: types.ExpirationStatusDisabled,
+			Filter:     &types.LifecycleRuleFilter{Prefix: aws.String("")},
+			Expiration: &types.LifecycleExpiration{Days: aws.Int32(1)},
+		},
+	}
+}
+
+// The storage clock offsets of the three servers populateV0_12_0 runs.
+const (
+	secondRun = 48 * time.Hour
+	thirdRun  = 96 * time.Hour
+)
+
+// populateV0_12_0 writes the versions README.md lists for v0.12.0, with
+// three servers on the root, each with its storage clock two days ahead
+// of the one before.
+func populateV0_12_0(run runFunc, fx *VersionedFixture) error {
+	ctx := context.Background()
+	archive := aws.String("archive/log.txt")
+	putArchive := func(c *s3.Client, n int) error {
+		return putLabeled(ctx, c, fx, fmt.Sprintf("archive-v%d", n), &s3.PutObjectInput{
+			Bucket: aws.String("history"), Key: archive,
+			Body: strings.NewReader(fmt.Sprintf("archive/log.txt, version %d\n", n)),
+		})
+	}
+	if err := run(0, func(c *s3.Client) error {
+		if err := populateHistory(ctx, c, fx); err != nil {
+			return err
+		}
+		if err := putArchive(c, 1); err != nil {
+			return err
+		}
+		return populatePaused(ctx, c, fx)
+	}); err != nil {
+		return err
+	}
+	if err := run(secondRun, func(c *s3.Client) error {
+		if err := putArchive(c, 2); err != nil {
+			return err
+		}
+		if err := recordLastModified(ctx, c, "history", fx); err != nil {
+			return err
+		}
+		fx.NoncurrentSince["archive-v1"] = fx.Versions["archive-v2"].LastModified
+		return nil
+	}); err != nil {
+		return err
+	}
+	return run(thirdRun, func(c *s3.Client) error {
+		if err := putArchive(c, 3); err != nil {
+			return err
+		}
+		if _, err := c.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket: aws.String("history"), Key: archive,
+			VersionId: aws.String(fx.Versions["archive-v2"].VersionID),
+		}); err != nil {
+			return fmt.Errorf("delete archive/log.txt version 2: %w", err)
+		}
+		delete(fx.Versions, "archive-v2")
+		if err := expiringReport(ctx, c, fx); err != nil {
+			return err
+		}
+		for _, bucket := range []string{"history", "paused"} {
+			if err := recordLastModified(ctx, c, bucket, fx); err != nil {
+				return err
+			}
+		}
+		fx.Written = time.Now().Add(thirdRun).UTC()
+		return nil
+	})
+}
+
+// populateHistory writes "history": legacy null versions, then, Enabled,
+// versions over one of them, and versions of doc.txt with tags, an ACL
+// and a delete marker.
+func populateHistory(ctx context.Context, c *s3.Client, fx *VersionedFixture) error {
+	bucket := aws.String("history")
+	if _, err := c.CreateBucket(ctx, &s3.CreateBucketInput{
+		Bucket: bucket, ObjectOwnership: types.ObjectOwnershipObjectWriter,
+	}); err != nil {
+		return fmt.Errorf("create history: %w", err)
+	}
+	if _, err := c.DeletePublicAccessBlock(ctx, &s3.DeletePublicAccessBlockInput{
+		Bucket: bucket,
+	}); err != nil {
+		return fmt.Errorf("delete public access block: %w", err)
+	}
+	if err := putLabeled(ctx, c, fx, "legacy-null", &s3.PutObjectInput{
+		Bucket: bucket, Key: aws.String("legacy.txt"),
+		Body:    strings.NewReader("legacy.txt, written while history was unversioned\n"),
+		Tagging: aws.String("origin=unversioned"),
+	}); err != nil {
+		return err
+	}
+	if err := putLabeled(ctx, c, fx, "untouched-null", &s3.PutObjectInput{
+		Bucket: bucket, Key: aws.String("untouched.txt"),
+		Body: strings.NewReader("untouched.txt, written while history was unversioned\n"),
+	}); err != nil {
+		return err
+	}
+	if err := versioning(ctx, c, "history", types.BucketVersioningStatusEnabled); err != nil {
+		return err
+	}
+	puts := []struct{ label, key, body string }{
+		{"legacy-v1", "legacy.txt", "legacy.txt, its first version\n"},
+		{"doc-v1", "doc.txt", "doc.txt, version 1\n"},
+		{"doc-v2", "doc.txt", "doc.txt, version 2\n"},
+		{"doc-v3", "doc.txt", "doc.txt, version 3\n"},
+	}
+	for _, p := range puts {
+		if err := putLabeled(ctx, c, fx, p.label, &s3.PutObjectInput{
+			Bucket: bucket, Key: aws.String(p.key), Body: strings.NewReader(p.body),
+		}); err != nil {
+			return err
+		}
+	}
+	doc := aws.String("doc.txt")
+	if _, err := c.PutObjectTagging(ctx, &s3.PutObjectTaggingInput{
+		Bucket: bucket, Key: doc, VersionId: aws.String(fx.Versions["doc-v2"].VersionID),
+		Tagging: &types.Tagging{TagSet: []types.Tag{
+			{Key: aws.String("stage"), Value: aws.String("review")},
+		}},
+	}); err != nil {
+		return fmt.Errorf("tag doc.txt version 2: %w", err)
+	}
+	if _, err := c.PutObjectAcl(ctx, &s3.PutObjectAclInput{
+		Bucket: bucket, Key: doc, VersionId: aws.String(fx.Versions["doc-v1"].VersionID),
+		ACL: types.ObjectCannedACLPublicRead,
+	}); err != nil {
+		return fmt.Errorf("put the ACL of doc.txt version 1: %w", err)
+	}
+	del, err := c.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: bucket, Key: doc})
+	if err != nil {
+		return fmt.Errorf("delete doc.txt: %w", err)
+	}
+	if !aws.ToBool(del.DeleteMarker) {
+		return errors.New("deleting doc.txt added no delete marker")
+	}
+	fx.Versions["doc-marker"] = Version{
+		Bucket: "history", Key: "doc.txt", VersionID: aws.ToString(del.VersionId),
+	}
+	return nil
+}
+
+// expiringReport writes history/reports/q3.txt, which the lifecycle
+// configuration expires, and that configuration.
+func expiringReport(ctx context.Context, c *s3.Client, fx *VersionedFixture) error {
+	bucket := aws.String("history")
+	if err := putLabeled(ctx, c, fx, "report-v1", &s3.PutObjectInput{
+		Bucket: bucket, Key: aws.String("reports/q3.txt"),
+		Body: strings.NewReader("reports/q3.txt, which lifecycle expires\n"),
+	}); err != nil {
+		return err
+	}
+	if _, err := c.PutBucketLifecycleConfiguration(ctx, &s3.PutBucketLifecycleConfigurationInput{
+		Bucket:                 bucket,
+		LifecycleConfiguration: &types.BucketLifecycleConfiguration{Rules: lifecycleRulesV0_12_0()},
+		TransitionDefaultMinimumObjectSize: types.
+			TransitionDefaultMinimumObjectSizeVariesByStorageClass,
+	}); err != nil {
+		return fmt.Errorf("put the lifecycle configuration: %w", err)
+	}
+	return nil
+}
+
+// populatePaused writes "paused": a version of note.txt and of gone.txt
+// while Enabled, then, Suspended, note.txt's null version and a delete of
+// gone.txt, which makes its null version a delete marker, and big.bin, a
+// multipart upload with one part, left in progress.
+func populatePaused(ctx context.Context, c *s3.Client, fx *VersionedFixture) error {
+	bucket := aws.String("paused")
+	if _, err := c.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: bucket}); err != nil {
+		return fmt.Errorf("create paused: %w", err)
+	}
+	if err := versioning(ctx, c, "paused", types.BucketVersioningStatusEnabled); err != nil {
+		return err
+	}
+	if err := putLabeled(ctx, c, fx, "note-v1", &s3.PutObjectInput{
+		Bucket: bucket, Key: aws.String("note.txt"),
+		Body: strings.NewReader("note.txt, written while paused was Enabled\n"),
+	}); err != nil {
+		return err
+	}
+	if err := putLabeled(ctx, c, fx, "gone-v1", &s3.PutObjectInput{
+		Bucket: bucket, Key: aws.String("gone.txt"),
+		Body: strings.NewReader("gone.txt, written while paused was Enabled\n"),
+	}); err != nil {
+		return err
+	}
+	if err := versioning(ctx, c, "paused", types.BucketVersioningStatusSuspended); err != nil {
+		return err
+	}
+	if err := putLabeled(ctx, c, fx, "note-null", &s3.PutObjectInput{
+		Bucket: bucket, Key: aws.String("note.txt"),
+		Body: strings.NewReader("note.txt, written while paused was Suspended\n"),
+	}); err != nil {
+		return err
+	}
+	if id := fx.Versions["note-null"].VersionID; id != "null" {
+		return fmt.Errorf("a Suspended write answered version %q", id)
+	}
+	del, err := c.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: bucket, Key: aws.String("gone.txt")})
+	if err != nil {
+		return fmt.Errorf("delete gone.txt: %w", err)
+	}
+	if !aws.ToBool(del.DeleteMarker) || aws.ToString(del.VersionId) != "null" {
+		return fmt.Errorf("a Suspended delete answered marker %v, version %q",
+			aws.ToBool(del.DeleteMarker), aws.ToString(del.VersionId))
+	}
+	fx.Versions["gone-marker"] = Version{Bucket: "paused", Key: "gone.txt", VersionID: "null"}
+	key := aws.String("big.bin")
+	up, err := c.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+		Bucket: bucket, Key: key, Metadata: map[string]string{"origin": tagV0_12_0},
+	})
+	if err != nil {
+		return fmt.Errorf("create pending upload: %w", err)
+	}
+	body := []byte("the one part of an upload v0.12.0 left in progress\n")
+	part, err := c.UploadPart(ctx, &s3.UploadPartInput{
+		Bucket: bucket, Key: key, UploadId: up.UploadId,
+		PartNumber: aws.Int32(1), Body: bytes.NewReader(body),
+	})
+	if err != nil {
+		return fmt.Errorf("upload pending part: %w", err)
+	}
+	fx.Upload = Upload{
+		Bucket: "paused", Key: "big.bin", ID: aws.ToString(up.UploadId),
+		PartETag: aws.ToString(part.ETag), PartSHA256: sha(body), PartSize: int64(len(body)),
+	}
+	return nil
+}
+
+// versioning sets bucket's versioning status.
+func versioning(
+	ctx context.Context, c *s3.Client, bucket string, status types.BucketVersioningStatus,
+) error {
+	if _, err := c.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
+		Bucket:                  aws.String(bucket),
+		VersioningConfiguration: &types.VersioningConfiguration{Status: status},
+	}); err != nil {
+		return fmt.Errorf("set the versioning of %s to %s: %w", bucket, status, err)
+	}
+	return nil
+}
+
+// putLabeled puts in, buffering its body, and records the version it
+// wrote in fx as label: "null" when the response names none.
+func putLabeled(
+	ctx context.Context, c *s3.Client, fx *VersionedFixture, label string, in *s3.PutObjectInput,
+) error {
+	body, err := io.ReadAll(in.Body)
+	if err != nil {
+		return err
+	}
+	in.Body = bytes.NewReader(body)
+	out, err := c.PutObject(ctx, in)
+	if err != nil {
+		return fmt.Errorf("put %s: %w", label, err)
+	}
+	id := aws.ToString(out.VersionId)
+	if id == "" {
+		id = "null"
+	}
+	fx.Versions[label] = Version{
+		Bucket: aws.ToString(in.Bucket), Key: aws.ToString(in.Key), VersionID: id,
+		SHA256: sha(body), ETag: aws.ToString(out.ETag), Size: int64(len(body)),
+	}
+	return nil
+}
+
+// recordLastModified sets the LastModified of each of fx's versions in
+// bucket from its listing, which must list exactly those.
+func recordLastModified(ctx context.Context, c *s3.Client, bucket string, fx *VersionedFixture) error {
+	out, err := c.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{Bucket: aws.String(bucket)})
+	if err != nil {
+		return fmt.Errorf("list the versions of %s: %w", bucket, err)
+	}
+	listed := map[string]time.Time{}
+	for _, v := range out.Versions {
+		listed[aws.ToString(v.Key)+"?"+aws.ToString(v.VersionId)] = aws.ToTime(v.LastModified)
+	}
+	for _, m := range out.DeleteMarkers {
+		listed[aws.ToString(m.Key)+"?"+aws.ToString(m.VersionId)] = aws.ToTime(m.LastModified)
+	}
+	labels := slices.Sorted(maps.Keys(fx.Versions))
+	n := 0
+	for _, label := range labels {
+		v := fx.Versions[label]
+		if v.Bucket != bucket {
+			continue
+		}
+		at, ok := listed[v.Key+"?"+v.VersionID]
+		if !ok {
+			return fmt.Errorf("%s does not list %s, version %s", bucket, label, v.VersionID)
+		}
+		v.LastModified = at.UTC()
+		fx.Versions[label] = v
+		n++
+	}
+	if n != len(listed) {
+		return fmt.Errorf("%s lists %d versions and markers, %d written", bucket, len(listed), n)
+	}
+	return nil
+}
+
 // writeTarball writes root, as "root/", and fx, as "fixture.json", to path
 // as a gzipped tar.
-func writeTarball(path, root string, fx *Fixture) error {
+func writeTarball(path, root string, fx any) error {
 	meta, err := json.MarshalIndent(fx, "", "  ")
 	if err != nil {
 		return err

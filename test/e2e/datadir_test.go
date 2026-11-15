@@ -61,7 +61,20 @@ const (
 // directory and returns its storage root and fixture.
 func extractRoot(t *testing.T) (string, *rootFixture) {
 	t.Helper()
-	f, err := os.Open("testdata/v0.10.1-root.tar.gz")
+	var fx rootFixture
+	dir := extractTarball(t, "testdata/v0.10.1-root.tar.gz", &fx)
+	if fx.Upload.ID == "" {
+		t.Fatal("the fixture has no fixture.json")
+	}
+	return dir, &fx
+}
+
+// extractTarball extracts the root tarball name, as genroot writes it, to
+// a temporary directory, decodes its fixture.json into fx and returns the
+// storage root.
+func extractTarball(t *testing.T, name string, fx any) string {
+	t.Helper()
+	f, err := os.Open(name) //nolint:gosec // G304: a tarball of this suite's testdata
 	requireNoErr(t, err, "open the fixture")
 	defer func() { _ = f.Close() }()
 	gz, err := gzip.NewReader(f)
@@ -70,7 +83,6 @@ func extractRoot(t *testing.T) (string, *rootFixture) {
 	root, err := os.OpenRoot(dir)
 	requireNoErr(t, err, "open the extraction directory")
 	defer func() { _ = root.Close() }()
-	var fx rootFixture
 	tr := tar.NewReader(gz)
 	for {
 		hdr, nErr := tr.Next()
@@ -79,15 +91,12 @@ func extractRoot(t *testing.T) (string, *rootFixture) {
 		}
 		requireNoErr(t, nErr, "read the fixture")
 		if hdr.Name == "fixture.json" {
-			requireNoErr(t, json.NewDecoder(tr).Decode(&fx), "decode fixture.json")
+			requireNoErr(t, json.NewDecoder(tr).Decode(fx), "decode fixture.json")
 			continue
 		}
 		extractEntry(t, root, hdr, tr)
 	}
-	if fx.Upload.ID == "" {
-		t.Fatal("the fixture has no fixture.json")
-	}
-	return filepath.Join(dir, "root"), &fx
+	return filepath.Join(dir, "root")
 }
 
 // extractEntry writes the directory or file hdr names in root, which
