@@ -475,8 +475,10 @@ type objectWrite struct {
 	// data, before anything is committed, and returns the one the write
 	// fails with.
 	failed func(error) error
-	acl    []byte
-	cond   contracts.Precondition
+	// event is the event the write causes once committed, "" for none.
+	event contracts.EventName
+	acl   []byte
+	cond  contracts.Precondition
 }
 
 // fail returns the error a write of w fails with when opening or writing
@@ -538,15 +540,26 @@ func (s *Service) writeLegacy(
 	if err := s.checkPrecondition(ctx, bucket, key, w.cond); err != nil {
 		return nil, false, err
 	}
+	p, writeID, err := s.legacyWriteEvent(ctx, bucket, key, w.event)
+	if err != nil {
+		return nil, false, err
+	}
 	body, tr, closeBody, err := w.open()
 	if err != nil {
+		p.abort()
 		return nil, false, w.fail(err)
 	}
+	tr.WriteID = writeID
 	info, err := s.putObject(ctx, bucket, key, body, tr, w.fail)
 	if cErr := closeBody(); cErr != nil {
 		err = errors.Join(err, cErr)
 	}
 	if err != nil {
+		return nil, false, errors.Join(err, p.settle(ctx))
+	}
+	if err = s.committed(p, func(ev *contracts.BucketEvent) {
+		ev.ETag, ev.Size, ev.Time = info.ETag, info.Size, info.LastModified
+	}); err != nil {
 		return nil, false, err
 	}
 	if err = s.finishLegacy(bucket, info, w); err != nil {
@@ -554,6 +567,31 @@ func (s *Service) writeLegacy(
 	}
 	info.Tags = tr.Tags
 	return info, true, nil
+}
+
+// legacyWriteEvent records the intent of event, caused by a write in place
+// at key about to be made, and returns it with the write ID its trailer is
+// to hold, its witness, "" for none: the event's ETag, size and time are
+// filled in once the write is made. The caller holds the key's lock.
+func (s *Service) legacyWriteEvent(
+	ctx context.Context,
+	bucket, key string,
+	event contracts.EventName,
+) (*pendingEvent, string, error) {
+	p, err := s.event(ctx, contracts.BucketEvent{
+		Name: event, Bucket: bucket, Key: key, Time: s.now(), HasObject: true,
+	}, func(ev *contracts.BucketEvent) (witness, bool, error) {
+		id, err := s.versionIDOf(bucket, nil)
+		if err != nil {
+			return witness{}, false, err
+		}
+		ev.VersionID, ev.Sequence = id, s.nextSeq(0)
+		return witness{Kind: witnessWrite, WriteID: rand.Text()}, true, nil
+	})
+	if p == nil || err != nil {
+		return nil, "", err
+	}
+	return p, p.rec.Witness.WriteID, nil
 }
 
 // finishLegacy stores w's ACL as the one of info's object, written in
@@ -675,18 +713,40 @@ func (s *Service) commitVersion(
 	if err != nil {
 		return false, err
 	}
-	if err = s.commit(bucket, m, fresh); err != nil {
+	p, err := s.event(ctx, contracts.BucketEvent{
+		Name: w.event, Bucket: bucket, Key: key, Time: e.LastModified, VersionID: e.ID,
+		ETag: e.ETag, Size: e.Size, Sequence: e.Seq, HasObject: true,
+	}, func(*contracts.BucketEvent) (witness, bool, error) {
+		return witness{Kind: witnessEntry, VersionID: e.ID, Seq: e.Seq}, true, nil
+	})
+	if err != nil {
 		return false, err
 	}
-	if err = s.at(stageCommitted); err != nil {
+	if err = s.commit(bucket, m, fresh); err != nil {
+		return false, errors.Join(err, p.settle(ctx))
+	}
+	if err = s.committed(p, nil); err != nil {
 		return true, err
 	}
+	s.finishVersion(ctx, bucket, key, displaced, w)
+	return true, nil
+}
+
+// finishVersion removes displaced, the version a write w of key
+// displaced, nil for none, and runs w.done, once the write's version is
+// committed, logging a failure of either (see warnAfterCommit). The caller
+// holds the key's lock.
+func (s *Service) finishVersion(
+	ctx context.Context,
+	bucket, key string,
+	displaced *versionEntry,
+	w *objectWrite,
+) {
 	s.warnAfterCommit("collect the version a write displaced", bucket, key,
 		s.collect(ctx, bucket, key, displaced))
 	if w.done != nil {
 		s.warnAfterCommit("finish a write", bucket, key, w.done())
 	}
-	return true, nil
 }
 
 // warnAfterCommit logs err, a failure of step, done after the manifest of
@@ -815,10 +875,19 @@ func (s *Service) deleteCurrent(
 	if err != nil {
 		return nil, err
 	}
-	if err = s.commit(bucket, m, fresh); err != nil {
+	p, err := s.event(ctx, contracts.BucketEvent{
+		Name: contracts.EventObjectRemovedDeleteMarkerCreated, Bucket: bucket, Key: key,
+		Time: at, VersionID: marker.ID, Sequence: marker.Seq,
+	}, func(*contracts.BucketEvent) (witness, bool, error) {
+		return witness{Kind: witnessEntry, VersionID: marker.ID, Seq: marker.Seq}, true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	if err = s.at(stageCommitted); err != nil {
+	if err = s.commit(bucket, m, fresh); err != nil {
+		return nil, errors.Join(err, p.settle(ctx))
+	}
+	if err = s.committed(p, nil); err != nil {
 		return nil, err
 	}
 	s.warnAfterCommit("collect the version a delete displaced", bucket, key,
@@ -841,22 +910,38 @@ func (s *Service) deleteVersion(
 	if i < 0 {
 		return &contracts.DeleteObjectOutput{VersionID: id}, nil
 	}
+	var floor int64
+	for _, v := range m.Versions {
+		floor = max(floor, v.Seq)
+	}
 	m.recordNoncurrent()
 	e := m.remove(i)
 	if i == 0 && len(m.Versions) > 0 {
 		m.Versions[0].NoncurrentSince = time.Time{}
 	}
 	out := &contracts.DeleteObjectOutput{VersionID: e.ID, DeleteMarker: e.Marker}
+	// A fresh sequence, not the deleted entry's, which sorts before the
+	// changes made since.
+	p, err := s.event(ctx, contracts.BucketEvent{
+		Name: contracts.EventObjectRemovedDelete, Bucket: bucket, Key: m.Key, Time: s.now(),
+		VersionID: e.ID,
+	}, func(ev *contracts.BucketEvent) (witness, bool, error) {
+		ev.Sequence = s.nextSeq(floor)
+		return witness{Kind: witnessNoEntry, VersionID: e.ID}, true, nil
+	})
+	if err != nil {
+		return nil, err
+	}
 	if len(m.Versions) == 0 {
-		if err := s.dropVersions(ctx, bucket, m.Key, e); err != nil {
+		if err = s.dropVersions(ctx, bucket, m.Key, e, p); err != nil {
 			return nil, err
 		}
 		return out, nil
 	}
-	if err := s.commit(bucket, m, false); err != nil {
-		return nil, err
+	if err = s.commit(bucket, m, false); err != nil {
+		return nil, errors.Join(err, p.settle(ctx))
 	}
-	if err := s.at(stageCommitted); err != nil {
+	if err = s.committed(p, nil); err != nil {
 		return nil, err
 	}
 	s.warnAfterCommit("collect a deleted version", bucket, m.Key, s.collect(ctx, bucket, m.Key, e))
@@ -864,21 +949,26 @@ func (s *Service) deleteVersion(
 }
 
 // dropVersions removes the manifest of key, whose last version, e, was
-// deleted: it commits an empty manifest, then removes the object at
-// keyHash, e's data and side files, the manifest, and the key's index
-// entry, in this order, so a crash leaves the empty manifest, under which
-// the object at keyHash, if left, does not come back. Once the empty
-// manifest is committed, the delete has happened, and a failure of the
-// removals after it is logged (see warnAfterCommit). The caller holds the
-// key's lock.
-func (s *Service) dropVersions(ctx context.Context, bucket, key string, e *versionEntry) error {
+// deleted: it commits an empty manifest, confirms p, the event of the
+// delete, nil for none, then removes the object at keyHash, e's data and
+// side files, the manifest, and the key's index entry, in this order, so
+// a crash leaves the empty manifest, under which the object at keyHash, if
+// left, does not come back. Once the empty manifest is committed, the
+// delete has happened, and a failure of the removals after it is logged
+// (see warnAfterCommit). The caller holds the key's lock.
+func (s *Service) dropVersions(
+	ctx context.Context,
+	bucket, key string,
+	e *versionEntry,
+	p *pendingEvent,
+) error {
 	if err := s.writeVersions(
 		bucket,
 		&versionManifest{Key: key, Versions: []versionEntry{}},
 	); err != nil {
-		return err
+		return errors.Join(err, p.settle(ctx))
 	}
-	if err := s.at(stageCommitted); err != nil {
+	if err := s.committed(p, nil); err != nil {
 		return err
 	}
 	s.warnAfterCommit("remove a key's last version", bucket, key, s.removeKey(ctx, bucket, key, e))

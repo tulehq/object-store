@@ -435,7 +435,7 @@ func (s *Service) commitLifecycle(
 	if len(m.Versions) == 0 {
 		last := removed[len(removed)-1]
 		removed = removed[:len(removed)-1]
-		if err := s.dropVersions(ctx, bucket, m.Key, &last); err != nil {
+		if err := s.dropVersions(ctx, bucket, m.Key, &last, nil); err != nil {
 			return err
 		}
 	} else {

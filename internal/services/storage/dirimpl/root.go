@@ -50,6 +50,11 @@ var (
 	// with one file per key that has versions, named by keyHash (see
 	// versions.go).
 	versionsDir = filepath.Join(stateDir, "versions")
+
+	// eventsDir is the outbox of bucket events, one directory per bucket
+	// with one file per event recorded (see events.go). DeleteBucket and
+	// CreateBucket leave it alone: an event outlives its bucket.
+	eventsDir = filepath.Join(stateDir, "events")
 )
 
 func (s *Service) openRoot() (*os.Root, error) {
@@ -62,7 +67,7 @@ func (s *Service) openRoot() (*os.Root, error) {
 	}
 	for _, d := range []string{
 		bucketsDir, indexDir, multipartDir, policiesDir, configDir, aclDir, tagDir,
-		versioningDir, versionsDir,
+		versioningDir, versionsDir, eventsDir,
 	} {
 		if err = root.MkdirAll(d, 0o750); err != nil {
 			return nil, errors.Join(

@@ -144,6 +144,30 @@ func (s *Service) PutObjectTagging(
 	tags []contracts.Tag,
 	check contracts.ObjectCheck,
 ) (string, error) {
+	return s.tagObject(ctx, ref, tags, check, contracts.EventObjectTaggingPut)
+}
+
+// DeleteObjectTagging removes the tags of the version ref names as it now
+// is, as PutObjectTagging with no tags does, and returns the version's ID.
+// ctx must be pinned to the bucket.
+func (s *Service) DeleteObjectTagging(
+	ctx context.Context,
+	ref contracts.ObjectRef,
+	check contracts.ObjectCheck,
+) (string, error) {
+	return s.tagObject(ctx, ref, nil, check, contracts.EventObjectTaggingDelete)
+}
+
+// tagObject is PutObjectTagging for a change that causes event, which it
+// always does: S3 documents no "no change" case for tags, as it does for
+// an ACL.
+func (s *Service) tagObject(
+	ctx context.Context,
+	ref contracts.ObjectRef,
+	tags []contracts.Tag,
+	check contracts.ObjectCheck,
+	event contracts.EventName,
+) (string, error) {
 	if _, err := requirePin(ctx, ref.Bucket); err != nil {
 		return "", err
 	}
@@ -153,29 +177,47 @@ func (s *Service) PutObjectTagging(
 	if err != nil {
 		return "", err
 	}
-	if err = s.writeTagFile(sideFile(tagDir, ref.Bucket, ref.Key, e), info, tags); err != nil {
+	name := sideFile(tagDir, ref.Bucket, ref.Key, e)
+	raw, err := s.encodeTags(info, tags)
+	if err != nil {
+		return "", err
+	}
+	p, err := s.event(ctx, contracts.BucketEvent{
+		Name: event, Bucket: ref.Bucket, Key: ref.Key, Time: s.now(),
+		VersionID: info.VersionID, ETag: info.ETag,
+	}, func(*contracts.BucketEvent) (witness, bool, error) {
+		return witness{Kind: witnessSideFile, File: name, SHA256: digest(raw)}, true, nil
+	})
+	if err != nil {
+		return "", err
+	}
+	if err = s.storeTags(name, info.Key, raw); err != nil {
+		return "", errors.Join(err, p.settle(ctx))
+	}
+	if err = s.committed(p, nil); err != nil {
 		return "", err
 	}
 	return info.VersionID, nil
 }
 
-// writeTagFile stores tags as the tags of the object info describes, in
-// its tag file, name, which overrides the tags it was written with; an
-// empty tag set is stored too, so those do not apply again. The caller
-// holds the key's lock.
-func (s *Service) writeTagFile(
-	name string,
-	info *contracts.ObjectInfo,
-	tags []contracts.Tag,
-) error {
+// encodeTags returns what the tag file of the object info describes
+// holds for tags, which override the tags it was written with; an empty
+// tag set is stored too, so those do not apply again.
+func (s *Service) encodeTags(info *contracts.ObjectInfo, tags []contracts.Tag) ([]byte, error) {
 	raw, err := json.Marshal(objectTags{
 		LastModified: info.LastModified, ETag: info.ETag, Tags: tags,
 	})
 	if err != nil {
-		return fmt.Errorf("%s: failed to encode the tags of %q: %w", s.Name(), info.Key, err)
+		return nil, fmt.Errorf("%s: failed to encode the tags of %q: %w", s.Name(), info.Key, err)
 	}
-	if err = s.writeFile(name, raw); err != nil {
-		return fmt.Errorf("%s: failed to store the tags of %q: %w", s.Name(), info.Key, err)
+	return raw, nil
+}
+
+// storeTags writes raw, which encodeTags returned for key's object, as its
+// tag file, name. The caller holds the key's lock.
+func (s *Service) storeTags(name, key string, raw []byte) error {
+	if err := s.writeFile(name, raw); err != nil {
+		return fmt.Errorf("%s: failed to store the tags of %q: %w", s.Name(), key, err)
 	}
 	return nil
 }

@@ -478,8 +478,9 @@ func (s *Service) CompleteMultipartUpload(
 			}
 			return nil
 		},
-		acl:  m.Put.ACL,
-		cond: cond,
+		event: contracts.EventObjectCreatedCompleteMultipartUpload,
+		acl:   m.Put.ACL,
+		cond:  cond,
 	})
 }
 

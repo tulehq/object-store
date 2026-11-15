@@ -17,6 +17,7 @@ import (
 	"tule.dev/object-store/internal/modules/bucket"
 	"tule.dev/object-store/internal/modules/health"
 	"tule.dev/object-store/internal/modules/object"
+	"tule.dev/object-store/internal/notification"
 	"tule.dev/object-store/internal/s3api"
 	"tule.dev/object-store/internal/services/storage/dirimpl"
 	"tule.dev/object-store/internal/services/sweep"
@@ -59,6 +60,7 @@ func New(cfg *Config, extra ...gas.Option) (*gas.App, error) {
 	registerAppModules(app, cfg)
 	installMiddleware(app.Router(), cfg, logger, verifier)
 	app.ReadyFunc(createBuckets(cfg.Storage.Buckets))
+	app.ReadyFunc(recoverEvents(logger))
 	// Last, so no lifecycle rule applies before every service and ready
 	// hook has succeeded.
 	app.ReadyFunc(func(*gas.ServiceContainer) error {
@@ -90,8 +92,12 @@ func registerAppServices(
 	clock := cfg.clockOrSystem()
 	app.RegisterServiceInstance[*sigv4.Verifier](verifier)
 	app.RegisterServiceInstance[contracts.PolicyPrincipals](bound)
+	// No destination type is available yet, so the router sends no event
+	// anywhere and the storage records none.
 	app.RegisterSingletonService[contracts.StorageProvider](
-		dirimpl.NewService(cfg.Storage, clock),
+		dirimpl.NewService(cfg.Storage, clock, dirimpl.Events{
+			Router: notification.NewRouter(cfg.Auth.AccountID, nil),
+		}),
 	)
 	// It depends on the storage, so gas closes it, stopping its sweeps,
 	// before the storage.
@@ -132,6 +138,29 @@ func createBuckets(names []string) func(*gas.ServiceContainer) error {
 			if cErr != nil && !errors.Is(cErr, contracts.ErrBucketExists) {
 				return fmt.Errorf("app: failed to create bucket %q: %w", name, cErr)
 			}
+		}
+		return nil
+	}
+}
+
+// recoverEvents returns a ready hook that settles the bucket events a stop
+// left recorded but not confirmed (see StorageProvider's RecoverEvents),
+// before the server listens and before the sweep runs, so nothing changes
+// what it checks. A failure is logged and does not fail the start: the
+// intents it could not settle are kept for the next one.
+func recoverEvents(logger gas.Logger) func(*gas.ServiceContainer) error {
+	return func(sc *gas.ServiceContainer) error {
+		storage, err := sc.Resolve[contracts.StorageProvider]()
+		if err != nil {
+			return fmt.Errorf("app: failed to resolve storage: %w", err)
+		}
+		out, err := storage.RecoverEvents(context.Background())
+		if err != nil {
+			logger.Error("failed to recover bucket events").Err("error", err).Send()
+		}
+		if out.Confirmed > 0 || out.Dropped > 0 {
+			logger.Info("recovered bucket events").
+				Int("confirmed", out.Confirmed).Int("dropped", out.Dropped).Send()
 		}
 		return nil
 	}

@@ -37,8 +37,11 @@ type Service struct {
 	// versions and of a read of one (see versions.go), and an error it
 	// returns fails the change or read there, as a crash would stop it.
 	// Tests set it.
-	hook  func(stage string) error
-	locks keyLocks
+	hook func(stage string) error
+	// events routes and renders the bucket events s records (see
+	// events.go).
+	events Events
+	locks  keyLocks
 	// bucketLocks order creating and deleting a bucket, which change its
 	// generation, against the operations pinned to it and the reads of its
 	// policy.
@@ -60,12 +63,14 @@ var (
 )
 
 // NewService returns the constructor gas uses to build a Service from
-// settings, which stamps what it stores with clock's time. Settings are
-// bound from the configuration, so clock is an argument of its own. A nil
-// clock panics here, when the service is registered.
+// settings, which stamps what it stores with clock's time and records
+// bucket events with events. Settings are bound from the configuration, so
+// clock and events are arguments of their own. A nil clock panics here,
+// when the service is registered.
 func NewService(
 	settings *Settings,
 	clock contracts.Clock,
+	events Events,
 ) func(config gas.ConfigProvider, logger gas.Logger) *Service {
 	if clock == nil {
 		panic("dirimpl: NewService needs a clock; pass contracts.SystemClock for the system's")
@@ -73,7 +78,7 @@ func NewService(
 	return func(config gas.ConfigProvider, logger gas.Logger) *Service {
 		return &Service{
 			settings: settings, clock: clock, config: config, logger: logger,
-			deleteWait: defaultDeleteWait,
+			deleteWait: defaultDeleteWait, events: events,
 		}
 	}
 }

@@ -212,8 +212,8 @@ func (s *Service) deleteLocked(
 
 // deleteUnlisted deletes the version ref names of a key without a
 // manifest, whose one version is the null version, in a bucket that is
-// Unversioned, or for a ref with a version. The caller holds the key's
-// lock.
+// Unversioned, or for a ref with a version. It causes an event only when
+// there was an object to delete. The caller holds the key's lock.
 func (s *Service) deleteUnlisted(
 	ctx context.Context,
 	ref contracts.ObjectRef,
@@ -226,7 +226,24 @@ func (s *Service) deleteUnlisted(
 	if ref.Version != "" && ref.Version != contracts.VersionNull {
 		return out, nil
 	}
-	return out, s.deleteLegacy(ctx, ref.Bucket, ref.Key)
+	p, err := s.event(ctx, contracts.BucketEvent{
+		Name: contracts.EventObjectRemovedDelete, Bucket: ref.Bucket, Key: ref.Key,
+		Time: s.now(), VersionID: out.VersionID,
+	}, func(ev *contracts.BucketEvent) (witness, bool, error) {
+		e, lErr := s.legacyEntry(ctx, ref.Bucket, ref.Key)
+		if lErr != nil || e == nil {
+			return witness{}, false, lErr
+		}
+		ev.Sequence = s.nextSeq(e.Seq)
+		return witness{Kind: witnessGone}, true, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err = s.deleteLegacy(ctx, ref.Bucket, ref.Key); err != nil {
+		return out, errors.Join(err, p.settle(ctx))
+	}
+	return out, s.committed(p, nil)
 }
 
 // checkRef returns storage.ErrBucketNotFound when there is no bucket
@@ -284,6 +301,18 @@ func (s *Service) PutObject(
 	in contracts.PutObjectInput,
 	cond contracts.Precondition,
 ) (*contracts.ObjectInfo, error) {
+	return s.putObjectAs(ctx, bucket, key, body, in, cond, contracts.EventObjectCreatedPut)
+}
+
+// putObjectAs is PutObject for a write that causes event once committed.
+func (s *Service) putObjectAs(
+	ctx context.Context,
+	bucket, key string,
+	body io.Reader,
+	in contracts.PutObjectInput,
+	cond contracts.Precondition,
+	event contracts.EventName,
+) (*contracts.ObjectInfo, error) {
 	if _, err := requirePin(ctx, bucket); err != nil {
 		return nil, err
 	}
@@ -300,8 +329,9 @@ func (s *Service) PutObject(
 			return er, &trailer{Meta: er.meta, ContentType: in.ContentType, Tags: in.Tags},
 				func() error { return nil }, nil
 		},
-		acl:  in.ACL,
-		cond: cond,
+		event: event,
+		acl:   in.ACL,
+		cond:  cond,
 	})
 }
 
@@ -385,8 +415,8 @@ func (s *Service) CopyObject(
 		return nil, err
 	}
 
-	info, err := s.PutObject(ctx, in.DstBucket, in.DstKey, src.Body, copyPut(in, src),
-		in.Precondition)
+	info, err := s.putObjectAs(ctx, in.DstBucket, in.DstKey, src.Body, copyPut(in, src),
+		in.Precondition, contracts.EventObjectCreatedCopy)
 	if err != nil {
 		return nil, err
 	}

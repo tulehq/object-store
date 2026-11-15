@@ -293,5 +293,5 @@ func TestNewServiceRefusesANilClock(t *testing.T) {
 			t.Fatal("a service was made without a clock")
 		}
 	}()
-	NewService(&Settings{RootDir: t.TempDir()}, nil)
+	NewService(&Settings{RootDir: t.TempDir()}, nil, Events{})
 }
