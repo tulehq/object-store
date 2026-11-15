@@ -142,31 +142,50 @@ func objectOwner(ownership string, r *http.Request, writer, bucketOwner string) 
 	return writer
 }
 
-// storedACL returns the owner and grants of the object at key: its stored
-// ACL's, or the bucket owner with FULL_CONTROL for an object without one.
-// It is storage.ErrObjectNotFound when there is no object, and check's
-// error when check does not pass for it.
+// objectACL is the ACL of an object version as storedACL reads it: its
+// owner and grants, and the version's ID, "" in an Unversioned bucket.
+type objectACL struct {
+	owner     string
+	versionID string
+	grants    []s3api.Grant
+}
+
+// storedACL returns the ACL of the object version ref names: its stored
+// ACL's owner and grants, or the bucket owner with FULL_CONTROL for one
+// without, and the version's ID. It is storage.ErrObjectNotFound when
+// there is no object, and check's error when check does not pass for it.
+// The version's ID is taken from the info check is given, since the
+// storage answers none with a version that has no ACL of its own.
 func (m *Module) storedACL(
 	ctx context.Context,
-	bucket, key string,
+	ref contracts.ObjectRef,
 	check contracts.ObjectCheck,
-) (string, []s3api.Grant, error) {
+) (*objectACL, error) {
 	bucketOwner := s3api.CanonicalUserID(m.authz.Account())
-	doc, _, err := m.storage.GetObjectACL(ctx, contracts.ObjectRef{Bucket: bucket, Key: key}, check)
+	acl := &objectACL{}
+	doc, _, err := m.storage.GetObjectACL(ctx, ref, func(info *contracts.ObjectInfo) error {
+		acl.versionID = info.VersionID
+		if check == nil {
+			return nil
+		}
+		return check(info)
+	})
 	if errors.Is(err, contracts.ErrNoSuchBucketConfig) {
-		return bucketOwner, []s3api.Grant{s3api.OwnerFullControl(bucketOwner)}, nil
+		acl.owner, acl.grants = bucketOwner, []s3api.Grant{s3api.OwnerFullControl(bucketOwner)}
+		return acl, nil
 	}
 	if err != nil {
-		return "", nil, err //nolint:wrapcheck // the storage's own error, answered as is
+		return nil, err //nolint:wrapcheck // the storage's own error, answered as is
 	}
-	var acl s3api.AccessControlPolicy
-	if err = xml.Unmarshal(doc, &acl); err != nil {
-		return "", nil, fmt.Errorf("object: the stored ACL of %q does not parse: %w", key, err)
+	var stored s3api.AccessControlPolicy
+	if err = xml.Unmarshal(doc, &stored); err != nil {
+		return nil, fmt.Errorf("object: the stored ACL of %q does not parse: %w", ref.Key, err)
 	}
-	if acl.Owner == nil {
-		return "", nil, fmt.Errorf("object: the stored ACL of %q has no owner", key)
+	if stored.Owner == nil {
+		return nil, fmt.Errorf("object: the stored ACL of %q has no owner", ref.Key)
 	}
-	return acl.Owner.ID, acl.Grants, nil
+	acl.owner, acl.grants = stored.Owner.ID, stored.Grants
+	return acl, nil
 }
 
 // getObjectACL serves GetObjectAcl (GET /<bucket>/<key>?acl): the
@@ -176,7 +195,12 @@ func (m *Module) storedACL(
 // ("Troubleshooting", Object Ownership, S3 User Guide). Otherwise it is
 // the stored ACL, without its public grants under IgnorePublicAcls, as
 // GetBucketAcl answers. A missing object is 404 NoSuchKey, the only error
-// the PutObjectAcl and GetObjectAcl API references list.
+// the PutObjectAcl and GetObjectAcl API references list. With ?versionId
+// it is that version's ACL: "The ACL of an object is set at the object
+// version level" (PutObjectAcl API reference). Both answer
+// x-amz-version-id, as the API references' samples show, in a bucket that
+// is not Unversioned, and a delete marker as writeSubresourceError
+// describes.
 func (m *Module) getObjectACL(ctx gas.Context, t s3api.Target) error {
 	g, err := m.authz.AuthorizeAndPin(ctx, ctx.Request(), authz.GetObjectACL, t)
 	if err != nil {
@@ -189,10 +213,11 @@ func (m *Module) getObjectACL(ctx gas.Context, t s3api.Target) error {
 		return s3api.WriteError(ctx, t, err)
 	}
 	// The ACL read is of the object the request was evaluated for.
-	owner, grants, err := m.storedACL(pinned, t.Bucket, t.Key, g.ObjectCheck(t))
+	acl, err := m.storedACL(pinned, objectRef(t), g.ObjectCheck(t))
 	if err != nil {
-		return s3api.WriteError(ctx, t, err)
+		return writeSubresourceError(ctx, t, err)
 	}
+	owner, grants := acl.owner, acl.grants
 	if ownership == s3api.OwnershipBucketOwnerEnforced {
 		owner = s3api.CanonicalUserID(m.authz.Account())
 		grants = []s3api.Grant{s3api.OwnerFullControl(owner)}
@@ -205,6 +230,7 @@ func (m *Module) getObjectACL(ctx gas.Context, t s3api.Target) error {
 			grants = s3api.WithoutPublicGrants(grants)
 		}
 	}
+	setVersionHeader(ctx.ResponseWriter(), acl.versionID)
 	return ctx.XML(http.StatusOK, s3api.NewAccessControlPolicy(owner, grants))
 }
 
@@ -229,32 +255,35 @@ func (m *Module) putObjectACL(ctx gas.Context, t s3api.Target) error {
 		return s3api.WriteError(ctx, t, err)
 	}
 	defer release()
-	if err = m.setObjectACL(pinned, r, t, doc, caller.ObjectCheck(t)); err != nil {
-		return s3api.WriteError(ctx, t, err)
+	versionID, err := m.setObjectACL(pinned, r, t, doc, caller.ObjectCheck(t))
+	if err != nil {
+		return writeSubresourceError(ctx, t, err)
 	}
+	setVersionHeader(ctx.ResponseWriter(), versionID)
 	ctx.ResponseWriter().WriteHeader(http.StatusOK)
 	return nil
 }
 
 // setObjectACL sets the ACL r, with the document doc, sets on the object
-// t, ctx being pinned to its bucket, as putObjectACL describes, if check
-// passes for the object read and written, the one the request was
-// evaluated for.
+// version t names, ctx being pinned to its bucket, as putObjectACL
+// describes, if check passes for the object read and written, the one the
+// request was evaluated for, and returns the version's ID.
 func (m *Module) setObjectACL(
 	ctx context.Context,
 	r *http.Request,
 	t s3api.Target,
 	doc []byte,
 	check contracts.ObjectCheck,
-) error {
+) (string, error) {
 	ownership, err := s3api.Ownership(ctx, m.storage, t.Bucket)
 	if err != nil {
-		return err //nolint:wrapcheck // an S3 or storage error, answered as is
+		return "", err //nolint:wrapcheck // an S3 or storage error, answered as is
 	}
-	owner, _, err := m.storedACL(ctx, t.Bucket, t.Key, check)
+	acl, err := m.storedACL(ctx, objectRef(t), check)
 	if err != nil {
-		return err
+		return "", err
 	}
+	owner := acl.owner
 	bucketOwner := s3api.CanonicalUserID(m.authz.Account())
 	if ownership == s3api.OwnershipBucketOwnerEnforced {
 		owner = bucketOwner
@@ -262,27 +291,22 @@ func (m *Module) setObjectACL(
 	grants, err := s3api.RequestGrants(r, s3api.ACLOwners{Owner: owner, BucketOwner: bucketOwner},
 		true, func() ([]byte, error) { return doc, nil })
 	if err != nil {
-		return err //nolint:wrapcheck // an S3 error, answered as is
+		return "", err //nolint:wrapcheck // an S3 error, answered as is
 	}
 	block, err := s3api.PublicAccessBlock(ctx, m.storage, t.Bucket)
 	if err != nil {
-		return err //nolint:wrapcheck // an S3 or storage error, answered as is
+		return "", err //nolint:wrapcheck // an S3 or storage error, answered as is
 	}
 	if err = s3api.CheckACL(ownership, block, grants, bucketOwner); err != nil {
-		return err //nolint:wrapcheck // an S3 error, answered as is
+		return "", err //nolint:wrapcheck // an S3 error, answered as is
 	}
 	if ownership == s3api.OwnershipBucketOwnerEnforced {
-		return nil
+		return acl.versionID, nil
 	}
 	stored, err := s3api.Encode(s3api.NewAccessControlPolicy(owner, grants))
 	if err != nil {
-		return err //nolint:wrapcheck // s3api's own error
+		return "", err //nolint:wrapcheck // s3api's own error
 	}
-	_, err = m.storage.PutObjectACL(
-		ctx,
-		contracts.ObjectRef{Bucket: t.Bucket, Key: t.Key},
-		stored,
-		check,
-	)
-	return err //nolint:wrapcheck // the storage's own error, answered as is
+	//nolint:wrapcheck // the storage's own error, answered as is
+	return m.storage.PutObjectACL(ctx, objectRef(t), stored, check)
 }

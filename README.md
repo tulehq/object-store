@@ -319,8 +319,8 @@ through its handler.
 | ListMultipartUploads | `s3:ListBucketMultipartUploads` | bucket |
 | GetObject, HeadObject | `s3:GetObject`; with `?versionId`, `s3:GetObjectVersion` | object |
 | PutObject | `s3:PutObject` | object |
-| CopyObject | `s3:GetObject`, then, for a source with tags under the `COPY` tagging directive, `s3:GetObjectTagging`; then `s3:PutObject`, then, for that source, `s3:PutObjectTagging` | source object, then destination |
-| UploadPartCopy | `s3:PutObject`, then `s3:GetObject` | destination, then source object |
+| CopyObject | `s3:GetObject`, then, for a source with tags under the `COPY` tagging directive, `s3:GetObjectTagging`; then `s3:PutObject`, then, for that source, `s3:PutObjectTagging`; for a source named with `?versionId`, `s3:GetObjectVersion` and `s3:GetObjectVersionTagging` | source object, then destination |
+| UploadPartCopy | `s3:PutObject`, then `s3:GetObject`; for a source named with `?versionId`, `s3:GetObjectVersion` | destination, then source object |
 | DeleteObject | `s3:DeleteObject`; with `?versionId`, `s3:DeleteObjectVersion` | object |
 | DeleteObjects | `s3:DeleteObject`; for a key with a `VersionId`, `s3:DeleteObjectVersion` | each key; a denied key gets its own `AccessDenied` entry in the result |
 | CreateMultipartUpload, UploadPart, CompleteMultipartUpload | `s3:PutObject` | object |
@@ -333,9 +333,9 @@ through its handler.
 | PutPublicAccessBlock, DeletePublicAccessBlock; GetPublicAccessBlock | `s3:PutBucketPublicAccessBlock`; `s3:GetBucketPublicAccessBlock` | bucket |
 | PutBucketOwnershipControls, DeleteBucketOwnershipControls; GetBucketOwnershipControls | `s3:PutBucketOwnershipControls`; `s3:GetBucketOwnershipControls` | bucket |
 | PutBucketAcl, GetBucketAcl | `s3:PutBucketAcl`, `s3:GetBucketAcl` | bucket |
-| PutObjectAcl, GetObjectAcl | `s3:PutObjectAcl`, `s3:GetObjectAcl` | object |
-| PutObjectTagging, GetObjectTagging, DeleteObjectTagging | `s3:PutObjectTagging`, `s3:GetObjectTagging`, `s3:DeleteObjectTagging` | object |
-| GetObjectAttributes | `s3:GetObject`, then `s3:GetObjectAttributes` | object |
+| PutObjectAcl, GetObjectAcl | `s3:PutObjectAcl`, `s3:GetObjectAcl`; with `?versionId`, `s3:PutObjectVersionAcl`, `s3:GetObjectVersionAcl` | object |
+| PutObjectTagging, GetObjectTagging, DeleteObjectTagging | `s3:PutObjectTagging`, `s3:GetObjectTagging`, `s3:DeleteObjectTagging`; with `?versionId`, `s3:PutObjectVersionTagging`, `s3:GetObjectVersionTagging`, `s3:DeleteObjectVersionTagging` | object |
+| GetObjectAttributes | `s3:GetObject`, then `s3:GetObjectAttributes`; with `?versionId`, `s3:GetObjectVersion`, then `s3:GetObjectVersionAttributes` | object |
 | PutBucketEncryption, DeleteBucketEncryption; GetBucketEncryption | `s3:PutEncryptionConfiguration`; `s3:GetEncryptionConfiguration` | bucket |
 
 A write's headers add actions, on the same resource, as the reference
@@ -444,7 +444,12 @@ S3 keys, each for the actions the reference lists it for and only when the
 request carries a value: `s3:prefix`, `s3:delimiter` and `s3:max-keys`
 (`s3:ListBucket`, `s3:ListBucketVersions`); `s3:versionid`, the version a
 request names as given (`null` for the null version), for
-`s3:GetObjectVersion` and `s3:DeleteObjectVersion`; `s3:x-amz-acl` and `s3:x-amz-grant-full-control`,
+`s3:GetObjectVersion`, `s3:DeleteObjectVersion`,
+`s3:GetObjectVersionTagging`, `s3:PutObjectVersionTagging`,
+`s3:DeleteObjectVersionTagging`, `s3:GetObjectVersionAcl`,
+`s3:PutObjectVersionAcl` and `s3:GetObjectVersionAttributes`, and for a
+copy the source's version, on the source's checks only, never on the
+destination's `s3:PutObject`; `s3:x-amz-acl` and `s3:x-amz-grant-full-control`,
 `-read`, `-read-acp`, `-write` and `-write-acp` (`s3:CreateBucket`,
 `s3:PutObject`, `s3:PutBucketAcl`, `s3:PutObjectAcl`);
 `s3:x-amz-object-ownership` (`s3:CreateBucket`);
@@ -471,10 +476,10 @@ are supplied for the actions the reference lists them for:
 
 - `s3:ExistingObjectTag/<key>`, each tag stored for the object acted on,
   for `s3:GetObject` (GetObject, HeadObject, GetObjectAttributes, and the
-  source of CopyObject and UploadPartCopy), `s3:GetObjectVersion` (of the
-  version named), `s3:GetObjectAcl`,
+  source of CopyObject and UploadPartCopy), `s3:GetObjectAcl`,
   `s3:PutObjectAcl`, `s3:GetObjectAttributes`, `s3:GetObjectTagging`,
-  `s3:PutObjectTagging` and `s3:DeleteObjectTagging`. A missing object has
+  `s3:PutObjectTagging` and `s3:DeleteObjectTagging`, and their version
+  actions, for which they are the tags of the version named. A missing object has
   none. It is not supplied to a write, nor to the `s3:PutObjectTagging` a
   write's `x-amz-tagging` adds: "When granting permissions for the `PUT
   Object` and `DELETE Object` operations, this condition key is not
@@ -485,8 +490,8 @@ are supplied for the actions the reference lists them for:
   HeadObject, GetObjectAttributes, GetObjectAcl, PutObjectAcl,
   GetObjectTagging, PutObjectTagging and DeleteObjectTagging, and the
   source of CopyObject and UploadPartCopy, a write's under the key's lock),
-  it checks that the object has the same ETag, modification time and tag
-  set, in any order,
+  it checks that the object is the same version, with the same ETag,
+  modification time and tag set, in any order,
   and that there was an object when it was evaluated. When it does not,
   because a write replaced the object or a PutObjectTagging retagged it
   meanwhile, the operation does nothing and answers `409
@@ -512,7 +517,10 @@ are supplied for the actions the reference lists them for:
 
 `s3:x-amz-copy-source` is the source CopyObject and UploadPartCopy read, `<bucket>/<key>`
 decoded, not the header as sent, so a percent-encoded or slash-led header
-cannot step around a condition on it. Resources are likewise the bucket and
+cannot step around a condition on it. It never carries the source's
+`?versionId`, which `s3:versionid` on the source's checks carries; no AWS
+page says how a versioned source's value reads, and this is a choice
+([Versioning](#versioning)). Resources are likewise the bucket and
 key the operation acts on, decoded.
 
 Every key has one value, read from the same parse of the request the
@@ -580,12 +588,18 @@ refused with `400 InvalidArgument`, which bounds the cost of evaluating it.
   GetBucketVersioning with the state set, ListObjectVersions, `?versionId`
   on GetObject, HeadObject and DeleteObject, `VersionId` in DeleteObjects,
   `x-amz-version-id` on writes, reads and deletes, delete markers, and the
-  Suspended state's null version ([Versioning](#versioning)). A request
-  naming a version is evaluated as its version action, as on S3, so a
-  policy granting only `s3:GetObject` no longer allows a `?versionId` read
-  (it needs `s3:GetObjectVersion`), nor `s3:DeleteObject` a delete of a
-  version (`s3:DeleteObjectVersion`). Responses in a bucket never versioned
-  are unchanged.
+  Suspended state's null version ([Versioning](#versioning)). `?versionId`
+  is served on GetObjectTagging, PutObjectTagging, DeleteObjectTagging,
+  GetObjectAcl, PutObjectAcl and GetObjectAttributes, each answering
+  `x-amz-version-id`, and in the `x-amz-copy-source` of CopyObject and
+  UploadPartCopy, which answer `x-amz-copy-source-version-id`; a version
+  copied onto its own key restores it. A request naming a version is
+  evaluated as its version action, as on S3, so a policy granting only
+  `s3:GetObject` no longer allows a `?versionId` read (it needs
+  `s3:GetObjectVersion`), nor `s3:DeleteObject` a delete of a version
+  (`s3:DeleteObjectVersion`), nor the tagging, ACL and attributes actions
+  their operations on a version, nor `s3:GetObject` a copy from one.
+  Responses in a bucket never versioned are unchanged.
 - **Fix:** ListObjects and ListObjectsV2 with `max-keys=0` answer an
   empty page that is not truncated, as ListObjectVersions does. They
   answered `IsTruncated` true once the bucket had a key, and ListObjectsV2
@@ -594,13 +608,14 @@ refused with `400 InvalidArgument`, which bounds the cost of evaluating it.
   Suspended is not supported by v0.10.x and earlier, which do not read the
   versions kept for its keys and would serve stale or missing objects.
   Buckets never versioned stay readable by them.
-- **Fix:** a request naming `?versionId` with a served subresource, such
-  as `?tagging&versionId=`, `?acl&versionId=` or `?partNumber=1&versionId=`,
-  answers `501 NotImplemented`, as every request with `?versionId` does. It
-  was served against the current object with `?versionId` ignored, so a
-  PutObjectTagging, PutObjectAcl or DeleteObjectTagging meant for one
-  version acted on the current object. Every subresource a request names is
-  checked, so any unserved one with a served one is `501 NotImplemented`.
+- **Fix:** a request naming `?versionId` with a subresource, such as
+  `?tagging&versionId=` or `?acl&versionId=`, acts on the version it
+  names, or answers `501 NotImplemented` where the operation takes no
+  version. It was served against the current object with `?versionId`
+  ignored, so a PutObjectTagging, PutObjectAcl or DeleteObjectTagging meant
+  for one version acted on the current object. Every subresource a request
+  names is checked, so any unserved one with a served one is `501
+  NotImplemented`.
 
 ### Changes in v0.10.1
 
@@ -1040,8 +1055,10 @@ sent, and SSE-KMS is accepted and reported only.
 PutObjectTagging (`PUT /<bucket>/<key>?tagging`, `200` with no body),
 GetObjectTagging (`GET`, `200` with the object's `Tagging` document) and
 DeleteObjectTagging (`DELETE`, `204 No Content`), as their API references
-answer them. Each takes `x-amz-expected-bucket-owner`; `?versionId` is
-`501 NotImplemented` ([Versioning](#versioning)). A tag set replaces the
+answer them. Each takes `x-amz-expected-bucket-owner`, and `?versionId`,
+which acts on that version: its tags are its own, a version's tagging never
+creates a version, and each answers the version's `x-amz-version-id` in a
+bucket that is not unversioned ([Versioning](#versioning)). A tag set replaces the
 object's whole set, and an empty one removes it: "If you send this request
 with an empty tag set, Amazon S3 deletes the existing tag set on the
 object" ("Tagging your objects", S3 User Guide). GetObjectTagging of an
@@ -1122,8 +1139,8 @@ UploadPartCopy (`PUT /<bucket>/<key>?partNumber=<n>&uploadId=<id>` with
 `CopyPartResult` of the part's `ETag` and `LastModified`, and the
 encryption headers UploadPart answers, those the upload's object will be
 stored with. `x-amz-copy-source` is read as CopyObject reads it, a leading
-slash and percent-encoding included; `?versionId` in it is `501
-NotImplemented` ([Versioning](#versioning)). The bytes are streamed from the source as it was opened,
+slash and percent-encoding included, and `?versionId` in it copies that
+version and answers `x-amz-copy-source-version-id` ([Versioning](#versioning)). The bytes are streamed from the source as it was opened,
 never read into memory whole, so a source written over meanwhile is
 copied as it was. The part's ETag is the MD5 of its bytes, and a
 completion assembles copied and uploaded parts alike, with S3's multipart
@@ -1265,6 +1282,30 @@ version ID of `null`" (same page).
   `version-id-marker` resume after the version named; `max-keys`, 1000 by
   default and at most, counts versions, markers and common prefixes alike.
   In a bucket never versioned every object is listed as its null version.
+- **Tags, ACLs and attributes.** GetObjectTagging, PutObjectTagging,
+  DeleteObjectTagging, GetObjectAcl, PutObjectAcl and GetObjectAttributes
+  take `?versionId` and act on that version: "The ACL of an object is set
+  at the object version level" (PutObjectAcl API reference), and tags are
+  each version's own. Each answers the version's `x-amz-version-id` in a
+  bucket that is not unversioned (their API references; GetObjectAcl's
+  and PutObjectAcl's in their examples). Tagging a version creates none:
+  "Some actions that modify the current object don't create a new version
+  ... such as changing the tags on an object" ("How S3 Versioning works").
+- **Copies from a version.** CopyObject and UploadPartCopy copy the
+  version `?versionId=<id>` in `x-amz-copy-source` names ("To copy a
+  different version, use the `versionId` query parameter", CopyObject API
+  reference); any other query there is `501 NotImplemented`. Both answer
+  `x-amz-copy-source-version-id`, the version copied, for a source in a
+  bucket that is not unversioned. A source naming a delete marker by
+  version is `400 InvalidRequest`: "you are not allowed to specify a
+  delete marker as a version for the `x-amz-copy-source`" (UploadPartCopy
+  API reference). A version copied onto its own key, under the `COPY`
+  metadata directive, in a bucket that is not unversioned, restores it:
+  "Copy a previous version of the object into the same bucket. The copied
+  object becomes the current version of that object and all object
+  versions are preserved." ("Restoring previous versions", S3 User
+  Guide). A copy onto itself without a version, or in a bucket never
+  versioned, is still `400 InvalidRequest`.
 
 Where AWS is silent or contradicts itself, these are the choices:
 
@@ -1296,13 +1337,23 @@ Where AWS is silent or contradicts itself, these are the choices:
 9. A missing version and a current delete marker answer `404` only to a
    caller allowed `s3:ListBucket`, as a missing key does, and any other
    gets `403` without the marker's headers ([Permissions](#permissions)).
-10. Tagging, ACL or attributes of a delete marker by version: not
-    reachable yet, since `?versionId` on those operations is `501
-    NotImplemented`. Without `?versionId`, a key whose current version is
-    a marker is `404 NoSuchKey` for them.
-11. A copy source naming a version: `?versionId` in `x-amz-copy-source` is
-    `501 NotImplemented`. A copy whose source's current version is a
-    marker is `404 NoSuchKey`, as for a missing source.
+10. Tagging, ACL or attributes of a delete marker by version is `405
+    MethodNotAllowed` with `x-amz-delete-marker: true` and the marker's
+    `x-amz-version-id`, as a GetObject of it is, without the
+    `Last-Modified` "Working with delete markers" gives "only when using
+    the HeadObject or GetObject API operations". Without `?versionId`, a
+    key whose current version is a marker is `404 NoSuchKey` for them,
+    with `x-amz-delete-marker` and the marker's ID on GetObjectAttributes,
+    whose API reference lists the header, and without on the tagging and
+    ACL operations, whose references do not.
+11. A copy source naming a delete marker by version is `400
+    InvalidRequest`, "The source of a copy request may not specifically
+    refer to a delete marker by version id.": the UploadPartCopy API
+    reference gives the status, not the code or message, and CopyObject's
+    gives neither; a `405` would read as a refusal of the destination. A
+    copy whose source's current version is a marker is `404 NoSuchKey`, as
+    for a missing source ("Amazon S3 behaves as if the object was
+    deleted", CopyObject API reference).
 12. DeleteObject of a version the key does not have succeeds, `204` with
     the ID echoed, as deletes are idempotent.
 13. `version-id-marker` without `key-marker` is `400 InvalidArgument`.
@@ -1315,9 +1366,11 @@ Where AWS is silent or contradicts itself, these are the choices:
     a page may repeat but never skips. `max-keys=0` answers an empty page
     that is not truncated, which the API reference does not address: a
     truncated page with no entry could not be resumed.
-15. `s3:x-amz-copy-source` will be `<bucket>/<key>` without the version,
-    which `s3:versionid` carries; no AWS page says either way. It matters
-    once copies from a version are served.
+15. `s3:x-amz-copy-source` is `<bucket>/<key>` without the version, and
+    a copy's `s3:versionid` is the source's, on the source's
+    `s3:GetObjectVersion` and `s3:GetObjectVersionTagging` alone, never on
+    the destination's `s3:PutObject`, which names no version. No AWS page
+    says either way.
 16. ListObjectVersions answers no `Owner`, as ListObjects here answers
     none.
 17. ListObjectsV2 and ListObjects emit a common prefix only for a key
@@ -1328,8 +1381,14 @@ Where AWS is silent or contradicts itself, these are the choices:
 19. A delete marker has no tags or ACL ("A delete marker isn't associated
     with an access control list (ACL) value", "Working with delete
     markers").
-20. GetObjectTagging of a version will need `s3:GetObjectVersionTagging`
-    alone, not also `s3:GetObjectTagging`, once it is served.
+20. GetObjectTagging of a version needs `s3:GetObjectVersionTagging`
+    alone, not also `s3:GetObjectTagging`, where its API reference says
+    "You also need permission for the `s3:GetObjectVersionTagging`
+    action": "Required permissions for Amazon S3 API operations" (S3 User
+    Guide) reads either one, and GetObject's API reference says of a
+    version that "The `s3:GetObject` permission is not required". The
+    tagging, ACL and attributes operations, and a copy's source, are
+    evaluated alike, the version action alone.
 
 Version IDs are 26 characters of `0-9A-V`, URL-safe and opaque, ordered by
 the order versions were written.

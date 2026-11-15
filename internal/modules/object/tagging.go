@@ -23,7 +23,13 @@ const maxTaggingDocument = 64 * 1024
 // "Tagging your objects", S3 User Guide). The document is read and parsed
 // before the request is evaluated, since its tags are the request's
 // s3:RequestObjectTag and s3:RequestObjectTagKeys. A missing object is 404
-// NoSuchKey, as for PutObjectAcl.
+// NoSuchKey, as for PutObjectAcl. With ?versionId it tags that version,
+// and never creates one: "Some actions that modify the current object
+// don't create a new version ... such as changing the tags on an object"
+// (S3 User Guide, "How S3 Versioning works"). Like GetObjectTagging and
+// DeleteObjectTagging it answers x-amz-version-id, the version tagged
+// (their API references), in a bucket that is not Unversioned, and a
+// delete marker as writeSubresourceError describes.
 func (m *Module) putObjectTagging(ctx gas.Context, t s3api.Target) error {
 	r := ctx.Request()
 	caller, err := m.authz.Caller(r)
@@ -47,32 +53,34 @@ func (m *Module) putObjectTagging(ctx gas.Context, t s3api.Target) error {
 		return s3api.WriteError(ctx, t, err)
 	}
 	defer release()
-	if _, err = m.storage.PutObjectTagging(pinned,
-		contracts.ObjectRef{Bucket: t.Bucket, Key: t.Key}, tags,
-		caller.ObjectCheck(t)); err != nil {
-		return s3api.WriteError(ctx, t, err)
+	versionID, err := m.storage.PutObjectTagging(pinned, objectRef(t), tags,
+		caller.ObjectCheck(t))
+	if err != nil {
+		return writeSubresourceError(ctx, t, err)
 	}
+	setVersionHeader(ctx.ResponseWriter(), versionID)
 	ctx.ResponseWriter().WriteHeader(http.StatusOK)
 	return nil
 }
 
 // getObjectTagging serves GetObjectTagging (GET /<bucket>/<key>?tagging):
-// the object's tag set, empty for an object without tags, answered only
-// for the object the request was evaluated for (authz.CheckObject).
+// the tag set of the object, or of the version ?versionId names, empty for
+// one without tags, answered only for the version the request was
+// evaluated for (authz.CheckObject).
 func (m *Module) getObjectTagging(ctx gas.Context, t s3api.Target) error {
 	g, err := m.authz.AuthorizeAndPin(ctx, ctx.Request(), authz.GetObjectTagging, t)
 	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
 	defer g.Release()
-	info, err := m.storage.StatObjectTagging(g.Context(),
-		contracts.ObjectRef{Bucket: t.Bucket, Key: t.Key})
+	info, err := m.storage.StatObjectTagging(g.Context(), objectRef(t))
 	if err != nil {
-		return s3api.WriteError(ctx, t, err)
+		return writeSubresourceError(ctx, t, err)
 	}
 	if err = g.CheckObject(t, info); err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
+	setVersionHeader(ctx.ResponseWriter(), info.VersionID)
 	return ctx.XML(http.StatusOK, s3api.NewTagging(info.Tags))
 }
 
@@ -85,11 +93,12 @@ func (m *Module) deleteObjectTagging(ctx gas.Context, t s3api.Target) error {
 		return s3api.WriteError(ctx, t, err)
 	}
 	defer g.Release()
-	if _, err = m.storage.PutObjectTagging(g.Context(),
-		contracts.ObjectRef{Bucket: t.Bucket, Key: t.Key}, nil,
-		g.ObjectCheck(t)); err != nil {
-		return s3api.WriteError(ctx, t, err)
+	versionID, err := m.storage.PutObjectTagging(g.Context(), objectRef(t), nil,
+		g.ObjectCheck(t))
+	if err != nil {
+		return writeSubresourceError(ctx, t, err)
 	}
+	setVersionHeader(ctx.ResponseWriter(), versionID)
 	return ctx.NoContent()
 }
 

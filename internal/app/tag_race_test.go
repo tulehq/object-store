@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -76,23 +77,69 @@ func (s *raceStore) replace(
 	}
 }
 
+// retag stores tags as the tags of version of bucket/key, as another
+// client's PutObjectTagging of it would.
+func (s *raceStore) retag(
+	t *testing.T,
+	bucket, key string,
+	version *string,
+	tags []contracts.Tag,
+) func(ctx context.Context) {
+	return func(ctx context.Context) {
+		gen, _, err := s.GetBucketPolicy(ctx, bucket)
+		if err != nil && !errors.Is(err, contracts.ErrNoSuchBucketPolicy) {
+			t.Error(err)
+			return
+		}
+		pinned, release, err := s.Pin(ctx, contracts.BucketRef{Name: bucket, Generation: gen})
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer release()
+		if _, err = s.PutObjectTagging(pinned, contracts.ObjectRef{
+			Bucket: bucket, Key: key, Version: *version,
+		}, tags, nil); err != nil {
+			t.Error(err)
+		}
+	}
+}
+
 // secretDeny denies dev every action evaluated with s3:ExistingObjectTag
 // on an object tagged class=secret, and allows it everything else.
 const secretDeny = `{"Version":"2012-10-17","Statement":[` +
 	`{"Effect":"Allow","Action":"s3:*","Resource":"*"},` +
 	`{"Effect":"Deny","Action":["s3:GetObject","s3:GetObjectTagging",` +
 	`"s3:GetObjectAttributes","s3:GetObjectAcl","s3:PutObjectAcl",` +
-	`"s3:PutObjectTagging","s3:DeleteObjectTagging"],"Resource":"*",` +
+	`"s3:PutObjectTagging","s3:DeleteObjectTagging","s3:GetObjectVersion",` +
+	`"s3:GetObjectVersionTagging","s3:GetObjectVersionAttributes",` +
+	`"s3:GetObjectVersionAcl","s3:PutObjectVersionAcl",` +
+	`"s3:PutObjectVersionTagging","s3:DeleteObjectVersionTagging"],"Resource":"*",` +
 	`"Condition":{"StringEquals":{"s3:ExistingObjectTag/class":"secret"}}}]}`
 
 // raceCalls makes a request of every operation evaluated with
 // s3:ExistingObjectTag on race/obj, or on it as a copy's source; upload is
-// an upload of race/mp. GetObject fails the test when it serves anything.
-func raceCalls(t *testing.T, upload *string) map[string]call {
+// an upload of race/mp. Each names the version *version when it is set,
+// as read when the request is made. GetObject fails the test when it
+// serves anything.
+func raceCalls(t *testing.T, upload, version *string) map[string]call {
 	race, obj := aws.String("race"), aws.String("obj")
-	return map[string]call{
+	vid := func() *string {
+		if version == nil || *version == "" {
+			return nil
+		}
+		return aws.String(*version)
+	}
+	src := func() *string {
+		if v := vid(); v != nil {
+			return aws.String("race/obj?versionId=" + *v)
+		}
+		return aws.String("race/obj")
+	}
+	calls := map[string]call{
 		"GetObject": func(ctx context.Context, c *s3.Client) error {
-			out, err := c.GetObject(ctx, &s3.GetObjectInput{Bucket: race, Key: obj})
+			out, err := c.GetObject(ctx,
+				&s3.GetObjectInput{Bucket: race, Key: obj, VersionId: vid()})
 			if err != nil {
 				return err //nolint:wrapcheck // the SDK's error, checked as is
 			}
@@ -102,46 +149,62 @@ func raceCalls(t *testing.T, upload *string) map[string]call {
 			return nil
 		},
 		"HeadObject": func(ctx context.Context, c *s3.Client) error {
-			return sdkErr(c.HeadObject(ctx, &s3.HeadObjectInput{Bucket: race, Key: obj}))
+			return sdkErr(c.HeadObject(ctx,
+				&s3.HeadObjectInput{Bucket: race, Key: obj, VersionId: vid()}))
 		},
 		"GetObjectTagging": func(ctx context.Context, c *s3.Client) error {
 			return sdkErr(c.GetObjectTagging(ctx,
-				&s3.GetObjectTaggingInput{Bucket: race, Key: obj}))
+				&s3.GetObjectTaggingInput{Bucket: race, Key: obj, VersionId: vid()}))
 		},
 		"GetObjectAttributes": func(ctx context.Context, c *s3.Client) error {
 			return sdkErr(c.GetObjectAttributes(ctx, &s3.GetObjectAttributesInput{
-				Bucket: race, Key: obj,
+				Bucket: race, Key: obj, VersionId: vid(),
 				ObjectAttributes: []s3types.ObjectAttributes{s3types.ObjectAttributesEtag},
 			}))
 		},
 		"GetObjectAcl": func(ctx context.Context, c *s3.Client) error {
-			return sdkErr(c.GetObjectAcl(ctx, &s3.GetObjectAclInput{Bucket: race, Key: obj}))
+			return sdkErr(c.GetObjectAcl(ctx,
+				&s3.GetObjectAclInput{Bucket: race, Key: obj, VersionId: vid()}))
 		},
+	}
+	for name, op := range raceWrites(upload, vid, src) {
+		calls[name] = op
+	}
+	return calls
+}
+
+// raceWrites are raceCalls' operations that write: to race/obj's ACL or
+// tags, of the version vid names, or from it, as src names it, to
+// race/dst or a part of upload.
+func raceWrites(upload *string, vid, src func() *string) map[string]call {
+	race, obj := aws.String("race"), aws.String("obj")
+	return map[string]call{
 		"PutObjectAcl": func(ctx context.Context, c *s3.Client) error {
 			return sdkErr(c.PutObjectAcl(ctx, &s3.PutObjectAclInput{
-				Bucket: race, Key: obj, ACL: s3types.ObjectCannedACLPrivate,
+				Bucket: race, Key: obj, VersionId: vid(), ACL: s3types.ObjectCannedACLPrivate,
 			}))
 		},
 		"PutObjectTagging": func(ctx context.Context, c *s3.Client) error {
 			return sdkErr(c.PutObjectTagging(ctx, &s3.PutObjectTaggingInput{
-				Bucket: race, Key: obj, Tagging: &s3types.Tagging{TagSet: []s3types.Tag{
+				Bucket: race, Key: obj, VersionId: vid(),
+				Tagging: &s3types.Tagging{TagSet: []s3types.Tag{
 					{Key: aws.String("a"), Value: aws.String("b")},
 				}},
 			}))
 		},
 		"DeleteObjectTagging": func(ctx context.Context, c *s3.Client) error {
 			return sdkErr(c.DeleteObjectTagging(ctx,
-				&s3.DeleteObjectTaggingInput{Bucket: race, Key: obj}))
+				&s3.DeleteObjectTaggingInput{Bucket: race, Key: obj, VersionId: vid()}))
 		},
 		"CopyObject": func(ctx context.Context, c *s3.Client) error {
 			return sdkErr(c.CopyObject(ctx, &s3.CopyObjectInput{
-				Bucket: race, Key: aws.String("dst"), CopySource: aws.String("race/obj"),
+				Bucket: race, Key: aws.String("dst"), CopySource: src(),
 			}))
 		},
 		"UploadPartCopy": func(ctx context.Context, c *s3.Client) error {
 			return sdkErr(c.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
 				Bucket: race, Key: aws.String("mp"), UploadId: upload,
-				PartNumber: aws.Int32(1), CopySource: aws.String("race/obj"),
+				PartNumber: aws.Int32(1), CopySource: src(),
 			}))
 		},
 	}
@@ -199,7 +262,7 @@ func TestADecisionIsNotAppliedToAnObjectReplacedSinceEvaluation(t *testing.T) {
 		t.Fatal(err)
 	}
 	secret := []contracts.Tag{{Key: "class", Value: "secret"}}
-	for name, op := range raceCalls(t, upload.UploadId) {
+	for name, op := range raceCalls(t, upload.UploadId, nil) {
 		if _, err = root.PutObject(ctx, &s3.PutObjectInput{
 			Bucket: aws.String("race"), Key: aws.String("obj"), Body: strings.NewReader("public"),
 		}); err != nil {
@@ -215,6 +278,72 @@ func TestADecisionIsNotAppliedToAnObjectReplacedSinceEvaluation(t *testing.T) {
 		// Evaluated against the replacement, dev is denied.
 		if denied, _ := isAccessDenied(op(ctx, user)); !denied {
 			t.Errorf("%s: the replacement is not denied", name)
+		}
+	}
+}
+
+// A decision made on one object version is not applied to another, nor to
+// the same version retagged since. In a versioned bucket, every
+// operation evaluated with s3:ExistingObjectTag fails with 409
+// OperationAborted rather than act on the version it reads when, between
+// the evaluation and the operation, the version it names by ID is
+// retagged class=secret, or, naming none, a new version tagged
+// class=secret becomes the current one. Asked again, each is denied.
+func TestADecisionOnAVersionIsNotAppliedToAnother(t *testing.T) {
+	f := &fakeIdentity{}
+	var store *raceStore
+	root, user, _ := startAuthzServerWith(t, f,
+		func(s *dirimpl.Service) contracts.StorageProvider {
+			store = &raceStore{Service: s}
+			return store
+		})
+	f.setPolicies(secretDeny)
+	ctx := t.Context()
+	race := aws.String("race")
+	if _, err := root.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: race}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := root.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
+		Bucket: race,
+		VersioningConfiguration: &s3types.VersioningConfiguration{
+			Status: s3types.BucketVersioningStatusEnabled,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	upload, err := root.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+		Bucket: race, Key: aws.String("mp"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := []contracts.Tag{{Key: "class", Value: "secret"}}
+	for _, named := range []bool{true, false} {
+		var version string
+		for name, op := range raceCalls(t, upload.UploadId, &version) {
+			out, pErr := root.PutObject(ctx, &s3.PutObjectInput{
+				Bucket: race, Key: aws.String("obj"), Body: strings.NewReader("public"),
+			})
+			if pErr != nil {
+				t.Fatal(pErr)
+			}
+			version = ""
+			if named {
+				version = aws.ToString(out.VersionId)
+				store.arm(store.retag(t, "race", "obj", &version, secret))
+			} else {
+				store.arm(store.replace(t, "race", "obj", "secret", secret))
+			}
+			code := "OperationAborted"
+			if name == "HeadObject" {
+				code = "" // a HEAD's error has no body
+			}
+			label := fmt.Sprintf("%s (by version: %t)", name, named)
+			requireStatusIn(t, label, op(ctx, user), http.StatusConflict, code)
+			requireUntouched(t, root, upload.UploadId, label)
+			if denied, _ := isAccessDenied(op(ctx, user)); !denied {
+				t.Errorf("%s: the version read since is not denied", label)
+			}
 		}
 	}
 }

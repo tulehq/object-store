@@ -15,6 +15,9 @@ const (
 	// HeaderDeleteMarker is x-amz-delete-marker: set to true when the
 	// version a request found, created or removed is a delete marker.
 	HeaderDeleteMarker = "X-Amz-Delete-Marker"
+	// HeaderCopySourceVersionID is x-amz-copy-source-version-id: the
+	// version of the source a CopyObject or UploadPartCopy copied.
+	HeaderCopySourceVersionID = "X-Amz-Copy-Source-Version-Id"
 )
 
 // VersionID returns the versionId r's query names, as given, or "" when it
