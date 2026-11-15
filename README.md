@@ -1548,9 +1548,7 @@ bucket are refused, as on S3.
   URL is a bearer grant over every key in the bucket for that operation:
   any keys to delete, or any of the upload's parts to complete.
 - **Not implemented** (requests return `501 NotImplemented`): MFA delete,
-  `?versionId` on the tagging, ACL and attributes operations and in a copy
-  source ([Versioning](#versioning)), lifecycle configuration, object lock,
-  and browser POST-policy uploads.
+  lifecycle configuration, object lock, and browser POST-policy uploads.
 - **Version listings name no owner.** ListObjectVersions answers no
   `Owner` for a version or delete marker, as ListObjects answers none
   here.
