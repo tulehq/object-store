@@ -209,18 +209,22 @@ func (s *Service) storePart(uploadID string, partNumber int, body io.Reader) (st
 // holds of the source as it is read. The bytes are streamed from the
 // source as it was opened, so a source written over meanwhile is copied
 // whole as it was. A range must be within the source, which must be larger
-// than MinRangeCopySource, and the copy at most MaxCopyPartSize. ctx must be pinned to both buckets.
+// than MinRangeCopySource, and the copy at most MaxCopyPartSize. It returns
+// the part with the source's version ID. ctx must be pinned to both
+// buckets.
 func (s *Service) UploadPartCopy(
 	ctx context.Context,
 	in contracts.UploadPartCopyInput,
-) (_ *contracts.PartInfo, _ map[string]string, err error) {
+) (_ *contracts.UploadPartCopyOutput, err error) {
 	m, err := s.loadUpload(ctx, in.Bucket, in.Key, in.UploadID)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	src, err := s.GetObject(ctx, in.SrcBucket, in.SrcKey)
+	src, err := s.GetObject(ctx, contracts.ObjectRef{
+		Bucket: in.SrcBucket, Key: in.SrcKey, Version: in.SrcVersion,
+	})
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	defer func() {
 		if cErr := src.Body.Close(); cErr != nil {
@@ -228,26 +232,28 @@ func (s *Service) UploadPartCopy(
 		}
 	}()
 	if err = checkSource(in.SourceCheck, in.SourceCondition, &src.ObjectInfo); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	first, length, err := copySpan(in.Range, src.Size)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	// The object body seeks within the object bytes (see objectBody).
 	rs, ok := src.Body.(io.Seeker)
 	if !ok {
-		return nil, nil, fmt.Errorf("%s: copy %q: body %T is not seekable",
+		return nil, fmt.Errorf("%s: copy %q: body %T is not seekable",
 			s.Name(), in.SrcKey, src.Body)
 	}
 	if _, err = rs.Seek(first, io.SeekStart); err != nil {
-		return nil, nil, fmt.Errorf("%s: copy %q: %w", s.Name(), in.SrcKey, err)
+		return nil, fmt.Errorf("%s: copy %q: %w", s.Name(), in.SrcKey, err)
 	}
 	part, err := s.copyPart(in, io.LimitReader(src.Body, length), length)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return part, m.Put.Headers, nil
+	return &contracts.UploadPartCopyOutput{
+		Part: *part, Headers: m.Put.Headers, SourceVersionID: src.VersionID,
+	}, nil
 }
 
 // copyPart stores the length bytes body yields as part in.PartNumber of
@@ -333,9 +339,11 @@ func (s *Service) writePart(name string, body io.Reader) (_ string, err error) {
 }
 
 // CompleteMultipartUpload assembles the listed parts, in order, into the
-// object and removes the upload. The object's ETag follows S3: the MD5 of the
-// concatenated binary part digests, suffixed with the part count. The object
-// is only written if cond holds; otherwise the upload is kept.
+// object, written as PutObject writes in the bucket's versioning state at
+// completion, and removes the upload. The object's ETag follows S3: the
+// MD5 of the concatenated binary part digests, suffixed with the part
+// count. The object is only written if cond holds; otherwise the upload is
+// kept.
 func (s *Service) CompleteMultipartUpload(
 	ctx context.Context,
 	bucket, key, uploadID string,
@@ -347,50 +355,44 @@ func (s *Service) CompleteMultipartUpload(
 		return nil, err
 	}
 
-	unlock := s.locks.lock(bucket, key)
-	defer unlock()
+	return s.writeObject(ctx, bucket, key, &objectWrite{
+		open: func() (io.Reader, *trailer, func() error, error) {
+			sizes, etag, pErr := s.checkParts(uploadID, parts)
+			if pErr != nil {
+				return nil, nil, nil, pErr
+			}
+			meta := joinMetadata(m.Put.Metadata, m.Put.Headers)
+			meta[etagMetaKey] = etag
+			joinParts(meta, sizes)
 
-	if err = s.checkPrecondition(ctx, bucket, key, cond); err != nil {
-		return nil, err
-	}
-
-	sizes, etag, err := s.checkParts(uploadID, parts)
-	if err != nil {
-		return nil, err
-	}
-
-	meta := joinMetadata(m.Put.Metadata, m.Put.Headers)
-	meta[etagMetaKey] = etag
-	joinParts(meta, sizes)
-
-	names := make([]string, len(parts))
-	for i, p := range parts {
-		names[i] = partFile(uploadID, p.PartNumber)
-	}
-	r := &partsReader{root: s.root, names: names}
-
-	info, err := s.putObject(ctx, bucket, key, r, &trailer{
-		Meta: meta, ContentType: m.Put.ContentType, Tags: m.Put.Tags,
+			names := make([]string, len(parts))
+			for i, p := range parts {
+				names[i] = partFile(uploadID, p.PartNumber)
+			}
+			r := &partsReader{root: s.root, names: names}
+			return r, &trailer{Meta: meta, ContentType: m.Put.ContentType, Tags: m.Put.Tags},
+				func() error {
+					if cErr := r.Close(); cErr != nil {
+						return fmt.Errorf("%s: complete upload %s: %w", s.Name(), uploadID, cErr)
+					}
+					return nil
+				}, nil
+		},
+		// Two completions of one upload may write at once; only one
+		// commits.
+		check: func() error {
+			_, lErr := s.loadUpload(ctx, bucket, key, uploadID)
+			return lErr
+		},
+		done: func() error {
+			if rErr := s.root.RemoveAll(uploadDir(uploadID)); rErr != nil {
+				return fmt.Errorf("%s: complete upload %s: %w", s.Name(), uploadID, rErr)
+			}
+			return nil
+		},
+		acl:  m.Put.ACL,
+		cond: cond,
 	})
-	if cErr := r.Close(); cErr != nil {
-		err = errors.Join(err, cErr)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("%s: complete upload %s: %w", s.Name(), uploadID, err)
-	}
-
-	if err = s.setObjectACL(bucket, info, m.Put.ACL); err != nil {
-		return nil, err
-	}
-	if err = s.dropTagFile(bucket, key); err != nil {
-		return nil, err
-	}
-
-	if err = s.root.RemoveAll(uploadDir(uploadID)); err != nil {
-		return nil, fmt.Errorf("%s: complete upload %s: %w", s.Name(), uploadID, err)
-	}
-
-	return info, nil
 }
 
 // checkParts validates a completion's part list against the uploaded parts

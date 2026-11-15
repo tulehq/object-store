@@ -154,12 +154,12 @@ func (m *Module) uploadPartCopy(ctx gas.Context, t s3api.Target) error {
 		return s3api.WriteError(ctx, t, err)
 	}
 
-	part, headers, err := m.storage.UploadPartCopy(g.Context(), in)
+	out, err := m.storage.UploadPartCopy(g.Context(), in)
 	if err != nil {
 		return s3api.WriteError(ctx, t, g.NotFound(srcBucket, err))
 	}
-	setEncryptionHeaders(ctx.ResponseWriter(), encryptionOf(headers))
-	return ctx.XML(http.StatusOK, s3api.NewCopyPartResult(part.ETag, part.LastModified))
+	setEncryptionHeaders(ctx.ResponseWriter(), encryptionOf(out.Headers))
+	return ctx.XML(http.StatusOK, s3api.NewCopyPartResult(out.Part.ETag, out.Part.LastModified))
 }
 
 // parseCopyRange reads an x-amz-copy-source-range, given as its values:

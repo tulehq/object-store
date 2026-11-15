@@ -37,9 +37,9 @@ func (s *raceStore) arm(hook func(ctx context.Context)) {
 
 func (s *raceStore) StatObjectTagging(
 	ctx context.Context,
-	bucket, key string,
+	ref contracts.ObjectRef,
 ) (*contracts.ObjectInfo, error) {
-	info, err := s.Service.StatObjectTagging(ctx, bucket, key)
+	info, err := s.Service.StatObjectTagging(ctx, ref)
 	s.mu.Lock()
 	hook := s.hook
 	s.hook = nil

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -83,8 +84,9 @@ func (s *Service) DeleteBucketConfig(
 	return nil
 }
 
-// resetConfigs removes the policy, configuration, object ACLs and object
-// tags bucket has, which an interrupted DeleteBucket can leave, and stores
+// resetConfigs removes the policy, configuration, object ACLs, object
+// tags, version manifests and versioning state bucket has, which an
+// interrupted DeleteBucket can leave (see removeConfigs), and stores
 // configs as its configuration, for CreateBucket, which holds the bucket's
 // write lock.
 func (s *Service) resetConfigs(bucket string, configs map[contracts.BucketConfig][]byte) error {
@@ -103,8 +105,9 @@ func (s *Service) resetConfigs(bucket string, configs map[contracts.BucketConfig
 	return nil
 }
 
-// removeConfigs removes every configuration, object ACL and object tag
-// set of bucket. The caller holds the bucket's write lock.
+// removeConfigs removes every configuration, object ACL, object tag set
+// and version manifest of bucket, and its versioning state. The caller
+// holds the bucket's write lock.
 func (s *Service) removeConfigs(bucket string) error {
 	for _, kind := range contracts.BucketConfigs {
 		if err := s.removeIfExists(configFile(kind, bucket)); err != nil {
@@ -118,6 +121,14 @@ func (s *Service) removeConfigs(bucket string) error {
 	}
 	if err := s.root.RemoveAll(filepath.Join(tagDir, bucket)); err != nil {
 		return fmt.Errorf("%s: failed to delete the object tags of bucket %s: %w",
+			s.Name(), bucket, err)
+	}
+	if err := s.root.RemoveAll(filepath.Join(versionsDir, bucket)); err != nil {
+		return fmt.Errorf("%s: failed to delete the object versions of bucket %s: %w",
+			s.Name(), bucket, err)
+	}
+	if err := s.removeIfExists(versioningFile(bucket)); err != nil {
+		return fmt.Errorf("%s: failed to delete the versioning of bucket %s: %w",
 			s.Name(), bucket, err)
 	}
 	return nil
@@ -138,6 +149,64 @@ func (s *Service) writeFile(name string, doc []byte) error {
 	return nil
 }
 
+// writeDurable writes doc to name as writeFile does, but syncs the temp
+// file before the rename and the directory after it, and the parent of a
+// directory it creates, so a commit that returned survives a power loss,
+// and is not lost while a backend delete made after it, which the backend
+// syncs, is kept. It is for the commits of version manifests and of the
+// versioning state.
+func (s *Service) writeDurable(name string, doc []byte) error {
+	dir := filepath.Dir(name)
+	if err := s.makeDurableDir(dir); err != nil {
+		return err
+	}
+	tmp := name + ".tmp-" + rand.Text()
+	if err := s.writeSynced(tmp, doc); err != nil {
+		return errors.Join(err, s.removeIfExists(tmp))
+	}
+	if err := s.root.Rename(tmp, name); err != nil {
+		return errors.Join(err, s.removeIfExists(tmp))
+	}
+	return s.syncDir(dir)
+}
+
+// makeDurableDir creates dir, when it does not exist, and syncs its
+// parent, so the new entry survives a power loss.
+func (s *Service) makeDurableDir(dir string) error {
+	_, err := s.root.Stat(dir)
+	if !errors.Is(err, fs.ErrNotExist) {
+		return err //nolint:wrapcheck // wrapped by the caller with what is written
+	}
+	if err = s.root.MkdirAll(dir, 0o750); err != nil {
+		return err //nolint:wrapcheck // wrapped by the caller with what is written
+	}
+	return s.syncDir(filepath.Dir(dir))
+}
+
+// writeSynced writes doc to name, a new file, and syncs it.
+func (s *Service) writeSynced(name string, doc []byte) (err error) {
+	f, err := s.root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err //nolint:wrapcheck // wrapped by the caller with what is written
+	}
+	defer func() { err = errors.Join(err, f.Close()) }()
+	if _, err = f.Write(doc); err != nil {
+		return err //nolint:wrapcheck // wrapped by the caller with what is written
+	}
+	return f.Sync() //nolint:wrapcheck // wrapped by the caller with what is written
+}
+
+// syncDir syncs directory dir, so the entries renamed or created in it
+// are durable.
+func (s *Service) syncDir(dir string) (err error) {
+	d, err := s.root.Open(dir)
+	if err != nil {
+		return err //nolint:wrapcheck // wrapped by the caller with what is written
+	}
+	defer func() { err = errors.Join(err, d.Close()) }()
+	return d.Sync() //nolint:wrapcheck // wrapped by the caller with what is written
+}
+
 // objectACL is what is stored for an object's ACL: the document, and the
 // ETag and modification time of the object it was stored for. Every write
 // and delete of the object replaces or removes it; the two are checked
@@ -148,59 +217,66 @@ type objectACL struct {
 	ACL          []byte    `json:"acl"`
 }
 
-// aclFile is the file the ACL of the object at key is stored in.
+// aclFile is the file the ACL of the object at key, a key without a
+// manifest, is stored in, which is also the one of a Legacy entry's
+// version (see sideFile).
 func aclFile(bucket, key string) string {
-	return filepath.Join(aclDir, bucket, keyHash(key))
+	return sideFile(aclDir, bucket, key, nil)
 }
 
-// GetObjectACL returns the ACL stored for the object at key, if it was
-// stored for the object as it now is and check passes for that object.
-// ctx must be pinned to bucket.
+// GetObjectACL returns the ACL stored for the version ref names, and its
+// version ID, if it was stored for the version as it now is and check
+// passes for that version. ctx must be pinned to the bucket.
 func (s *Service) GetObjectACL(
 	ctx context.Context,
-	bucket, key string,
+	ref contracts.ObjectRef,
 	check contracts.ObjectCheck,
-) ([]byte, error) {
-	info, err := s.statChecked(ctx, bucket, key, check)
+) ([]byte, string, error) {
+	info, e, err := s.statChecked(ctx, ref, check)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	raw, err := s.root.ReadFile(aclFile(bucket, key))
+	raw, err := s.root.ReadFile(sideFile(aclDir, ref.Bucket, ref.Key, e))
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil, contracts.ErrNoSuchBucketConfig
+		return nil, "", contracts.ErrNoSuchBucketConfig
 	}
 	if err != nil {
-		return nil, fmt.Errorf("%s: failed to read the ACL of %q: %w", s.Name(), key, err)
+		return nil, "", fmt.Errorf("%s: failed to read the ACL of %q: %w", s.Name(), ref.Key, err)
 	}
 	var stored objectACL
 	if err = json.Unmarshal(raw, &stored); err != nil {
-		return nil, fmt.Errorf("%s: failed to decode the ACL of %q: %w", s.Name(), key, err)
+		return nil, "", fmt.Errorf("%s: failed to decode the ACL of %q: %w",
+			s.Name(), ref.Key, err)
 	}
 	if stored.ETag != info.ETag || !stored.LastModified.Equal(info.LastModified) {
-		return nil, contracts.ErrNoSuchBucketConfig
+		return nil, "", contracts.ErrNoSuchBucketConfig
 	}
-	return stored.ACL, nil
+	return stored.ACL, info.VersionID, nil
 }
 
-// PutObjectACL stores doc as the ACL of the object at key as it now is,
-// if check passes for it, under the key's lock, so the object it is
-// stored for is not written over meanwhile. ctx must be pinned to bucket.
+// PutObjectACL stores doc as the ACL of the version ref names as it now
+// is, if check passes for it, under the key's lock, so the version it is
+// stored for is not written over meanwhile, and returns the version's ID.
+// ctx must be pinned to the bucket.
 func (s *Service) PutObjectACL(
 	ctx context.Context,
-	bucket, key string,
+	ref contracts.ObjectRef,
 	doc []byte,
 	check contracts.ObjectCheck,
-) error {
-	if _, err := requirePin(ctx, bucket); err != nil {
-		return err
+) (string, error) {
+	if _, err := requirePin(ctx, ref.Bucket); err != nil {
+		return "", err
 	}
-	unlock := s.locks.lock(bucket, key)
+	unlock := s.locks.lock(ref.Bucket, ref.Key)
 	defer unlock()
-	info, err := s.statChecked(ctx, bucket, key, check)
+	info, e, err := s.statChecked(ctx, ref, check)
 	if err != nil {
-		return err
+		return "", err
 	}
-	return s.writeObjectACL(bucket, info, doc)
+	if err = s.writeObjectACL(sideFile(aclDir, ref.Bucket, ref.Key, e), info, doc); err != nil {
+		return "", err
+	}
+	return info.VersionID, nil
 }
 
 // setObjectACL stores doc as the ACL of the object info describes, just
@@ -209,7 +285,7 @@ func (s *Service) PutObjectACL(
 // key's lock.
 func (s *Service) setObjectACL(bucket string, info *contracts.ObjectInfo, doc []byte) error {
 	if doc != nil {
-		return s.writeObjectACL(bucket, info, doc)
+		return s.writeObjectACL(aclFile(bucket, info.Key), info, doc)
 	}
 	if err := s.removeIfExists(aclFile(bucket, info.Key)); err != nil {
 		return fmt.Errorf("%s: failed to delete the ACL of %q: %w", s.Name(), info.Key, err)
@@ -217,14 +293,15 @@ func (s *Service) setObjectACL(bucket string, info *contracts.ObjectInfo, doc []
 	return nil
 }
 
-// writeObjectACL stores doc as the ACL of the object info describes. The
-// caller holds the key's lock.
-func (s *Service) writeObjectACL(bucket string, info *contracts.ObjectInfo, doc []byte) error {
+// writeObjectACL stores doc as the ACL of the object info describes, in
+// its ACL file, name. The caller holds the key's lock, or writes the ACL
+// of a version not yet committed.
+func (s *Service) writeObjectACL(name string, info *contracts.ObjectInfo, doc []byte) error {
 	raw, err := json.Marshal(objectACL{LastModified: info.LastModified, ETag: info.ETag, ACL: doc})
 	if err != nil {
 		return fmt.Errorf("%s: failed to encode the ACL of %q: %w", s.Name(), info.Key, err)
 	}
-	if err = s.writeFile(aclFile(bucket, info.Key), raw); err != nil {
+	if err = s.writeFile(name, raw); err != nil {
 		return fmt.Errorf("%s: failed to store the ACL of %q: %w", s.Name(), info.Key, err)
 	}
 	return nil

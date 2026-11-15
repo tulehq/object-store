@@ -2,6 +2,7 @@ package dirimpl
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -31,7 +32,7 @@ func TestBucketConfigs(t *testing.T) {
 	for name, err := range map[string]error{
 		"put":    s.PutBucketConfig(context.Background(), "bucket", contracts.ConfigCORS, nil),
 		"delete": s.DeleteBucketConfig(context.Background(), "bucket", contracts.ConfigCORS),
-		"acl":    s.PutObjectACL(context.Background(), "bucket", "k", nil, nil),
+		"acl":    errOf(s.PutObjectACL(context.Background(), oref("bucket", "k"), nil, nil)),
 	} {
 		if err == nil {
 			t.Errorf("%s without a pin succeeded", name)
@@ -108,7 +109,7 @@ func TestABucketsConfigIsDeletedWithIt(t *testing.T) {
 	}, contracts.Precondition{}); err != nil {
 		t.Fatal(err)
 	}
-	if err = s.DeleteObject(ctx, "left", "k"); err != nil {
+	if err = errOf(s.DeleteObject(ctx, oref("left", "k"))); err != nil {
 		t.Fatal(err)
 	}
 	release()
@@ -138,36 +139,30 @@ func TestObjectACLs(t *testing.T) {
 		}
 	}
 
-	_, err := s.GetObjectACL(ctx, "bucket", "k", nil)
+	_, _, err := s.GetObjectACL(ctx, oref("bucket", "k"), nil)
 	requireIs(t, "no object", err, storage.ErrObjectNotFound)
-	requireIs(t, "put on no object", s.PutObjectACL(ctx, "bucket", "k", []byte("<a/>"), nil),
-		storage.ErrObjectNotFound)
+	requireIs(
+		t,
+		"put on no object",
+		errOf(s.PutObjectACL(ctx, oref("bucket", "k"), []byte("<a/>"), nil)),
+		storage.ErrObjectNotFound,
+	)
 
 	write([]byte("<written/>"))
-	if got, gErr := s.GetObjectACL(
-		ctx,
-		"bucket",
-		"k",
-		nil,
-	); gErr != nil ||
+	if got, _, gErr := s.GetObjectACL(ctx, oref("bucket", "k"), nil); gErr != nil ||
 		string(got) != "<written/>" {
 		t.Fatalf("the ACL written with the object: %q %v", got, gErr)
 	}
-	if err = s.PutObjectACL(ctx, "bucket", "k", []byte("<put/>"), nil); err != nil {
+	if err = errOf(s.PutObjectACL(ctx, oref("bucket", "k"), []byte("<put/>"), nil)); err != nil {
 		t.Fatal(err)
 	}
-	if got, gErr := s.GetObjectACL(
-		ctx,
-		"bucket",
-		"k",
-		nil,
-	); gErr != nil ||
+	if got, _, gErr := s.GetObjectACL(ctx, oref("bucket", "k"), nil); gErr != nil ||
 		string(got) != "<put/>" {
 		t.Fatalf("the ACL put: %q %v", got, gErr)
 	}
 
 	write(nil)
-	_, err = s.GetObjectACL(ctx, "bucket", "k", nil)
+	_, _, err = s.GetObjectACL(ctx, oref("bucket", "k"), nil)
 	requireIs(t, "written over without an ACL", err, contracts.ErrNoSuchBucketConfig)
 	requireNoACLFile(t, s, "k", "written over without an ACL")
 }
@@ -195,7 +190,7 @@ func TestObjectACLFilesGoWithTheirObjects(t *testing.T) {
 	}
 
 	withACL("deleted")
-	if err := s.DeleteObject(ctx, "bucket", "deleted"); err != nil {
+	if err := errOf(s.DeleteObject(ctx, oref("bucket", "deleted"))); err != nil {
 		t.Fatal(err)
 	}
 	requireNoACLFile(t, s, "deleted", "a delete")
@@ -265,7 +260,7 @@ func TestACopysACL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = s.GetObjectACL(ctx, "bucket", "copy", nil)
+	_, _, err = s.GetObjectACL(ctx, oref("bucket", "copy"), nil)
 	requireIs(t, "a copy without an ACL", err, contracts.ErrNoSuchBucketConfig)
 	if _, err = s.CopyObject(ctx, contracts.CopyObjectInput{
 		SrcBucket: "bucket", SrcKey: "k", DstBucket: "bucket", DstKey: "copy",
@@ -273,20 +268,46 @@ func TestACopysACL(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if got, gErr := s.GetObjectACL(
-		ctx,
-		"bucket",
-		"copy",
-		nil,
-	); gErr != nil ||
+	if got, _, gErr := s.GetObjectACL(ctx, oref("bucket", "copy"), nil); gErr != nil ||
 		string(got) != "<copy/>" {
 		t.Fatalf("a copy's ACL: %q %v", got, gErr)
 	}
-	info, err := s.StatObject(ctx, "bucket", "copy")
+	info, err := s.StatObject(ctx, oref("bucket", "copy"))
 	if err != nil || info.Headers["X-A"] != "1" {
 		t.Fatalf("a copy's headers: %v %v", info, err)
 	}
 	if _, ok := info.Headers["Cache-Control"]; ok {
 		t.Error("an empty header was stored")
 	}
+}
+
+// PutObjectACL stores the ACL of the version it names only, and refuses a
+// delete marker.
+func TestACLsArePerVersion(t *testing.T) {
+	f := newFixture(t)
+	f.state(contracts.VersioningEnabled)
+	v1 := f.putIn("k", "v1", contracts.PutObjectInput{ACL: []byte("<v1/>")})
+	v2 := f.put("k", "v2")
+	id, err := f.s.PutObjectACL(f.ctx, vref("k", v1.VersionID), []byte("<v1b/>"), nil)
+	if err != nil || id != v1.VersionID {
+		t.Fatalf("put v1's ACL: %q %v", id, err)
+	}
+	if doc, got, gErr := f.s.GetObjectACL(f.ctx, vref("k", v1.VersionID), nil); gErr != nil ||
+		string(doc) != "<v1b/>" || got != v1.VersionID {
+		t.Fatalf("v1's ACL: %q %q %v", doc, got, gErr)
+	}
+	_, id, err = f.s.GetObjectACL(f.ctx, oref("bucket", "k"), nil)
+	if !errors.Is(err, contracts.ErrNoSuchBucketConfig) || id != "" {
+		t.Fatalf("v2's ACL: %q %v", id, err)
+	}
+	if id, err = f.s.PutObjectACL(f.ctx, oref("bucket", "k"), []byte("<v2/>"), nil); err != nil ||
+		id != v2.VersionID {
+		t.Fatalf("put the current version's ACL: %q %v", id, err)
+	}
+
+	marker := f.del(oref("bucket", "k"))
+	_, err = f.s.PutObjectACL(f.ctx, vref("k", marker.VersionID), []byte("<m/>"), nil)
+	requireIs(t, "a marker's ACL", err, contracts.ErrMethodNotAllowed)
+	_, _, err = f.s.GetObjectACL(f.ctx, oref("bucket", "k"), nil)
+	requireIs(t, "a current marker's ACL", err, storage.ErrObjectNotFound)
 }

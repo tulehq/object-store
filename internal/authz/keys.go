@@ -337,7 +337,8 @@ func (c *Caller) existing(t s3api.Target) ([]contracts.Tag, error) {
 		return o.tags, nil
 	}
 	var o evaluatedObject
-	info, err := c.a.policies.StatObjectTagging(c.req.Context(), t.Bucket, t.Key)
+	info, err := c.a.policies.StatObjectTagging(c.req.Context(),
+		contracts.ObjectRef{Bucket: t.Bucket, Key: t.Key})
 	switch {
 	case errors.Is(err, storage.ErrObjectNotFound), errors.Is(err, storage.ErrBucketNotFound),
 		errors.Is(err, storage.ErrInvalidKey):

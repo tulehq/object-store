@@ -61,7 +61,7 @@ func TestOperationsNeedAPin(t *testing.T) {
 	ctx := context.Background()
 	for name, err := range map[string]error{
 		"put policy": s.PutBucketPolicy(ctx, "bucket", []byte("{}")),
-		"delete":     s.DeleteObject(ctx, "bucket", "k"),
+		"delete":     errOf(s.DeleteObject(ctx, oref("bucket", "k"))),
 	} {
 		if err == nil || errors.Is(err, storage.ErrBucketNotFound) {
 			t.Errorf("%s without a pin: %v", name, err)
