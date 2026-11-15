@@ -1,6 +1,12 @@
 package object
 
-import "testing"
+import (
+	"errors"
+	"net/http"
+	"testing"
+
+	"tule.dev/object-store/internal/s3api"
+)
 
 func TestParseCopySource(t *testing.T) {
 	tests := []struct {
@@ -32,6 +38,29 @@ func TestParseCopySource(t *testing.T) {
 			src.VersionID != tt.version {
 			t.Errorf("%q: got %+v %v, want %q %q %q", tt.in, src, err,
 				tt.bucket, tt.key, tt.version)
+		}
+	}
+}
+
+// A copy source's query is refused with the status its fault calls for:
+// 400 for one that does not decode or an empty versionId, 501 for a query
+// other than one versionId.
+func TestParseCopySourceQueryErrors(t *testing.T) {
+	const bad, unserved = "InvalidArgument", "NotImplemented"
+	tests := []struct {
+		in, code string
+		status   int
+	}{
+		{in: "src/k?versionId=%zz", status: http.StatusBadRequest, code: bad},
+		{in: "src/k?versionId=", status: http.StatusBadRequest, code: bad},
+		{in: "src/k?x=1", status: http.StatusNotImplemented, code: unserved},
+		{in: "src/k?versionId=a&versionId=b", status: http.StatusNotImplemented, code: unserved},
+	}
+	for _, tt := range tests {
+		_, err := parseCopySource(tt.in)
+		var s3Err *s3api.Error
+		if !errors.As(err, &s3Err) || s3Err.Status != tt.status || s3Err.Code != tt.code {
+			t.Errorf("%q: got %v, want %d %s", tt.in, err, tt.status, tt.code)
 		}
 	}
 }

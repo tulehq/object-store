@@ -78,9 +78,10 @@ func selfCopy(in contracts.CopyObjectInput) bool {
 // optional leading slash and a URL-encoded key, and an optional
 // "?versionId=<version-id>" (CopyObject and UploadPartCopy API
 // references), into the source it names: its bucket, key and version, ""
-// for the current one. A query of anything but one versionId is 501
-// NotImplemented, and an empty versionId 400 InvalidArgument, as
-// s3api.VersionID answers one.
+// for the current one. A query that does not decode is 400
+// InvalidArgument, as a key that does not is; one of anything but one
+// versionId is 501 NotImplemented; and an empty versionId is 400
+// InvalidArgument, as s3api.VersionID answers one.
 func parseCopySource(v string) (s3api.Target, error) {
 	v, query, _ := strings.Cut(v, "?")
 	versionID, err := copySourceVersion(query)
@@ -110,8 +111,11 @@ func copySourceVersion(query string) (string, error) {
 		return "", nil
 	}
 	values, err := url.ParseQuery(query)
+	if err != nil {
+		return "", s3api.ErrInvalidArgument("Invalid copy source encoding")
+	}
 	ids, ok := values["versionId"]
-	if err != nil || len(values) != 1 || !ok || len(ids) != 1 {
+	if len(values) != 1 || !ok || len(ids) != 1 {
 		return "", s3api.ErrNotImplemented(
 			"An x-amz-copy-source query other than one versionId is not supported.",
 		)

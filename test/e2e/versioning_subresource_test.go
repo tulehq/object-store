@@ -3,6 +3,7 @@
 package e2e
 
 import (
+	"bytes"
 	"net/http"
 	"testing"
 
@@ -347,4 +348,64 @@ func TestCopyFromADeleteMarker(t *testing.T) {
 	requireCode(t, err, "NoSuchKey")
 	_, err = c.HeadObject(ctx, &s3.HeadObjectInput{Bucket: bucket, Key: aws.String("c")})
 	requireResponse(t, err, http.StatusNotFound)
+}
+
+// In a Suspended bucket a copy writes the null version, so a restore by
+// copy replaces the key's null version and keeps every other: copying an
+// older version onto its key makes it the new null version, and copying
+// the null version onto itself, which replaces its own source while it is
+// read, leaves the null version with its source's bytes and tags.
+func TestRestoreByCopySuspended(t *testing.T) {
+	c := startLive(t, nil).testClient()
+	ctx := t.Context()
+	versionedBucket(t, c, "vsusp")
+	bucket, key := aws.String("vsusp"), aws.String("k")
+	v1 := putVersion(t, c, "vsusp", "k", "one")
+	setVersioning(t, c, "vsusp", types.BucketVersioningStatusSuspended)
+	requireEqual(t, putVersion(t, c, "vsusp", "k", "suspended"), "null", "the null version")
+
+	out, err := c.CopyObject(ctx, &s3.CopyObjectInput{
+		Bucket: bucket, Key: key, CopySource: aws.String("vsusp/k?versionId=" + v1),
+	})
+	requireNoErr(t, err, "restore v1 in a Suspended bucket")
+	requireEqual(t, aws.ToString(out.VersionId), "null", "the restored copy's version")
+	requireEqual(t, aws.ToString(out.CopySourceVersionId), v1, "the version restored")
+	body, id := getVersion(t, c, "vsusp", "k", "")
+	requireEqual(t, body, "one", "the current version after the restore")
+	requireEqual(t, id, "null", "the current version's ID")
+	body, _ = getVersion(t, c, "vsusp", "k", v1)
+	requireEqual(t, body, "one", "v1 kept")
+	listed := listVersions(t, c, s3.ListObjectVersionsInput{Bucket: bucket})
+	requireEqual(t, len(listed.Versions), 2, "v1 and one null version")
+
+	// The null version copied onto itself: larger than one read buffer, and
+	// tagged, so a copy that read its source after replacing it, or lost
+	// its tags with it, shows.
+	self := randomBytes(t, 6*mib)
+	_, err = c.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: bucket, Key: key, Body: bytes.NewReader(self), Tagging: aws.String("a=b"),
+	})
+	requireNoErr(t, err, "write the null version to copy")
+	out, err = c.CopyObject(ctx, &s3.CopyObjectInput{
+		Bucket: bucket, Key: key, CopySource: aws.String("vsusp/k?versionId=null"),
+	})
+	requireNoErr(t, err, "copy the null version onto itself")
+	requireEqual(t, aws.ToString(out.VersionId), "null", "the self-copy's version")
+	requireEqual(t, aws.ToString(out.CopySourceVersionId), "null", "the version copied")
+	requireEqual(t, aws.ToString(out.CopyObjectResult.ETag), md5Hex(self), "the copy's ETag")
+	got, _ := get(t, c, &s3.GetObjectInput{Bucket: bucket, Key: key, VersionId: aws.String("null")})
+	requireEqual(t, aws.ToString(got.VersionId), "null", "the null version read")
+	_, data := get(t, c, &s3.GetObjectInput{Bucket: bucket, Key: key})
+	requireEqual(t, bytes.Equal(data, self), true, "the self-copy's bytes equal its source's")
+	tagsOut, err := c.GetObjectTagging(ctx, &s3.GetObjectTaggingInput{
+		Bucket: bucket, Key: key, VersionId: aws.String("null"),
+	})
+	requireNoErr(t, err, "the self-copy's tags")
+	requireEqual(t, len(tagsOut.TagSet) == 1 && aws.ToString(tagsOut.TagSet[0].Key) == "a",
+		true, "the self-copy keeps its source's tags")
+	body, _ = getVersion(t, c, "vsusp", "k", v1)
+	requireEqual(t, body, "one", "v1 kept after the self-copy")
+	listed = listVersions(t, c, s3.ListObjectVersionsInput{Bucket: bucket})
+	requireEqual(t, len(listed.Versions), 2, "still v1 and one null version")
+	requireEqual(t, len(listed.DeleteMarkers), 0, "no delete marker")
 }
