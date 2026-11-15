@@ -67,6 +67,11 @@ func (m *Module) getBucket(ctx gas.Context) error {
 
 	if sub := s3api.Subresource(r); sub != "" {
 		if serve, ok := m.getSubresource(sub); ok {
+			// Any other subresource with sub, such as ?versionId, is one
+			// not served with it.
+			if err := s3api.CheckSubresource(r, sub); err != nil {
+				return s3api.WriteError(ctx, target, err)
+			}
 			return serve(ctx)
 		}
 		return s3api.WriteError(ctx, target, s3api.CheckSubresource(r))
@@ -337,7 +342,11 @@ func (m *Module) headBucket(ctx gas.Context) error {
 func (m *Module) putBucket(ctx gas.Context) error {
 	bucket := ctx.Param("bucket")
 
-	if serve, ok := m.putSubresource(s3api.Subresource(ctx.Request())); ok {
+	sub := s3api.Subresource(ctx.Request())
+	if serve, ok := m.putSubresource(sub); ok {
+		if err := s3api.CheckSubresource(ctx.Request(), sub); err != nil {
+			return s3api.WriteError(ctx, s3api.Target{Bucket: bucket}, err)
+		}
 		return serve(ctx)
 	}
 	if err := s3api.CheckSubresource(ctx.Request()); err != nil {
@@ -389,6 +398,9 @@ func (m *Module) deleteBucket(ctx gas.Context) error {
 	bucket := ctx.Param("bucket")
 
 	sub := s3api.Subresource(ctx.Request())
+	if err := s3api.CheckSubresource(ctx.Request(), sub); err != nil {
+		return s3api.WriteError(ctx, s3api.Target{Bucket: bucket}, err)
+	}
 	if ck, ok := configKinds[sub]; ok {
 		return m.deleteConfig(ctx, ck)
 	}
