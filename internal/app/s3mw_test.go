@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 	"time"
 
@@ -58,7 +59,7 @@ func TestS3AuthErrorPicksTheQueryErrorForAPresignedURL(t *testing.T) {
 		if !errors.As(s3AuthError(tc.err), &got) {
 			t.Fatalf("%s: not an *s3api.Error", tc.err.Kind)
 		}
-		if *got != tc.want {
+		if !reflect.DeepEqual(*got, tc.want) {
 			t.Errorf(
 				"%s (presigned %t) = %+v, want %+v",
 				tc.err.Kind,
@@ -116,7 +117,7 @@ func TestS3AuthErrorAnswersKeyRefusalsAsS3Does(t *testing.T) {
 			if !errors.As(s3AuthError(e), &got) {
 				t.Fatalf("%s: not an *s3api.Error", tc.kind)
 			}
-			if *got != tc.want {
+			if !reflect.DeepEqual(*got, tc.want) {
 				t.Errorf("%s (presigned %t) = %+v, want %+v", tc.kind, presigned, *got, tc.want)
 			}
 		}
