@@ -20,24 +20,37 @@ var subresources = []string{
 	"versioning", "versions", "website",
 }
 
+// Subresources returns every subresource named in r's query, in the order
+// of subresources, or nil when there is none.
+func Subresources(r *http.Request) []string {
+	q := r.URL.Query()
+	var names []string
+	for _, name := range subresources {
+		if q.Has(name) {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
 // Subresource returns the first subresource named in r's query, or "" when
 // there is none.
 func Subresource(r *http.Request) string {
-	q := r.URL.Query()
-	for _, name := range subresources {
-		if q.Has(name) {
-			return name
-		}
+	if names := Subresources(r); len(names) > 0 {
+		return names[0]
 	}
 	return ""
 }
 
-// CheckSubresource returns a NotImplemented error when r names a subresource
-// other than those in allowed.
+// CheckSubresource returns a NotImplemented error when r names any
+// subresource other than those in allowed. Every subresource is checked, so
+// one that changes the meaning of another, such as ?versionId with
+// ?tagging, is refused rather than ignored.
 func CheckSubresource(r *http.Request, allowed ...string) error {
-	name := Subresource(r)
-	if name == "" || slices.Contains(allowed, name) {
-		return nil
+	for _, name := range Subresources(r) {
+		if !slices.Contains(allowed, name) {
+			return ErrNotImplemented("The ?" + name + " subresource is not supported.")
+		}
 	}
-	return ErrNotImplemented("The ?" + name + " subresource is not supported.")
+	return nil
 }

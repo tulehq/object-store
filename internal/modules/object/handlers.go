@@ -31,14 +31,15 @@ func (m *Module) getObject(ctx gas.Context) error {
 	t := target(ctx)
 	r := ctx.Request()
 
-	if r.URL.Query().Has("uploadId") {
-		if err := s3api.CheckSubresource(r, "uploadId"); err != nil {
-			return s3api.WriteError(ctx, t, err)
-		}
-		return m.listParts(ctx, t)
+	// A request names one operation: any other subresource with it, such
+	// as ?versionId, is one not served with it.
+	sub := s3api.Subresource(r)
+	if err := s3api.CheckSubresource(r, sub); err != nil {
+		return s3api.WriteError(ctx, t, err)
 	}
-
-	switch s3api.Subresource(r) {
+	switch sub {
+	case "uploadId":
+		return m.listParts(ctx, t)
 	case "acl":
 		return m.getObjectACL(ctx, t)
 	case "tagging":
@@ -216,7 +217,11 @@ func (m *Module) putObject(ctx gas.Context) error {
 		return m.uploadPart(ctx, t)
 	}
 
-	switch s3api.Subresource(r) {
+	sub := s3api.Subresource(r)
+	if err := s3api.CheckSubresource(r, sub); err != nil {
+		return s3api.WriteError(ctx, t, err)
+	}
+	switch sub {
 	case "acl":
 		return m.putObjectACL(ctx, t)
 	case "tagging":
@@ -397,6 +402,9 @@ func (m *Module) deleteObject(ctx gas.Context) error {
 	}
 
 	if s3api.Subresource(r) == "tagging" {
+		if err := s3api.CheckSubresource(r, "tagging"); err != nil {
+			return s3api.WriteError(ctx, t, err)
+		}
 		return m.deleteObjectTagging(ctx, t)
 	}
 	if err := s3api.CheckSubresource(r); err != nil {

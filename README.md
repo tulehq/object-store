@@ -556,6 +556,16 @@ refused with `400 InvalidArgument`, which bounds the cost of evaluating it.
 
 ### Changes in this version
 
+- **Fix:** a request naming `?versionId` with a served subresource, such
+  as `?tagging&versionId=`, `?acl&versionId=` or `?partNumber=1&versionId=`,
+  answers `501 NotImplemented`, as every request with `?versionId` does. It
+  was served against the current object with `?versionId` ignored, so a
+  PutObjectTagging, PutObjectAcl or DeleteObjectTagging meant for one
+  version acted on the current object. Every subresource a request names is
+  checked, so any unserved one with a served one is `501 NotImplemented`.
+
+### Changes in v0.10.1
+
 - **Behavior:** a CopyObject under the `COPY` tagging directive, the
   default, of a source with tags also needs `s3:GetObjectTagging` on the
   source and `s3:PutObjectTagging` on the destination, and the source's
