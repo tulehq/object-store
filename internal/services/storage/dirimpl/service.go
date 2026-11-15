@@ -29,7 +29,10 @@ type Service struct {
 	config   gas.ConfigProvider
 	logger   gas.Logger
 	settings *Settings
-	root     *os.Root
+	// clock stamps what is stored: an object's LastModified, a delete
+	// marker's, and an upload's initiation.
+	clock contracts.Clock
+	root  *os.Root
 	// hook, when set, is called at each stage of a change to an object's
 	// versions and of a read of one (see versions.go), and an error it
 	// returns fails the change or read there, as a crash would stop it.
@@ -57,13 +60,27 @@ var (
 )
 
 // NewService returns the constructor gas uses to build a Service from
-// settings.
-func NewService(settings *Settings) func(config gas.ConfigProvider, logger gas.Logger) *Service {
+// settings, which stamps what it stores with clock's time. Settings are
+// bound from the configuration, so clock is an argument of its own. A nil
+// clock panics here, when the service is registered.
+func NewService(
+	settings *Settings,
+	clock contracts.Clock,
+) func(config gas.ConfigProvider, logger gas.Logger) *Service {
+	if clock == nil {
+		panic("dirimpl: NewService needs a clock; pass contracts.SystemClock for the system's")
+	}
 	return func(config gas.ConfigProvider, logger gas.Logger) *Service {
 		return &Service{
-			settings: settings, config: config, logger: logger, deleteWait: defaultDeleteWait,
+			settings: settings, clock: clock, config: config, logger: logger,
+			deleteWait: defaultDeleteWait,
 		}
 	}
+}
+
+// now is the time s stamps what it stores with.
+func (s *Service) now() time.Time {
+	return s.clock.Now()
 }
 
 // Name identifies the service to gas.
@@ -78,6 +95,9 @@ func (s *Service) Name() string {
 func (s *Service) Init(ctx context.Context) (err error) {
 	if s.root, err = s.openRoot(); err != nil {
 		return fmt.Errorf("%s: %w", s.Name(), err)
+	}
+	if err = s.removeOrphanUploads(); err != nil {
+		return fmt.Errorf("%s: %w", s.Name(), errors.Join(err, s.root.Close()))
 	}
 
 	s.dir, err = dir.New(

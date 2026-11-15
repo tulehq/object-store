@@ -50,6 +50,41 @@ func (l *keyLocks) lock(bucket, key string) func() {
 	}
 }
 
+// tryLock locks the object bucket/key if no one holds its lock, and returns
+// the function that unlocks it, or false when the lock is held. It never
+// waits, so a caller that must not stall behind a slow write, which holds
+// the lock while it reads its body, can come back to the key later.
+func (l *keyLocks) tryLock(bucket, key string) (func(), bool) {
+	name := bucket + "/" + key
+
+	l.mu.Lock()
+	if l.m == nil {
+		l.m = make(map[string]*keyLock)
+	}
+	kl, ok := l.m[name]
+	if !ok {
+		kl = &keyLock{}
+		l.m[name] = kl
+	}
+	// A lock held has a reference, so one just made is never held.
+	if !kl.TryLock() {
+		l.mu.Unlock()
+		return nil, false
+	}
+	kl.refs++
+	l.mu.Unlock()
+
+	return func() {
+		kl.Unlock()
+		l.mu.Lock()
+		kl.refs--
+		if kl.refs == 0 {
+			delete(l.m, name)
+		}
+		l.mu.Unlock()
+	}, true
+}
+
 // checkPrecondition returns contracts.ErrPreconditionFailed when cond does not
 // hold for the object at bucket/key, and storage.ErrObjectNotFound when cond
 // requires an object that does not exist.

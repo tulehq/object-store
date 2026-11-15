@@ -21,7 +21,7 @@ func openTestService(t *testing.T, root string) *Service {
 	if err := cfg.Load(); err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	s := NewService(&Settings{RootDir: root})(cfg, &gas.NopLogger{})
+	s := NewService(&Settings{RootDir: root}, contracts.SystemClock)(cfg, &gas.NopLogger{})
 	if err := s.Init(context.Background()); err != nil {
 		t.Fatalf("init: %v", err)
 	}

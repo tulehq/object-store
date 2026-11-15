@@ -53,15 +53,15 @@ type trailer struct {
 // withTrailer returns a reader of body followed by the trailer of tr. The
 // trailer is encoded once body is exhausted, so it records what reading
 // body filled in, such as the ETag an etagReader adds to tr.Meta, and the
-// time the body was read. An empty tr.ContentType is detected from the
-// first bytes of body.
-func withTrailer(body io.Reader, tr *trailer) io.Reader {
+// time now returns once the body was read. An empty tr.ContentType is
+// detected from the first bytes of body.
+func withTrailer(body io.Reader, tr *trailer, now func() time.Time) io.Reader {
 	head := &headReader{r: body}
 	return io.MultiReader(head, &lazyReader{build: func() ([]byte, error) {
 		if tr.ContentType == "" {
 			tr.ContentType = http.DetectContentType(head.head)
 		}
-		tr.LastModified = time.Now()
+		tr.LastModified = now()
 		return encodeTrailer(tr)
 	}})
 }

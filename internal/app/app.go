@@ -79,7 +79,9 @@ func registerAppServices(
 ) {
 	app.RegisterServiceInstance[*sigv4.Verifier](verifier)
 	app.RegisterServiceInstance[contracts.PolicyPrincipals](bound)
-	app.RegisterSingletonService[contracts.StorageProvider](dirimpl.NewService(cfg.Storage))
+	app.RegisterSingletonService[contracts.StorageProvider](
+		dirimpl.NewService(cfg.Storage, contracts.SystemClock),
+	)
 	app.RegisterSingletonService[*authz.Authorizer](
 		func(storage contracts.StorageProvider) *authz.Authorizer {
 			return authz.New(cfg.Auth.AccountID, storage)

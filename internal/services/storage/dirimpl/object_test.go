@@ -109,7 +109,7 @@ func TestManyPartSizes(t *testing.T) {
 	joinParts(meta, sizes)
 
 	if _, err := s.putObject(ctx, "bucket", "k", strings.NewReader("x"),
-		&trailer{Meta: meta}); err != nil {
+		&trailer{Meta: meta}, asIs); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	info, err := s.StatObject(ctx, oref("bucket", "k"))
@@ -133,7 +133,7 @@ func newTestService(t *testing.T) *Service {
 	if err := cfg.Load(); err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	s := NewService(&Settings{RootDir: t.TempDir()})(cfg, &gas.NopLogger{})
+	s := NewService(&Settings{RootDir: t.TempDir()}, contracts.SystemClock)(cfg, &gas.NopLogger{})
 	ctx := context.Background()
 	if err := s.Init(ctx); err != nil {
 		t.Fatalf("init: %v", err)
