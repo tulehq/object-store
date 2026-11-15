@@ -493,6 +493,20 @@ var calls = map[authz.Operation]call{
 	authz.DeleteBucketLifecycle: func(ctx context.Context, c *s3.Client) error {
 		return sdkErr(c.DeleteBucketLifecycle(ctx, &s3.DeleteBucketLifecycleInput{Bucket: cfg}))
 	},
+	// An EventBridge configuration names no destination, so the Put is
+	// stored without validating one, which this app has no service for.
+	authz.PutBucketNotificationConfiguration: func(ctx context.Context, c *s3.Client) error {
+		return sdkErr(c.PutBucketNotificationConfiguration(ctx,
+			&s3.PutBucketNotificationConfigurationInput{
+				Bucket: cfg, NotificationConfiguration: &s3types.NotificationConfiguration{
+					EventBridgeConfiguration: &s3types.EventBridgeConfiguration{},
+				},
+			}))
+	},
+	authz.GetBucketNotificationConfiguration: func(ctx context.Context, c *s3.Client) error {
+		return sdkErr(c.GetBucketNotificationConfiguration(ctx,
+			&s3.GetBucketNotificationConfigurationInput{Bucket: cfg}))
+	},
 	authz.PutObjectTagging: func(ctx context.Context, c *s3.Client) error {
 		return sdkErr(c.PutObjectTagging(ctx, &s3.PutObjectTaggingInput{
 			Bucket: b, Key: key, Tagging: &s3types.Tagging{TagSet: []s3types.Tag{

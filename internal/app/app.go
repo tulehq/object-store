@@ -6,9 +6,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"time"
 
 	"github.com/gasmod/gas"
 	"github.com/go-chi/chi/v5/middleware"
+	"tule.dev/functions/serviceinvoke"
+	"tule.dev/queues/servicesend"
 	"tule.dev/sigv4"
 
 	"tule.dev/object-store/internal/authz"
@@ -19,6 +23,7 @@ import (
 	"tule.dev/object-store/internal/modules/object"
 	"tule.dev/object-store/internal/notification"
 	"tule.dev/object-store/internal/s3api"
+	"tule.dev/object-store/internal/services/destinations"
 	"tule.dev/object-store/internal/services/storage/dirimpl"
 	"tule.dev/object-store/internal/services/sweep"
 )
@@ -42,6 +47,10 @@ func New(cfg *Config, extra ...gas.Option) (*gas.App, error) {
 	if aErr != nil {
 		return nil, aErr
 	}
+	queues, functions, dErr := newDestinationClients(cfg)
+	if dErr != nil {
+		return nil, dErr
+	}
 
 	// S3 requests are authenticated by signature, not cookies, so the
 	// cross-origin protection meant for browser sessions only gets in the way
@@ -60,7 +69,7 @@ func New(cfg *Config, extra ...gas.Option) (*gas.App, error) {
 
 	registerInfraServices(app, cfg, logger)
 	ready := make(chan struct{})
-	registerAppServices(app, cfg, verifier, bound, ready, implicitACL)
+	registerAppServices(app, cfg, verifier, bound, ready, implicitACL, queues, functions)
 	registerAppModules(app, cfg)
 	installMiddleware(app.Router(), cfg, logger, verifier)
 	app.ReadyFunc(createBuckets(cfg.Storage.Buckets))
@@ -85,8 +94,10 @@ func registerInfraServices(app *gas.App, cfg *Config, logger gas.Logger) {
 // ReadBody the modules read small request documents with, and the
 // authorizer the modules evaluate each operation with, which reads bucket
 // policies from the storage, and how bucket policies' principals are bound;
-// and the lifecycle sweep, which applies no rule before ready is closed.
-// implicitACL is the ACL document of an object without one of its own.
+// the notification destinations, through queues and functions, either nil
+// for a service without an endpoint; and the lifecycle sweep, which applies
+// no rule before ready is closed. implicitACL is the ACL document of an
+// object without one of its own.
 func registerAppServices(
 	app *gas.App,
 	cfg *Config,
@@ -94,15 +105,23 @@ func registerAppServices(
 	bound contracts.PolicyPrincipals,
 	ready <-chan struct{},
 	implicitACL []byte,
+	queues *servicesend.Client,
+	functions *serviceinvoke.Client,
 ) {
 	clock := cfg.clockOrSystem()
 	app.RegisterServiceInstance[*sigv4.Verifier](verifier)
 	app.RegisterServiceInstance[contracts.PolicyPrincipals](bound)
-	// No destination type is available yet, so the router sends no event
-	// anywhere and the storage records none.
+	app.RegisterServiceInstance[contracts.Destinations](destinations.New(queues, functions))
+	// The router sends events to the destination types whose service has
+	// an endpoint, so the storage records only events that can be
+	// delivered.
+	available := map[contracts.DestinationType]bool{
+		contracts.DestinationQueue:    queues != nil,
+		contracts.DestinationFunction: functions != nil,
+	}
 	app.RegisterSingletonService[contracts.StorageProvider](
 		dirimpl.NewService(cfg.Storage, clock, dirimpl.Events{
-			Router:      notification.NewRouter(cfg.Auth.AccountID, nil),
+			Router:      notification.NewRouter(cfg.Auth.AccountID, available),
 			ImplicitACL: implicitACL,
 		}),
 	)
@@ -115,6 +134,50 @@ func registerAppServices(
 		func(storage contracts.StorageProvider) *authz.Authorizer {
 			return authz.New(cfg.Auth.AccountID, storage)
 		})
+}
+
+// destinationTimeout bounds one call to the queues service's service-send
+// endpoint or the functions service's service-invoke endpoint: a send, or
+// a dry run or Event invocation, neither of which waits for the function.
+const destinationTimeout = 10 * time.Second
+
+// newDestinationClients returns the clients of the queues and functions
+// services' endpoints, each nil when its endpoint is not set. Both
+// endpoints accept only their account's root user, so the calls are signed
+// with the configured root key, for the region every bucket is in.
+func newDestinationClients(
+	cfg *Config,
+) (*servicesend.Client, *serviceinvoke.Client, error) {
+	var (
+		queues    *servicesend.Client
+		functions *serviceinvoke.Client
+		err       error
+	)
+	if cfg.Storage.QueuesEndpoint != "" {
+		queues, err = servicesend.New(servicesend.Config{
+			HTTPClient:      &http.Client{Timeout: destinationTimeout},
+			Endpoint:        cfg.Storage.QueuesEndpoint,
+			Region:          contracts.Region,
+			AccessKeyID:     cfg.Auth.AccessKeyID,
+			SecretAccessKey: cfg.Auth.SecretAccessKey,
+		})
+		if err != nil {
+			return nil, nil, fmt.Errorf("app: queues service-send client: %w", err)
+		}
+	}
+	if cfg.Storage.FunctionsEndpoint != "" {
+		functions, err = serviceinvoke.New(serviceinvoke.Config{
+			HTTPClient:      &http.Client{Timeout: destinationTimeout},
+			Endpoint:        cfg.Storage.FunctionsEndpoint,
+			Region:          contracts.Region,
+			AccessKeyID:     cfg.Auth.AccessKeyID,
+			SecretAccessKey: cfg.Auth.SecretAccessKey,
+		})
+		if err != nil {
+			return nil, nil, fmt.Errorf("app: functions service-invoke client: %w", err)
+		}
+	}
+	return queues, functions, nil
 }
 
 func registerAppModules(app *gas.App, _ *Config) {

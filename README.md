@@ -42,6 +42,8 @@ Settings come from environment variables prefixed with `TULE_`, and from a
 | `TULE_Server_Port` | `9000` | Listen port |
 | `TULE_Storage_RootDir` | `./data` (`/data` in the image) | Where buckets and objects are stored |
 | `TULE_Storage_Buckets` | unset | Comma-separated buckets to create at startup, if missing |
+| `TULE_Storage_QueuesEndpoint` | unset | The [queues](https://github.com/tulehq/queues) service's base URL, such as `http://localhost:9050`, whose service send endpoint queue destinations of event notifications are validated through ([Event notifications](#event-notifications)). Must be an absolute `http` or `https` URL; needs queues v0.6.0 or later. Unset, a queue destination is refused |
+| `TULE_Storage_FunctionsEndpoint` | unset | The [functions](https://github.com/tulehq/functions) service's base URL, such as `http://localhost:9060`, whose service invoke endpoint function destinations are validated through. Must be an absolute `http` or `https` URL; needs functions v0.6.1 or later. Unset, a function destination is refused |
 | `TULE_HSTS_MaxAge` | unset | `Strict-Transport-Security` max age; the header is only sent when set |
 | `TULE_Server_Domain` | `localhost` | Enables virtual-hosted-style requests to `<bucket>.<domain>` |
 | `TULE_Auth_AccessKeyID` | required | The access key clients sign requests with |
@@ -338,6 +340,7 @@ through its handler.
 | GetObjectAttributes | `s3:GetObject`, then `s3:GetObjectAttributes`; with `?versionId`, `s3:GetObjectVersion`, then `s3:GetObjectVersionAttributes` | object |
 | PutBucketEncryption, DeleteBucketEncryption; GetBucketEncryption | `s3:PutEncryptionConfiguration`; `s3:GetEncryptionConfiguration` | bucket |
 | PutBucketLifecycleConfiguration, DeleteBucketLifecycle; GetBucketLifecycleConfiguration | `s3:PutLifecycleConfiguration`; `s3:GetLifecycleConfiguration` | bucket |
+| PutBucketNotificationConfiguration; GetBucketNotificationConfiguration | `s3:PutBucketNotification`; `s3:GetBucketNotification` | bucket |
 
 A write's headers add actions, on the same resource, as the reference
 and the API references list them: CreateBucket with an
@@ -403,7 +406,19 @@ the same actions, so they are served and evaluated as those
 ([Lifecycle](#lifecycle)). The lifecycle operations are not limited to the
 owner's account: "The resource owner can optionally grant access
 permissions to others by writing an access policy"
-(PutBucketLifecycleConfiguration API reference). PutBucketVersioning is
+(PutBucketLifecycleConfiguration API reference). The notification
+configuration operations are not limited to the owner's account either:
+"bucket owners can use a bucket policy to grant permission to other users
+to set this configuration with the required `s3:PutBucketNotification`
+permission" (PutBucketNotificationConfiguration API reference). The
+deprecated PutBucketNotification and GetBucketNotification share their
+request lines and are served and evaluated as those; the reference
+authorizes GetBucketNotification with `s3:GetBucketNotification` and
+lists no action for PutBucketNotification, which is evaluated as
+`s3:PutBucketNotification`. The caller needs no permission on a
+destination: only the destination's own policy is evaluated, for
+`s3.amazonaws.com` ([Event notifications](#event-notifications)).
+PutBucketVersioning is
 not limited to the owner's account: "all authorized users can enable
 versioning. However, only the bucket owner (root account) can enable MFA
 delete." ("Configuring MFA delete", S3 User Guide), and MFA delete is
@@ -595,6 +610,16 @@ refused with `400 InvalidArgument`, which bounds the cost of evaluating it.
 
 ### Changes in this version
 
+- **Behavior:** bucket notification configuration is served
+  ([Event notifications](#event-notifications)):
+  PutBucketNotificationConfiguration and
+  GetBucketNotificationConfiguration, and the deprecated
+  PutBucketNotification and GetBucketNotification, which answered
+  `501 NotImplemented`. They are evaluated as `s3:PutBucketNotification`
+  and `s3:GetBucketNotification`. Events are recorded but not yet
+  delivered.
+- **New settings:** `TULE_Storage_QueuesEndpoint` and
+  `TULE_Storage_FunctionsEndpoint`.
 - **Behavior:** `aws:PrincipalIsAWSService` is `false` for every
   evaluated principal, where it was absent, and `aws:PrincipalServiceName`
   is absent whatever the request carries (tule.dev/policy v0.4.0). A `Bool`
@@ -1689,6 +1714,150 @@ does:
 A sweep holds its bucket for at most 64 keys or 200 ms at a time, with a
 pause between, so a DeleteBucket is never held up by it.
 
+## Event notifications
+
+PutBucketNotificationConfiguration (`PUT /<bucket>?notification`) stores
+a bucket's notification configuration, replacing any it had, and answers
+`200` with no body. GetBucketNotificationConfiguration answers it, or,
+for a bucket without one, an empty `NotificationConfiguration`: "If
+notifications are not enabled on the bucket, the action returns an empty
+`NotificationConfiguration` element" (its API reference). An empty
+configuration turns notifications off: "You can disable notifications by
+adding the empty `NotificationConfiguration` element". There is no
+DeleteBucketNotification, on S3 or here (`DELETE ?notification` answers
+`501 NotImplemented`). The deprecated PutBucketNotification and
+GetBucketNotification share these request lines and are served as these
+operations: a `CloudFunctionConfiguration`'s `InvocationRole` is read
+and dropped. As with the other bucket configurations, the Put is
+evaluated before its document is read, `x-amz-expected-bucket-owner` is
+taken, and `Content-MD5` and the checksum headers are accepted and
+ignored. A document over 1 MiB is refused with
+`400 MaxMessageLengthExceeded`.
+
+**Events are recorded but not yet delivered.** With an endpoint set, the
+events of a bucket configured for a queue or function destination are
+recorded in a durable outbox under `.tule/events/<bucket>/` in the
+storage root, as they will be delivered; this version sends none of them,
+and they stay there until a version that delivers them does. Validation,
+below, does call the destinations.
+
+### The configuration document
+
+A configuration holds `TopicConfiguration`, `QueueConfiguration` and
+`CloudFunctionConfiguration` elements, the SDK's
+`LambdaFunctionConfigurations`, and at most one
+`EventBridgeConfiguration`. GET answers them in that order, each with
+its `Id`, ARN, `Event`s and `Filter`, filter rule names in lower case; a
+`Filter` with no rules is dropped. A configuration without an `Id` is
+given one, the standard base64 of a random UUID, the form of the API
+reference's sample Id. A configuration stored in another generation of
+its bucket, which a server that did not know notification configurations
+can leave across a delete and create, is none. Unknown elements are
+ignored.
+
+Each configuration is checked in document order, and the first error is
+answered; these checks are never skipped:
+
+| Check | Answer |
+|---|---|
+| Not XML, another root, a configuration without its `Topic`, `Queue` or `CloudFunction` or without an `Event`, an element repeated where one is allowed, two `EventBridgeConfiguration` | `400 MalformedXML` |
+| An `Event` that is not one of S3's event types (the SDK's `Event` enum); `s3:TestEvent` is refused, as only S3 sends it | `400 InvalidArgument` "The event is not supported for notifications" |
+| A `FilterRule` `Name` other than `prefix` or `suffix`, in any case | `400 InvalidArgument` "filter rule name must be either prefix or suffix" |
+| Two prefix or two suffix rules in a filter | `400 InvalidArgument` "Cannot specify more than one prefix rule in a filter." (or suffix) |
+| A rule `Value` over 1,024 characters | `400 InvalidArgument` |
+| An `Id` over 255 characters, or an `Id` used twice | `400 InvalidArgument` |
+| An ARN that does not parse, of another service than its element's, or of another partition than `aws` | `400 InvalidArgument` "The ARN is not well formed", with `ArgumentName1` the element and `ArgumentValue1` the ARN |
+| An ARN of another region than `us-east-1`, the region of every bucket, or a FIFO queue or topic ("Amazon SQS FIFO ... queues aren't supported", S3 User Guide) | `400 InvalidArgument`, with the ARN as above |
+| Two configurations, of any destination types, whose event types, wildcards expanded, share one and whose filters overlap: each prefix starts the other, and each suffix ends the other, a missing one overlapping every other ("Configuring event notifications using object key name filtering", S3 User Guide) | `400 InvalidArgument` "Configurations overlap. Configurations on the same bucket cannot share a common event type." |
+
+The messages S3 documents none of are strings S3 was seen to answer, or
+choices; they have not been checked against S3.
+
+### Destination validation
+
+S3 "first verifies that any ... SNS or SQS destination exists, and that
+the bucket owner has permission to publish to it by sending a test
+notification. In the case of AWS Lambda destinations, Amazon S3 verifies
+that the Lambda function permissions grant Amazon S3 permission to invoke
+the function" (PutBucketNotificationConfiguration API reference). So,
+unless `x-amz-skip-destination-validation` is `true`, each distinct
+destination is validated before the configuration is stored, as
+`s3.amazonaws.com`, with `aws:SourceArn` `arn:aws:s3:::<bucket>` and
+`aws:SourceAccount` `TULE_Auth_AccountID`, the owner of every bucket:
+
+- **A queue** is sent an `s3:TestEvent` through the queues service's
+  [service send endpoint](https://github.com/tulehq/queues#the-service-send-endpoint),
+  once for each distinct queue ARN. The message stays in the queue, as on
+  AWS:
+
+  ```json
+  {"Service":"Amazon S3","Event":"s3:TestEvent","Time":"2026-11-15T10:30:00.123Z",
+   "Bucket":"photos","RequestId":"9F2C61B05D3E4A17","HostId":"..."}
+  ```
+
+  `RequestId` and `HostId` are the Put's own `x-amz-request-id` and
+  `x-amz-id-2`. The queue's policy must allow `s3.amazonaws.com`
+  `sqs:SendMessage`, as the S3 User Guide's ("Granting permissions to
+  publish event notification messages to a destination") does:
+
+  ```json
+  {"Effect": "Allow", "Principal": {"Service": "s3.amazonaws.com"},
+   "Action": ["SQS:SendMessage"], "Resource": "arn:aws:sqs:us-east-1:000000000000:events",
+   "Condition": {"ArnLike": {"aws:SourceArn": "arn:aws:s3:*:*:photos"},
+                 "StringEquals": {"aws:SourceAccount": "000000000000"}}}
+  ```
+- **A function** is checked with a `DryRun` through the functions
+  service's [service invoke endpoint](https://github.com/tulehq/functions#the-service-invoke-endpoint):
+  its function policy is evaluated and nothing runs or is recorded. The
+  functions service evaluates the policy before the function's state, so
+  a function that is `Pending`, `Failed` or updating, whose policy allows
+  S3, validates: S3 checks the permission alone. The
+  permission `aws lambda add-permission --action lambda:InvokeFunction
+  --principal s3.amazonaws.com --source-arn arn:aws:s3:::<bucket>
+  --source-account <account>` adds allows it.
+- **A topic** always fails: there is no topic service. With
+  `x-amz-skip-destination-validation: true` it is stored and answered by
+  GET, and no event is ever sent to it.
+- **EventBridge** names no destination, so it is never validated; it is
+  stored and answered, and no event is ever sent to it.
+
+Every destination is tried, and every one that fails is answered, in the
+order GET answers them, as one `400 InvalidArgument` "Unable to validate
+the following destination configurations", each failing ARN an
+`ArgumentName<n>` and its reason the `ArgumentValue<n>`; nothing is
+stored, and test events already sent stay sent. Up to 8 destinations are
+validated at once, and validating a configuration takes at most 30
+seconds: a call still running then is canceled, and a destination not
+yet called fails, both as not reached. The reasons:
+
+| Destination | Reason |
+|---|---|
+| A queue whose policy does not allow S3 | Permissions on the destination queue do not allow S3 to publish notifications from this bucket |
+| A function whose policy does not allow S3 | Not authorized to invoke function [`<arn>`] |
+| A queue or function that does not exist, one of another account or region than its service serves, and any topic | The destination does not exist |
+| A queue or function whose service has no endpoint | The destination's service is not configured in this Tule (`TULE_Storage_QueuesEndpoint` or `TULE_Storage_FunctionsEndpoint`) |
+| A destination that refuses the call's content: a test event the queue refuses, or a payload or result the functions service refuses (`400`, `413`, `502`) | The destination refused the test message |
+| Anything else: a service that does not answer within 10 seconds or fails, or a destination not validated within 30 seconds of the first call | The destination could not be reached (the failure is logged at Warn) |
+
+With `x-amz-skip-destination-validation: true` (or `false`, in any case;
+another value is `400 InvalidArgument`), the configuration is stored
+without calling any destination.
+
+### Destination settings
+
+`TULE_Storage_QueuesEndpoint` and `TULE_Storage_FunctionsEndpoint`
+([Configuration](#configuration)) are the base URLs of the queues and
+functions services. Both endpoints accept only the root user of their
+service's account, so the calls are signed with the configured
+`TULE_Auth_AccessKeyID` and `TULE_Auth_SecretAccessKey`, for
+`us-east-1`: configure the same root key on all three services, or
+identity's root key when they use identity. The destination service's
+region must be `us-east-1` and its account the one a destination's ARN
+names; an ARN of another account or region is answered as not existing.
+A destination in another account works when that service runs as that
+account and its policy names `aws:SourceAccount` `TULE_Auth_AccountID`.
+Each call waits at most 10 seconds.
+
 ## Health checks
 
 `GET /_health` (liveness) and `GET /_ready` (readiness) answer without a
@@ -1757,6 +1926,12 @@ as on S3. Treat both as opaque; their format may change.
   GetBucketOwnershipControls, DeleteBucketOwnershipControls; PutBucketAcl,
   GetBucketAcl, PutObjectAcl, GetObjectAcl; PutBucketEncryption,
   GetBucketEncryption, DeleteBucketEncryption.
+- **Event notifications** ([above](#event-notifications)):
+  PutBucketNotificationConfiguration and
+  GetBucketNotificationConfiguration, and the deprecated
+  PutBucketNotification and GetBucketNotification, with destinations
+  validated through the queues and functions services. Events are
+  recorded but not yet delivered.
 - **Lifecycle** ([above](#lifecycle)): PutBucketLifecycleConfiguration,
   GetBucketLifecycleConfiguration and DeleteBucketLifecycle, and the
   deprecated PutBucketLifecycle and GetBucketLifecycle, with expiration,

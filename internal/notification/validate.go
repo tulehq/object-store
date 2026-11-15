@@ -113,7 +113,7 @@ func checkConfig(d *decodedConfig) error {
 	}
 	arg := []s3api.ErrorArgument{{Name: d.kind.arn, Value: c.ARN}}
 	switch {
-	case arn.Region != bucketRegion:
+	case arn.Region != contracts.Region:
 		return argumentError(msgRegion, arg)
 	case d.kind.typ != functionKind.typ && strings.HasSuffix(arn.Resource, ".fifo"):
 		return argumentError(msgFIFO, arg)

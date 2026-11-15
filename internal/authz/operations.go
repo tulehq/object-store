@@ -68,6 +68,9 @@ const (
 	GetBucketLifecycleConfiguration Operation = "GetBucketLifecycleConfiguration"
 	DeleteBucketLifecycle           Operation = "DeleteBucketLifecycle"
 
+	PutBucketNotificationConfiguration Operation = "PutBucketNotificationConfiguration"
+	GetBucketNotificationConfiguration Operation = "GetBucketNotificationConfiguration"
+
 	PutObjectTagging    Operation = "PutObjectTagging"
 	GetObjectTagging    Operation = "GetObjectTagging"
 	DeleteObjectTagging Operation = "DeleteObjectTagging"
@@ -149,6 +152,15 @@ type check struct {
 // s3:PutLifecycleConfiguration and s3:GetLifecycleConfiguration. The
 // deprecated PutBucketLifecycle and GetBucketLifecycle share their request
 // lines and their actions, so they are served and evaluated as these.
+// PutBucketNotificationConfiguration and its Get are evaluated as
+// s3:PutBucketNotification and s3:GetBucketNotification, on the bucket and
+// not only for the owner's account: "bucket owners can use a bucket policy
+// to grant permission to other users to set this configuration with the
+// required s3:PutBucketNotification permission" (its API reference). The
+// deprecated PutBucketNotification and GetBucketNotification share their
+// request lines, so they are served and evaluated as these; the reference
+// lists s3:GetBucketNotification for GetBucketNotification, and no action
+// for PutBucketNotification.
 //
 // GetObjectAttributes needs both s3:GetObject and s3:GetObjectAttributes:
 // "If you do not pass a version ID in your request, you need the
@@ -279,6 +291,12 @@ var operations = map[Operation][]check{
 	},
 	DeleteBucketLifecycle: {
 		{action: "s3:PutLifecycleConfiguration", kind: bucketResource},
+	},
+	PutBucketNotificationConfiguration: {
+		{action: "s3:PutBucketNotification", kind: bucketResource},
+	},
+	GetBucketNotificationConfiguration: {
+		{action: "s3:GetBucketNotification", kind: bucketResource},
 	},
 	PutObjectTagging: {{
 		action: "s3:PutObjectTagging", versionAction: "s3:PutObjectVersionTagging",
