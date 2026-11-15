@@ -92,7 +92,7 @@ func TestDeleteBucketPurgesGarbage(t *testing.T) {
 	// The data of a version a crash kept from being committed.
 	if _, err := f.s.dir.PutObject(f.ctx, &storage.PutObjectInput{
 		BaseObjectInput: dataInput("bucket", "orphan", &versionEntry{Token: rand.Text()}),
-		Body:            withTrailer(strings.NewReader("orphan"), &trailer{}),
+		Body:            withTrailer(strings.NewReader("orphan"), &trailer{}, f.s.now),
 	}); err != nil {
 		t.Fatal(err)
 	}

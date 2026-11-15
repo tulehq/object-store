@@ -212,7 +212,7 @@ func TestAWrittenObjectIsVisibleWithItsTags(t *testing.T) {
 	unlock := s.locks.lock("bucket", "k")
 	er := newETagReader(strings.NewReader("y"), nil)
 	if _, err := s.putObject(ctx, "bucket", "k", er,
-		&trailer{Meta: er.meta, Tags: testTags}); err != nil {
+		&trailer{Meta: er.meta, Tags: testTags}, asIs); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.root.Stat(tagFile("bucket", "k")); err != nil {
@@ -228,7 +228,7 @@ func TestTagFilesOfEarlierWritesStillApply(t *testing.T) {
 	s := newTestService(t)
 	ctx, _ := pin(t, s)
 	er := newETagReader(strings.NewReader("x"), nil)
-	info, err := s.putObject(ctx, "bucket", "k", er, &trailer{Meta: er.meta})
+	info, err := s.putObject(ctx, "bucket", "k", er, &trailer{Meta: er.meta}, asIs)
 	if err != nil {
 		t.Fatal(err)
 	}

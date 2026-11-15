@@ -171,7 +171,7 @@ func (s *Service) currentObject(
 		}
 		return &contracts.ObjectInfo{
 			Key: key, ETag: e.ETag, Size: e.Size, LastModified: e.LastModified,
-			VersionID: e.ID,
+			VersionID: e.ID, IsLatest: true,
 		}, nil
 	}
 	info, err := s.StatObject(ctx, contracts.ObjectRef{Bucket: bucket, Key: key})

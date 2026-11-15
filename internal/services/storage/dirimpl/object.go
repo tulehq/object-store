@@ -205,7 +205,7 @@ func (s *Service) deleteLocked(
 	case m != nil && ref.Version != "":
 		return s.deleteVersion(ctx, ref.Bucket, m, ref.Version)
 	case m != nil || !unversioned && ref.Version == "":
-		return s.deleteCurrent(ctx, ref.Bucket, ref.Key)
+		return s.deleteCurrent(ctx, ref.Bucket, ref.Key, s.now())
 	}
 	return s.deleteUnlisted(ctx, ref, unversioned)
 }
@@ -307,12 +307,15 @@ func (s *Service) PutObject(
 
 // putObject indexes key and writes the object, with tr as its trailer,
 // whose metadata, content type and tags the caller sets. An empty content
-// type is detected from the body. The caller holds the key's lock.
+// type is detected from the body. A failure to write it, after which no
+// object was written, is the error fail returns for it. The caller holds
+// the key's lock.
 func (s *Service) putObject(
 	ctx context.Context,
 	bucket, key string,
 	body io.Reader,
 	tr *trailer,
+	fail func(error) error,
 ) (*contracts.ObjectInfo, error) {
 	base, err := objectInput(bucket, key)
 	if err != nil {
@@ -324,9 +327,9 @@ func (s *Service) putObject(
 
 	if _, err = s.dir.PutObject(ctx, &storage.PutObjectInput{
 		BaseObjectInput: base,
-		Body:            withTrailer(body, tr),
+		Body:            withTrailer(body, tr, s.now),
 	}); err != nil {
-		err = fmt.Errorf("%s: put %q: %w", s.Name(), key, err)
+		err = fail(fmt.Errorf("%s: put %q: %w", s.Name(), key, err))
 		return nil, errors.Join(err, s.unindexMissing(ctx, base, bucket, key))
 	}
 

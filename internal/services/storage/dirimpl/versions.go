@@ -55,6 +55,11 @@ type versionEntry struct {
 	// LastModified is the version's, as its trailer holds it, or when a
 	// marker was created.
 	LastModified time.Time `json:"lastModified"`
+	// NoncurrentSince is when the entry stopped being the current version:
+	// the LastModified of the version or marker placed above it then. It
+	// is zero for the current entry, and for an entry written before it
+	// was recorded (see noncurrentSince).
+	NoncurrentSince time.Time `json:"noncurrentSince,omitzero"`
 	// ID is VersionNull or an ID newVersionID drew. IDs are unique within
 	// a manifest.
 	ID string `json:"id"`
@@ -90,6 +95,12 @@ const (
 	// stageCollecting: a change is about to remove the data of a version
 	// its committed manifest no longer lists.
 	stageCollecting = "collecting"
+	// stagePartsChecked: a completion has checked the parts it lists, and
+	// is about to read them.
+	stagePartsChecked = "partsChecked"
+	// stageLifecycleDecided: ApplyLifecycle has the plan for a key it read
+	// under the key's lock, and has not applied it yet.
+	stageLifecycleDecided = "lifecycleDecided"
 )
 
 // at calls s.hook, when set, at stage.
@@ -186,6 +197,31 @@ func (m *versionManifest) dropNull() *versionEntry {
 		return m.remove(i)
 	}
 	return nil
+}
+
+// noncurrentSince returns when m.Versions[i] became noncurrent: the time
+// recorded, or for an entry written before it was recorded, the
+// LastModified of the entry above it, its successor ("the time when the
+// new successor version of the object is created", S3 User Guide,
+// "Lifecycle configuration elements"). It is zero for i == 0.
+func noncurrentSince(m *versionManifest, i int) time.Time {
+	if i == 0 {
+		return time.Time{}
+	}
+	if t := m.Versions[i].NoncurrentSince; !t.IsZero() {
+		return t
+	}
+	return m.Versions[i-1].LastModified
+}
+
+// recordNoncurrent records, for each noncurrent entry of m written before
+// the time was recorded, the time noncurrentSince derives for it, before a
+// change removes an entry from below the current one, which would give it
+// another successor.
+func (m *versionManifest) recordNoncurrent() {
+	for i := 1; i < len(m.Versions); i++ {
+		m.Versions[i].NoncurrentSince = noncurrentSince(m, i)
+	}
 }
 
 // push makes e the current version.
@@ -292,7 +328,7 @@ func (s *Service) resolveOnce(
 	if err != nil {
 		return nil, nil, err
 	}
-	e, err := s.pick(op, ref, m)
+	e, latest, err := s.pick(op, ref, m)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -309,6 +345,7 @@ func (s *Service) resolveOnce(
 	if obj.VersionID, err = s.versionIDOf(ref.Bucket, e); err != nil {
 		return nil, nil, errors.Join(err, obj.Body.Close())
 	}
+	obj.IsLatest = latest
 	return &resolved{obj: obj, entry: e, written: written}, nil, nil
 }
 
@@ -337,21 +374,22 @@ func (s *Service) recheck(op string, ref contracts.ObjectRef, raw []byte, attemp
 }
 
 // pick returns the entry of m that ref names, nil for the legacy object of
-// a key without a manifest, with resolve's errors.
+// a key without a manifest, with resolve's errors, and whether it is the
+// key's current version: the first entry, or the legacy object.
 func (s *Service) pick(
 	op string,
 	ref contracts.ObjectRef,
 	m *versionManifest,
-) (*versionEntry, error) {
+) (*versionEntry, bool, error) {
 	if m == nil {
 		if ref.Version == "" || ref.Version == contracts.VersionNull {
-			return nil, nil
+			return nil, true, nil
 		}
-		return nil, s.noSuchVersion(op, ref)
+		return nil, false, s.noSuchVersion(op, ref)
 	}
 	if ref.Version == "" {
 		if len(m.Versions) == 0 {
-			return nil, fmt.Errorf(
+			return nil, false, fmt.Errorf(
 				"%s: %s %q: %w",
 				s.Name(),
 				op,
@@ -361,21 +399,23 @@ func (s *Service) pick(
 		}
 		e := &m.Versions[0]
 		if e.Marker {
-			return nil, &contracts.DeleteMarkerError{
+			return nil, false, &contracts.DeleteMarkerError{
 				LastModified: e.LastModified, VersionID: e.ID, Current: true,
 			}
 		}
-		return e, nil
+		return e, true, nil
 	}
 	i := m.find(ref.Version)
 	if i < 0 {
-		return nil, s.noSuchVersion(op, ref)
+		return nil, false, s.noSuchVersion(op, ref)
 	}
 	e := &m.Versions[i]
 	if e.Marker {
-		return nil, &contracts.DeleteMarkerError{LastModified: e.LastModified, VersionID: e.ID}
+		return nil, false, &contracts.DeleteMarkerError{
+			LastModified: e.LastModified, VersionID: e.ID,
+		}
 	}
-	return e, nil
+	return e, i == 0, nil
 }
 
 // noSuchVersion is the error for a version ref names that its key does not
@@ -431,8 +471,21 @@ type objectWrite struct {
 	// done, when set, runs under the key's lock once the object is
 	// written.
 	done func() error
-	acl  []byte
-	cond contracts.Precondition
+	// failed, when set, is given the error of open, or of writing the
+	// data, before anything is committed, and returns the one the write
+	// fails with.
+	failed func(error) error
+	acl    []byte
+	cond   contracts.Precondition
+}
+
+// fail returns the error a write of w fails with when opening or writing
+// its data failed with err (see objectWrite's failed).
+func (w *objectWrite) fail(err error) error {
+	if w.failed == nil {
+		return err
+	}
+	return w.failed(err)
 }
 
 // writeObject writes w as the object at key in bucket: in place, as an
@@ -487,9 +540,9 @@ func (s *Service) writeLegacy(
 	}
 	body, tr, closeBody, err := w.open()
 	if err != nil {
-		return nil, false, err
+		return nil, false, w.fail(err)
 	}
-	info, err := s.putObject(ctx, bucket, key, body, tr)
+	info, err := s.putObject(ctx, bucket, key, body, tr, w.fail)
 	if cErr := closeBody(); cErr != nil {
 		err = errors.Join(err, cErr)
 	}
@@ -547,7 +600,7 @@ func (s *Service) writeVersion(
 		}
 		return nil, err
 	}
-	info.Key, info.VersionID = key, e.ID
+	info.Key, info.VersionID, info.IsLatest = key, e.ID, true
 	return info, nil
 }
 
@@ -562,17 +615,17 @@ func (s *Service) writeData(
 ) (*contracts.ObjectInfo, error) {
 	body, tr, closeBody, err := w.open()
 	if err != nil {
-		return nil, err
+		return nil, w.fail(err)
 	}
 	_, err = s.dir.PutObject(ctx, &storage.PutObjectInput{
 		BaseObjectInput: dataInput(bucket, key, e),
-		Body:            withTrailer(body, tr),
+		Body:            withTrailer(body, tr, s.now),
 	})
 	if cErr := closeBody(); cErr != nil {
 		err = errors.Join(err, cErr)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("%s: put %q: %w", s.Name(), key, err)
+		return nil, w.fail(fmt.Errorf("%s: put %q: %w", s.Name(), key, err))
 	}
 	info, err := s.statData(ctx, "put", bucket, key, e)
 	if err != nil {
@@ -650,18 +703,26 @@ func (s *Service) warnAfterCommit(step, bucket, key string, err error) {
 // state, and makes it the current version of m: in a Suspended bucket, it
 // is the null version, and the one m had is returned, removed. Its
 // sequence is above every one m holds, even after a restart on a clock
-// that went back, so m stays in sequence order (see resumeAt). The caller
-// holds the key's lock.
+// that went back, so m stays in sequence order (see resumeAt). The version
+// e displaces as the current one becomes noncurrent at e's LastModified,
+// which the caller has set; the times the others became noncurrent are
+// recorded first, since the null version it may replace is the successor
+// of the one below it. The caller holds the key's lock.
 func (s *Service) place(bucket string, m *versionManifest, e *versionEntry) (*versionEntry, error) {
 	st, err := s.versioning(bucket)
 	if err != nil {
 		return nil, err
 	}
+	m.recordNoncurrent()
 	var floor int64
 	for _, v := range m.Versions {
 		floor = max(floor, v.Seq)
 	}
 	e.Seq = s.nextSeq(floor)
+	prior := ""
+	if len(m.Versions) > 0 {
+		prior = m.Versions[0].ID
+	}
 	var displaced *versionEntry
 	switch st.Status {
 	case contracts.VersioningEnabled:
@@ -673,6 +734,11 @@ func (s *Service) place(bucket string, m *versionManifest, e *versionEntry) (*ve
 		return nil, fmt.Errorf("%s: %q: %w", s.Name(), m.Key, errUnversionedManifest)
 	}
 	m.push(*e)
+	// The version e displaced, unless e replaced it as the null version,
+	// is noncurrent from now on.
+	if j := m.find(prior); j > 0 && m.Versions[j].NoncurrentSince.IsZero() {
+		m.Versions[j].NoncurrentSince = e.LastModified
+	}
 	return displaced, nil
 }
 
@@ -729,18 +795,20 @@ func (s *Service) removeVersion(ctx context.Context, bucket, key string, e *vers
 // deleteCurrent is a DeleteObject without a version of a key in a bucket
 // that is not Unversioned: it adds a delete marker on top, which in a
 // Suspended bucket is the null marker that replaces the null version
-// (DeleteObject API reference). It adds one also for a key that has no
-// version, and on top of a marker. The caller holds the key's lock.
+// (DeleteObject API reference), with at as its LastModified. It adds one
+// also for a key that has no version, and on top of a marker. The caller
+// holds the key's lock.
 func (s *Service) deleteCurrent(
 	ctx context.Context,
 	bucket, key string,
+	at time.Time,
 ) (*contracts.DeleteObjectOutput, error) {
 	m, existed, err := s.loadVersions(ctx, bucket, key)
 	if err != nil {
 		return nil, err
 	}
 	fresh := !existed && len(m.Versions) == 0
-	marker := versionEntry{Marker: true, LastModified: time.Now()}
+	marker := versionEntry{Marker: true, LastModified: at}
 	displaced, err := s.place(bucket, m, &marker)
 	if err != nil {
 		return nil, err
@@ -759,7 +827,8 @@ func (s *Service) deleteCurrent(
 // deleteVersion permanently deletes version id of key, a key with
 // manifest m, version or marker; a version it does not have is deleted
 // already. When the last version goes, the key's manifest and index entry
-// go too (see dropVersions). The caller holds the key's lock.
+// go too (see dropVersions). An entry that becomes the current version
+// again is no longer noncurrent. The caller holds the key's lock.
 func (s *Service) deleteVersion(
 	ctx context.Context,
 	bucket string,
@@ -770,7 +839,11 @@ func (s *Service) deleteVersion(
 	if i < 0 {
 		return &contracts.DeleteObjectOutput{VersionID: id}, nil
 	}
+	m.recordNoncurrent()
 	e := m.remove(i)
+	if i == 0 && len(m.Versions) > 0 {
+		m.Versions[0].NoncurrentSince = time.Time{}
+	}
 	out := &contracts.DeleteObjectOutput{VersionID: e.ID, DeleteMarker: e.Marker}
 	if len(m.Versions) == 0 {
 		if err := s.dropVersions(ctx, bucket, m.Key, e); err != nil {

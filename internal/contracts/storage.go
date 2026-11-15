@@ -162,12 +162,16 @@ const (
 	ConfigOwnership         BucketConfig = "ownershipControls"
 	ConfigEncryption        BucketConfig = "encryption"
 	ConfigACL               BucketConfig = "acl"
+	// ConfigLifecycle is stored as the lifecycle package encodes it: an
+	// envelope naming the bucket generation it was stored for, which
+	// readers check (see StorageProvider's LifecycleTargets).
+	ConfigLifecycle BucketConfig = "lifecycle"
 )
 
 // BucketConfigs lists every BucketConfig.
 var BucketConfigs = []BucketConfig{
 	ConfigTagging, ConfigCORS, ConfigPublicAccessBlock, ConfigOwnership, ConfigEncryption,
-	ConfigACL,
+	ConfigACL, ConfigLifecycle,
 }
 
 // MinPartSize is the smallest size S3 allows for every multipart part but the
@@ -352,6 +356,135 @@ type StorageProvider interface {
 		bucket string,
 		in ListObjectVersionsInput,
 	) (*ListObjectVersionsOutput, error)
+
+	// LifecycleTargets returns every bucket with a lifecycle configuration
+	// stored for its current generation, with that configuration as it was
+	// stored. A configuration whose envelope names another generation, one
+	// a bucket of the same name had, is none, and so is one that does not
+	// decode, which is logged.
+	LifecycleTargets(ctx context.Context) ([]LifecycleTarget, error)
+	// ScanKeys returns up to n of bucket's indexed keys after cursor, in an
+	// order of their own that keys added or removed meanwhile do not
+	// change, and the cursor to pass next, "" once there are no more. A
+	// cursor of "" starts the scan. Some keys may hold no object. ctx must
+	// be pinned to bucket.
+	ScanKeys(
+		ctx context.Context,
+		bucket, cursor string,
+		n int,
+	) (keys []string, next string, err error)
+	// ApplyLifecycle reads key's versions under its lock, asks d what the
+	// lifecycle rules do to them, and does it in one commit, as S3 does
+	// itself: no principal, check or policy applies. When the key's lock is
+	// held, it does nothing and reports Busy. A key without versions is not
+	// given to d. ctx must be pinned to bucket.
+	ApplyLifecycle(
+		ctx context.Context,
+		bucket, key string,
+		d LifecycleDecider,
+	) (*LifecycleOutcome, error)
+	// AbortLifecycleUpload aborts upload uploadID of key, under the key's
+	// lock, if it is still the upload initiated at initiated, and reports
+	// what it did. When the key's lock is held, it does nothing and
+	// reports Busy, as ApplyLifecycle does. ctx must be pinned to bucket.
+	AbortLifecycleUpload(
+		ctx context.Context,
+		bucket, key, uploadID string,
+		initiated time.Time,
+	) (*LifecycleAbort, error)
+}
+
+// LifecycleAbort is what AbortLifecycleUpload did to an upload.
+type LifecycleAbort struct {
+	// Aborted reports that the upload is gone; it can be set with an
+	// error, when the upload's parts could not all be removed after.
+	Aborted bool
+	// Busy reports that the key's lock was held, so nothing was done.
+	Busy bool
+}
+
+// LifecycleTarget is a bucket with a lifecycle configuration stored for its
+// generation, Ref's.
+type LifecycleTarget struct {
+	Ref BucketRef
+	// Config is the configuration as it was stored (ConfigLifecycle).
+	Config []byte
+}
+
+// LifecycleVersion is a version or delete marker as lifecycle rules see
+// it.
+type LifecycleVersion struct {
+	// Tags returns the version's tags as GetObjectTagging does, read on
+	// the first call, and none for a marker. It is for use while the
+	// decider is asked, under the key's lock.
+	Tags         func() ([]Tag, error)
+	LastModified time.Time
+	// NoncurrentSince is when the version became noncurrent, zero for the
+	// current version.
+	NoncurrentSince time.Time
+	// VersionID is VersionNull, an issued ID, or "" in an Unversioned
+	// bucket.
+	VersionID string
+	// Size is 0 for a marker.
+	Size   int64
+	Marker bool
+}
+
+// LifecycleKey is a key's versions and delete markers, newest first, so
+// the first is the current one, read under the key's lock, in the
+// bucket's versioning state then.
+type LifecycleKey struct {
+	Key        string
+	Versioning Versioning
+	Versions   []LifecycleVersion
+}
+
+// LifecyclePlan is what lifecycle rules do to a key now.
+type LifecyclePlan struct {
+	// MarkerTime is the LastModified of the marker ExpireCurrentRule adds.
+	MarkerTime time.Time
+	// Remove maps the IDs of noncurrent versions and markers to delete
+	// permanently to the ID of the rule that deletes each.
+	Remove map[string]string
+	// ExpireCurrentRule, when set, is the ID of the rule that expires the
+	// current version, which must not be a marker, as a DeleteObject
+	// without a version does: permanently in an Unversioned bucket, and
+	// otherwise by adding a delete marker dated MarkerTime. Remove is
+	// applied first.
+	ExpireCurrentRule string
+}
+
+// LifecycleDecider decides what lifecycle rules do to a key.
+type LifecycleDecider interface {
+	// Plan returns what the rules do to k now.
+	Plan(k *LifecycleKey) (LifecyclePlan, error)
+	// RemoveSoleMarker is asked once the plan is applied, in a bucket that
+	// is not Unversioned, when the key's only version left is a delete
+	// marker the plan did not add, since an object gets one lifecycle
+	// action a day; it returns the ID of the rule that removes it, "" for
+	// none.
+	RemoveSoleMarker(key string, marker LifecycleVersion) (string, error)
+}
+
+// LifecycleDeletion is a version or marker ApplyLifecycle deleted
+// permanently, and the ID of the rule that did.
+type LifecycleDeletion struct {
+	VersionID string
+	RuleID    string
+	Marker    bool
+}
+
+// LifecycleOutcome is what ApplyLifecycle did to a key.
+type LifecycleOutcome struct {
+	// MarkerID is the ID of the delete marker added, "" for none, and
+	// MarkerRule the ID of the rule that added it.
+	MarkerID   string
+	MarkerRule string
+	// Deleted are the permanent deletions, including the null version a
+	// Suspended bucket's marker replaced.
+	Deleted []LifecycleDeletion
+	// Busy reports that the key's lock was held, so nothing was done.
+	Busy bool
 }
 
 // BucketRef names a bucket of one generation. A bucket deleted and created
@@ -377,7 +510,8 @@ type BucketInfo struct {
 // and StatObjectTagging read them, and every other operation leaves them
 // nil. VersionID is the ID of the version described: VersionNull or an
 // issued ID, and empty only for an object of an Unversioned bucket, which
-// reports none.
+// reports none. IsLatest is set when the version described is its key's
+// current version, as it was read or written.
 type ObjectInfo struct {
 	LastModified time.Time
 	Metadata     map[string]string
@@ -389,6 +523,7 @@ type ObjectInfo struct {
 	PartSizes    []int64
 	Tags         []Tag
 	Size         int64
+	IsLatest     bool
 }
 
 // Tag is one tag of an object's tag set.

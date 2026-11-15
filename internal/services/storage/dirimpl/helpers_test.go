@@ -23,6 +23,12 @@ func vref(key, id string) contracts.ObjectRef {
 	return contracts.ObjectRef{Bucket: "bucket", Key: key, Version: id}
 }
 
+// asIs is the failure mapping of a write that fails with its error as it
+// is.
+func asIs(err error) error {
+	return err
+}
+
 // errOf returns the error of a call that returns a value with it.
 func errOf[T any](_ T, err error) error {
 	return err

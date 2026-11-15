@@ -80,28 +80,103 @@ func (s *Service) CreateMultipartUpload(
 		return "", err
 	}
 
-	id := rand.Text()
-	if err = s.root.MkdirAll(uploadDir(id), 0o755); err != nil {
-		return "", fmt.Errorf("%s: create upload %q: %w", s.Name(), key, err)
-	}
-
 	manifest, err := json.Marshal(uploadManifest{
 		Bucket:     bucket,
 		Key:        key,
 		Generation: gen,
-		Initiated:  time.Now().UTC(),
+		Initiated:  s.now().UTC(),
 		Put:        in,
 	})
 	if err != nil {
 		return "", fmt.Errorf("%s: create upload %q: %w", s.Name(), key, err)
 	}
-
-	name := filepath.Join(uploadDir(id), manifestFile)
-	if err = s.root.WriteFile(name, manifest, 0o644); err != nil {
+	id := rand.Text()
+	if err = s.makeUpload(id, manifest); err != nil {
 		return "", fmt.Errorf("%s: create upload %q: %w", s.Name(), key, err)
 	}
-
 	return id, nil
+}
+
+// uploadTempPrefix starts the name of an upload directory being made,
+// which uploadIDRe does not match.
+const uploadTempPrefix = ".new-"
+
+// makeUpload makes the directory of upload id with manifest as its
+// manifest: under a temporary name, renamed into place once the manifest
+// is in it, so an upload directory never lacks its manifest while it is
+// made, and one without a manifest is garbage (see removeOrphanUploads).
+//
+//nolint:wrapcheck // wrapped at the caller site
+func (s *Service) makeUpload(id string, manifest []byte) error {
+	tmp := filepath.Join(multipartDir, uploadTempPrefix+rand.Text())
+	if err := s.root.Mkdir(tmp, 0o755); err != nil {
+		return err
+	}
+	err := s.root.WriteFile(filepath.Join(tmp, manifestFile), manifest, 0o644)
+	if err == nil {
+		err = s.root.Rename(tmp, uploadDir(id))
+	}
+	if err != nil {
+		return errors.Join(err, s.root.RemoveAll(tmp))
+	}
+	return nil
+}
+
+// staleUploadTemp is how long ago an upload directory being made must
+// have been made to be one a create that stopped left: making one takes a
+// few file operations.
+const staleUploadTemp = time.Hour
+
+// removeOrphanUploads removes the upload directories without a manifest,
+// which only an abort or completion that stopped after removing it leaves
+// (see removeUpload and makeUpload), and the directories of uploads being
+// made that are older than staleUploadTemp, which only a create that
+// stopped leaves. Parts are written only after their upload's manifest is
+// read, so a directory without one never becomes an upload again.
+func (s *Service) removeOrphanUploads() error {
+	entries, err := fs.ReadDir(s.root.FS(), multipartDir)
+	if err != nil {
+		return fmt.Errorf("%s: list uploads: %w", s.Name(), err)
+	}
+	for _, e := range entries {
+		orphan, oErr := s.isOrphanUpload(e)
+		if oErr != nil {
+			return oErr
+		}
+		if !orphan {
+			continue
+		}
+		if rErr := s.root.RemoveAll(filepath.Join(multipartDir, e.Name())); rErr != nil {
+			return fmt.Errorf("%s: remove abandoned upload %s: %w", s.Name(), e.Name(), rErr)
+		}
+	}
+	return nil
+}
+
+// isOrphanUpload reports whether e, an entry of multipartDir, is one
+// removeOrphanUploads removes. An entry removed meanwhile is none.
+func (s *Service) isOrphanUpload(e fs.DirEntry) (bool, error) {
+	switch {
+	case !e.IsDir():
+		return false, nil
+	case uploadIDRe.MatchString(e.Name()):
+		_, err := s.root.Stat(filepath.Join(uploadDir(e.Name()), manifestFile))
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return false, fmt.Errorf("%s: stat upload %s: %w", s.Name(), e.Name(), err)
+		}
+		return err != nil, nil
+	case strings.HasPrefix(e.Name(), uploadTempPrefix):
+		info, err := e.Info()
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("%s: stat upload %s: %w", s.Name(), e.Name(), err)
+		}
+		// File times are the system's, not the store's clock.
+		return info.ModTime().Before(time.Now().Add(-staleUploadTemp)), nil
+	}
+	return false, nil
 }
 
 // readManifest reads the manifest of upload id. It fails with fs.ErrNotExist
@@ -358,6 +433,9 @@ func (s *Service) CompleteMultipartUpload(
 	return s.writeObject(ctx, bucket, key, &objectWrite{
 		open: func() (io.Reader, *trailer, func() error, error) {
 			sizes, etag, pErr := s.checkParts(uploadID, parts)
+			if pErr == nil {
+				pErr = s.at(stagePartsChecked)
+			}
 			if pErr != nil {
 				return nil, nil, nil, pErr
 			}
@@ -384,8 +462,17 @@ func (s *Service) CompleteMultipartUpload(
 			_, lErr := s.loadUpload(ctx, bucket, key, uploadID)
 			return lErr
 		},
+		// An abort that removed the upload while its parts were read
+		// fails the completion as one after it would.
+		failed: func(err error) error {
+			_, lErr := s.loadUpload(ctx, bucket, key, uploadID)
+			if errors.Is(lErr, contracts.ErrNoSuchUpload) {
+				return lErr
+			}
+			return errors.Join(err, lErr)
+		},
 		done: func() error {
-			if rErr := s.root.RemoveAll(uploadDir(uploadID)); rErr != nil {
+			if _, rErr := s.removeUpload(uploadID); rErr != nil {
 				return fmt.Errorf("%s: complete upload %s: %w", s.Name(), uploadID, rErr)
 			}
 			return nil
@@ -469,15 +556,32 @@ func (s *Service) checkPart(
 	return info.Size(), digest, nil
 }
 
-// AbortMultipartUpload discards an upload and its parts.
+// AbortMultipartUpload discards an upload and its parts (see
+// removeUpload).
 func (s *Service) AbortMultipartUpload(ctx context.Context, bucket, key, uploadID string) error {
 	if _, err := s.loadUpload(ctx, bucket, key, uploadID); err != nil {
 		return err
 	}
-	if err := s.root.RemoveAll(uploadDir(uploadID)); err != nil {
+	if _, err := s.removeUpload(uploadID); err != nil {
 		return fmt.Errorf("%s: abort upload %s: %w", s.Name(), uploadID, err)
 	}
 	return nil
+}
+
+// removeUpload removes upload id: its manifest first, which is the commit,
+// since an upload without one does not exist, then its directory, whose
+// removal takes its files in no particular order. So the upload goes at
+// once, and a crash leaves no upload that is listed with parts missing,
+// only, at worst, a directory without a manifest, which no operation sees.
+// It reports whether the manifest is gone, so the upload is, even when
+// removing the directory then failed.
+//
+//nolint:wrapcheck // wrapped at the caller site
+func (s *Service) removeUpload(id string) (bool, error) {
+	if err := s.removeIfExists(filepath.Join(uploadDir(id), manifestFile)); err != nil {
+		return false, err
+	}
+	return true, s.root.RemoveAll(uploadDir(id))
 }
 
 // ListParts returns the uploaded parts of an upload, in part number order.
@@ -526,9 +630,14 @@ func (s *Service) ListParts(
 }
 
 // removeUploads removes the uploads into bucket of generation gen, which
-// cannot complete or be listed once the bucket is deleted. The caller holds
-// the bucket's write lock, so none of them is in use.
+// cannot complete or be listed once the bucket is deleted, and the upload
+// directories of any bucket left without a manifest (see
+// removeOrphanUploads). The caller holds the bucket's write lock, so none
+// of the uploads is in use.
 func (s *Service) removeUploads(bucket, gen string) error {
+	if err := s.removeOrphanUploads(); err != nil {
+		return err
+	}
 	entries, err := fs.ReadDir(s.root.FS(), multipartDir)
 	if err != nil {
 		return fmt.Errorf("%s: list uploads: %w", s.Name(), err)

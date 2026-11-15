@@ -411,7 +411,7 @@ func requireWritten(
 	if st == contracts.Unversioned {
 		reported = ""
 	}
-	if info.VersionID != reported || !slices.Equal(after[1:], kept) {
+	if info.VersionID != reported || !slices.Equal(after[1:], displacedBy(before, kept, after[0])) {
 		t.Fatalf("wrote %q, versions %+v; want %q on %+v", info.VersionID, after, reported, kept)
 	}
 	if f.body(oref("bucket", "k")) != "new" || f.body(vref("k", after[0].ID)) != "new" {
@@ -474,6 +474,18 @@ func withoutNull(before []versionEntry, listed bool) ([]versionEntry, *versionEn
 	return slices.Delete(slices.Clone(before), i, i+1), &before[i]
 }
 
+// displacedBy returns kept, the versions of before a change that placed
+// top kept, as they are after it: the one that was current, if kept, is
+// noncurrent since top's LastModified, and the others are unchanged.
+func displacedBy(before, kept []versionEntry, top versionEntry) []versionEntry {
+	if len(kept) == 0 || kept[0].ID != before[0].ID {
+		return kept
+	}
+	kept = slices.Clone(kept)
+	kept[0].NoncurrentSince = top.LastModified
+	return kept
+}
+
 // A delete without a version removes the object in an Unversioned bucket,
 // adds a delete marker in an Enabled one, also on a marker or a key
 // without versions, and replaces the null version with a null marker in
@@ -498,7 +510,7 @@ func requireSimpleDelete(t *testing.T, f *fixture, st contracts.Versioning) {
 	if st == contracts.VersioningSuspended {
 		kept, displaced = withoutNull(before, true)
 	}
-	if !out.DeleteMarker || !slices.Equal(after[1:], kept) {
+	if !out.DeleteMarker || !slices.Equal(after[1:], displacedBy(before, kept, after[0])) {
 		t.Fatalf("delete: %+v, versions %+v, want a marker on %+v", out, after, kept)
 	}
 	if e := after[0]; !e.Marker || e.ID != out.VersionID || e.LastModified.IsZero() {
