@@ -591,7 +591,7 @@ refused with `400 InvalidArgument`, which bounds the cost of evaluating it.
   answered `IsTruncated` true once the bucket had a key, and ListObjectsV2
   an empty `NextContinuationToken`, so a client paging on it never ended.
 - **Downgrade:** a data directory in which a bucket was ever Enabled or
-  Suspended is not supported by v0.10.1 and earlier, which do not read the
+  Suspended is not supported by v0.10.x and earlier, which do not read the
   versions kept for its keys and would serve stale or missing objects.
   Buckets never versioned stay readable by them.
 - **Fix:** a request naming `?versionId` with a served subresource, such
