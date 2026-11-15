@@ -33,8 +33,10 @@ type lifecycleEnvelope struct {
 
 // LifecycleTargets returns every bucket with a lifecycle configuration
 // stored for its current generation, each read under the bucket's lock, so
-// the configuration and generation are read together. A configuration
-// whose envelope does not decode is logged and skipped.
+// the configuration and generation are read together. A bucket whose
+// configuration or generation cannot be read, or whose envelope does not
+// decode, is logged and skipped, so it keeps no other bucket's rules from
+// applying; only a failure to list the buckets fails the call.
 func (s *Service) LifecycleTargets(ctx context.Context) ([]contracts.LifecycleTarget, error) {
 	buckets, err := s.ListBuckets(ctx)
 	if err != nil {
@@ -44,7 +46,9 @@ func (s *Service) LifecycleTargets(ctx context.Context) ([]contracts.LifecycleTa
 	for _, b := range buckets {
 		t, ok, tErr := s.lifecycleTarget(ctx, b.Name)
 		if tErr != nil {
-			return nil, tErr
+			s.logger.Warn("skipped a lifecycle configuration that could not be read").
+				Str("bucket", b.Name).Err("error", tErr).Send()
+			continue
 		}
 		if ok {
 			targets = append(targets, t)
@@ -81,8 +85,7 @@ func (s *Service) lifecycleTarget(
 	}
 	var env lifecycleEnvelope
 	if err = json.Unmarshal(raw, &env); err != nil {
-		// Only damage leaves one, which keeps no other bucket's rules from
-		// applying.
+		// Only damage leaves one.
 		s.logger.Warn("skipped a damaged lifecycle configuration").
 			Str("bucket", bucket).Err("error", err).Send()
 		return contracts.LifecycleTarget{}, false, nil

@@ -19,6 +19,7 @@ import (
 	"tule.dev/object-store/internal/modules/object"
 	"tule.dev/object-store/internal/s3api"
 	"tule.dev/object-store/internal/services/storage/dirimpl"
+	"tule.dev/object-store/internal/services/sweep"
 )
 
 // New builds the application from cfg. extra options are applied after the
@@ -53,10 +54,17 @@ func New(cfg *Config, extra ...gas.Option) (*gas.App, error) {
 	app := gas.NewApp(opts...)
 
 	registerInfraServices(app, cfg, logger)
-	registerAppServices(app, cfg, verifier, bound)
+	ready := make(chan struct{})
+	registerAppServices(app, cfg, verifier, bound, ready)
 	registerAppModules(app, cfg)
 	installMiddleware(app.Router(), cfg, logger, verifier)
 	app.ReadyFunc(createBuckets(cfg.Storage.Buckets))
+	// Last, so no lifecycle rule applies before every service and ready
+	// hook has succeeded.
+	app.ReadyFunc(func(*gas.ServiceContainer) error {
+		close(ready)
+		return nil
+	})
 
 	return app, nil
 }
@@ -70,17 +78,25 @@ func registerInfraServices(app *gas.App, cfg *Config, logger gas.Logger) {
 // registerAppServices registers the storage, the signature verifier, whose
 // ReadBody the modules read small request documents with, and the
 // authorizer the modules evaluate each operation with, which reads bucket
-// policies from the storage, and how bucket policies' principals are bound.
+// policies from the storage, and how bucket policies' principals are bound;
+// and the lifecycle sweep, which applies no rule before ready is closed.
 func registerAppServices(
 	app *gas.App,
 	cfg *Config,
 	verifier *sigv4.Verifier,
 	bound contracts.PolicyPrincipals,
+	ready <-chan struct{},
 ) {
+	clock := cfg.clockOrSystem()
 	app.RegisterServiceInstance[*sigv4.Verifier](verifier)
 	app.RegisterServiceInstance[contracts.PolicyPrincipals](bound)
 	app.RegisterSingletonService[contracts.StorageProvider](
-		dirimpl.NewService(cfg.Storage, contracts.SystemClock),
+		dirimpl.NewService(cfg.Storage, clock),
+	)
+	// It depends on the storage, so gas closes it, stopping its sweeps,
+	// before the storage.
+	app.RegisterSingletonService[*sweep.Service](
+		sweep.NewService(sweep.Settings{Clock: clock, Ready: ready}),
 	)
 	app.RegisterSingletonService[*authz.Authorizer](
 		func(storage contracts.StorageProvider) *authz.Authorizer {

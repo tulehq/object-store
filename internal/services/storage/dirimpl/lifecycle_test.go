@@ -607,6 +607,24 @@ func TestLifecycleTargets(t *testing.T) {
 	}
 }
 
+// A configuration that cannot be read is skipped, and keeps no other
+// bucket's: only a failure to list the buckets fails LifecycleTargets.
+func TestLifecycleTargetsSkipAnUnreadableConfiguration(t *testing.T) {
+	f := newFixture(t)
+	if _, err := f.s.CreateBucket(context.Background(), "other", nil); err != nil {
+		t.Fatal(err)
+	}
+	r := ref(t, f.s, "bucket")
+	f.writeLifecycle("bucket", envelope(t, r.Generation))
+	// A directory in place of the file fails the read.
+	if err := f.s.root.Mkdir(configFile(contracts.ConfigLifecycle, "other"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if got := targets(t, f.s); len(got) != 1 || got["bucket"].Ref != r {
+		t.Fatalf("targets with an unreadable configuration: %v", got)
+	}
+}
+
 // writeLifecycle writes doc as bucket's lifecycle configuration file, as
 // it was left on disk.
 func (f *fixture) writeLifecycle(bucket string, doc []byte) {

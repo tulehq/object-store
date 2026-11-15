@@ -361,7 +361,8 @@ type StorageProvider interface {
 	// stored for its current generation, with that configuration as it was
 	// stored. A configuration whose envelope names another generation, one
 	// a bucket of the same name had, is none, and so is one that does not
-	// decode, which is logged.
+	// decode or cannot be read, which is logged: only a failure to list
+	// the buckets fails the call.
 	LifecycleTargets(ctx context.Context) ([]LifecycleTarget, error)
 	// ScanKeys returns up to n of bucket's indexed keys after cursor, in an
 	// order of their own that keys added or removed meanwhile do not
