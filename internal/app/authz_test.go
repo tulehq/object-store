@@ -469,6 +469,28 @@ var calls = map[authz.Operation]call{
 	authz.DeleteBucketEncryption: func(ctx context.Context, c *s3.Client) error {
 		return sdkErr(c.DeleteBucketEncryption(ctx, &s3.DeleteBucketEncryptionInput{Bucket: cfg}))
 	},
+	// The lifecycle calls act on cfg-bkt, which holds no object, so the
+	// rule PutBucketLifecycleConfiguration sets expires nothing another
+	// call reads.
+	authz.PutBucketLifecycleConfiguration: func(ctx context.Context, c *s3.Client) error {
+		return sdkErr(c.PutBucketLifecycleConfiguration(ctx,
+			&s3.PutBucketLifecycleConfigurationInput{
+				Bucket: cfg, LifecycleConfiguration: &s3types.BucketLifecycleConfiguration{
+					Rules: []s3types.LifecycleRule{{
+						ID: aws.String("expire"), Status: s3types.ExpirationStatusEnabled,
+						Filter:     &s3types.LifecycleRuleFilter{Prefix: aws.String("logs/")},
+						Expiration: &s3types.LifecycleExpiration{Days: aws.Int32(1)},
+					}},
+				},
+			}))
+	},
+	authz.GetBucketLifecycleConfiguration: func(ctx context.Context, c *s3.Client) error {
+		return sdkErr(c.GetBucketLifecycleConfiguration(ctx,
+			&s3.GetBucketLifecycleConfigurationInput{Bucket: cfg}))
+	},
+	authz.DeleteBucketLifecycle: func(ctx context.Context, c *s3.Client) error {
+		return sdkErr(c.DeleteBucketLifecycle(ctx, &s3.DeleteBucketLifecycleInput{Bucket: cfg}))
+	},
 	authz.PutObjectTagging: func(ctx context.Context, c *s3.Client) error {
 		return sdkErr(c.PutObjectTagging(ctx, &s3.PutObjectTaggingInput{
 			Bucket: b, Key: key, Tagging: &s3types.Tagging{TagSet: []s3types.Tag{

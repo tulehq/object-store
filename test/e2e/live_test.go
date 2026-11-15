@@ -16,6 +16,7 @@ import (
 	"github.com/gasmod/gas/config"
 
 	"tule.dev/object-store/internal/app"
+	"tule.dev/object-store/internal/contracts"
 )
 
 // liveServer is object-store run as the binary runs it: the app's own
@@ -34,10 +35,24 @@ type liveServer struct {
 // it serves TLS. Its idle connections are closed when the test ends.
 func (l *liveServer) Client() *http.Client { return l.httpClient }
 
+// liveOptions are the settings of a live server that the environment
+// cannot carry.
+type liveOptions struct {
+	// clock, when set, is the clock the app stamps what it stores with
+	// and runs the lifecycle on (app.Config.SetClock).
+	clock contracts.Clock
+}
+
 // startLive starts the app on a fresh storage root and a free port, with
 // env setting extra TULE_ variables over the test/test credentials, waits
 // until it is ready, and stops it when the test ends.
 func startLive(t *testing.T, env map[string]string) *liveServer {
+	t.Helper()
+	return startLiveWith(t, env, liveOptions{})
+}
+
+// startLiveWith is startLive with opts.
+func startLiveWith(t *testing.T, env map[string]string, opts liveOptions) *liveServer {
 	t.Helper()
 
 	port := freePort(t)
@@ -55,6 +70,9 @@ func startLive(t *testing.T, env map[string]string) *liveServer {
 		config.WithEnvPrefix("TULE_"),
 	))
 	requireNoErr(t, err, "load config")
+	if opts.clock != nil {
+		cfg.SetClock(opts.clock)
+	}
 	a, err := app.New(cfg)
 	requireNoErr(t, err, "new app")
 	requireNoErr(t, a.Start(context.Background()), "start app")
@@ -82,11 +100,16 @@ func startLive(t *testing.T, env map[string]string) *liveServer {
 // keys the identity service at identityURL issued.
 func startLiveWithIdentity(t *testing.T, identityURL string) *liveServer {
 	t.Helper()
-	return startLive(t, map[string]string{
+	return startLive(t, identityEnv(identityURL))
+}
+
+// identityEnv is the environment of startLiveWithIdentity.
+func identityEnv(identityURL string) map[string]string {
+	return map[string]string{
 		"TULE_Auth_AccessKeyID":      rootKeyID,
 		"TULE_Auth_SecretAccessKey":  rootSecret,
 		"TULE_Auth_IdentityEndpoint": identityURL,
-	})
+	}
 }
 
 // waitReady polls the readiness probe until it answers 200, failing if

@@ -64,6 +64,10 @@ const (
 	GetBucketEncryption           Operation = "GetBucketEncryption"
 	DeleteBucketEncryption        Operation = "DeleteBucketEncryption"
 
+	PutBucketLifecycleConfiguration Operation = "PutBucketLifecycleConfiguration"
+	GetBucketLifecycleConfiguration Operation = "GetBucketLifecycleConfiguration"
+	DeleteBucketLifecycle           Operation = "DeleteBucketLifecycle"
+
 	PutObjectTagging    Operation = "PutObjectTagging"
 	GetObjectTagging    Operation = "GetObjectTagging"
 	DeleteObjectTagging Operation = "DeleteObjectTagging"
@@ -138,9 +142,13 @@ type check struct {
 // answered on its own. The Delete operations of the bucket configurations
 // are evaluated as the configuration's Put action, as the reference lists
 // them (DeleteBucketTagging as s3:PutBucketTagging, DeleteBucketCors as
-// s3:PutBucketCORS and so on), and PutBucketEncryption, its Get and its
-// Delete as s3:PutEncryptionConfiguration and
-// s3:GetEncryptionConfiguration.
+// s3:PutBucketCORS, DeleteBucketLifecycle as s3:PutLifecycleConfiguration
+// and so on), PutBucketEncryption, its Get and its Delete as
+// s3:PutEncryptionConfiguration and s3:GetEncryptionConfiguration, and
+// PutBucketLifecycleConfiguration and its Get as
+// s3:PutLifecycleConfiguration and s3:GetLifecycleConfiguration. The
+// deprecated PutBucketLifecycle and GetBucketLifecycle share their request
+// lines and their actions, so they are served and evaluated as these.
 //
 // GetObjectAttributes needs both s3:GetObject and s3:GetObjectAttributes:
 // "If you do not pass a version ID in your request, you need the
@@ -262,6 +270,15 @@ var operations = map[Operation][]check{
 	},
 	DeleteBucketEncryption: {
 		{action: "s3:PutEncryptionConfiguration", kind: bucketResource},
+	},
+	PutBucketLifecycleConfiguration: {
+		{action: "s3:PutLifecycleConfiguration", kind: bucketResource},
+	},
+	GetBucketLifecycleConfiguration: {
+		{action: "s3:GetLifecycleConfiguration", kind: bucketResource},
+	},
+	DeleteBucketLifecycle: {
+		{action: "s3:PutLifecycleConfiguration", kind: bucketResource},
 	},
 	PutObjectTagging: {{
 		action: "s3:PutObjectTagging", versionAction: "s3:PutObjectVersionTagging",
