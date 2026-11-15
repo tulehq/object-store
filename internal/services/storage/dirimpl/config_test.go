@@ -205,7 +205,7 @@ func TestObjectACLFilesGoWithTheirObjects(t *testing.T) {
 	requireNoACLFile(t, s, "copied", "a copy without an ACL")
 
 	withACL("uploaded")
-	id, err := s.CreateMultipartUpload(ctx, "bucket", "uploaded", contracts.PutObjectInput{})
+	id, _, err := s.CreateMultipartUpload(ctx, "bucket", "uploaded", contracts.PutObjectInput{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +232,7 @@ func TestObjectACLFilesGoWithTheirObjects(t *testing.T) {
 func TestUploadPartReportsTheUploadsHeaders(t *testing.T) {
 	s := newTestService(t)
 	ctx, _ := pin(t, s)
-	id, err := s.CreateMultipartUpload(ctx, "bucket", "k", contracts.PutObjectInput{
+	id, _, err := s.CreateMultipartUpload(ctx, "bucket", "k", contracts.PutObjectInput{
 		Headers: map[string]string{"X-Amz-Server-Side-Encryption": "aws:kms"},
 	})
 	if err != nil {

@@ -230,11 +230,13 @@ type StorageProvider interface {
 	) (*ObjectInfo, error)
 	CopyObject(ctx context.Context, in CopyObjectInput) (*CopyObjectOutput, error)
 
+	// CreateMultipartUpload starts an upload of key and returns its ID
+	// and the time it was initiated.
 	CreateMultipartUpload(
 		ctx context.Context,
 		bucket, key string,
 		in PutObjectInput,
-	) (string, error)
+	) (id string, initiated time.Time, err error)
 	// UploadPart stores a part of an upload and returns its ETag and the
 	// system headers the upload's object will be stored with, which a
 	// part's response reports.
@@ -254,7 +256,9 @@ type StorageProvider interface {
 		cond Precondition,
 	) (*ObjectInfo, error)
 	AbortMultipartUpload(ctx context.Context, bucket, key, uploadID string) error
-	ListParts(ctx context.Context, bucket, key, uploadID string) ([]PartInfo, error)
+	// ListParts returns the time an upload was initiated and its
+	// uploaded parts, in part number order.
+	ListParts(ctx context.Context, bucket, key, uploadID string) (*UploadParts, error)
 	ListMultipartUploads(ctx context.Context, bucket string) ([]UploadInfo, error)
 
 	// Pin locks each bucket refs names against deletion and creation and
@@ -508,8 +512,9 @@ type BucketInfo struct {
 // described on PutObjectInput. PartSizes lists the part sizes of an object
 // assembled by a multipart upload, and is empty for other objects. Tags
 // are the object's tags, as GetObjectTagging returns them; only GetObject
-// and StatObjectTagging read them, and every other operation leaves them
-// nil. VersionID is the ID of the version described: VersionNull or an
+// and StatObjectTagging read them, the writes (PutObject, CopyObject and
+// CompleteMultipartUpload) return the ones written, and every other
+// operation leaves them nil. VersionID is the ID of the version described: VersionNull or an
 // issued ID, and empty only for an object of an Unversioned bucket, which
 // reports none. IsLatest is set when the version described is its key's
 // current version, as it was read or written.
@@ -733,6 +738,13 @@ type PartInfo struct {
 	ETag         string
 	PartNumber   int
 	Size         int64
+}
+
+// UploadParts is an in-progress multipart upload's initiation time and
+// its uploaded parts, as ListParts returns them.
+type UploadParts struct {
+	Initiated time.Time
+	Parts     []PartInfo
 }
 
 // UploadInfo describes an in-progress multipart upload.

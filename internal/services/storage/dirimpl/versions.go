@@ -552,6 +552,7 @@ func (s *Service) writeLegacy(
 	if err = s.finishLegacy(bucket, info, w); err != nil {
 		return nil, false, err
 	}
+	info.Tags = tr.Tags
 	return info, true, nil
 }
 
@@ -606,7 +607,7 @@ func (s *Service) writeVersion(
 
 // writeData writes the data of w, and its ACL, as those of e, a version of
 // key not yet committed, and fills in e's ETag, size and modification time
-// from it. It returns the data's info.
+// from it. It returns the data's info, with the tags it was written with.
 func (s *Service) writeData(
 	ctx context.Context,
 	bucket, key string,
@@ -632,6 +633,7 @@ func (s *Service) writeData(
 		return nil, err
 	}
 	e.ETag, e.Size, e.LastModified = info.ETag, info.Size, info.LastModified
+	info.Tags = tr.Tags
 	if w.acl != nil {
 		if err = s.writeObjectACL(sideFile(aclDir, bucket, key, e), info, w.acl); err != nil {
 			return nil, err

@@ -604,6 +604,11 @@ refused with `400 InvalidArgument`, which bounds the cost of evaluating it.
   stored and answered, and never applied ([Lifecycle](#lifecycle)). The
   three operations are evaluated as `s3:PutLifecycleConfiguration` and
   `s3:GetLifecycleConfiguration`.
+- **Behavior:** PutObject, CopyObject, CompleteMultipartUpload, GetObject
+  and HeadObject answer `x-amz-expiration` for an object a lifecycle rule
+  expires, and CreateMultipartUpload and ListParts answer
+  `x-amz-abort-date` and `x-amz-abort-rule-id` for an upload a rule aborts
+  ([Lifecycle](#lifecycle)).
 - **Behavior:** a multipart upload is created under a temporary name and
   renamed into place once its manifest is written, and an upload is
   removed manifest first, so an upload directory without a manifest is
@@ -1558,6 +1563,23 @@ The rules apply to existing objects as well as new ones. When several
 rules match a version, a permanent deletion wins over adding a marker,
 and the earliest action wins. Tags are read when the rule is applied.
 
+**Response headers.** PutObject, CopyObject and CompleteMultipartUpload
+answer `x-amz-expiration` for the object they write, and GetObject and
+HeadObject for a key's current version, also when it is named by
+`versionId`, when an enabled Expiration by Days or Date matches it:
+`expiry-date="Sun, 19 Jan 2014 00:00:00 GMT", rule-id="logs"`, the
+midnight it is eligible at and the rule's ID, URL-encoded ("The value of
+the rule-id is URL-encoded.", GetObject API reference). A Date already
+past is answered as it is. A noncurrent version answers none, and so do
+rules with only NoncurrentVersionExpiration or ExpiredObjectDeleteMarker,
+and Disabled rules. CreateMultipartUpload and ListParts answer
+`x-amz-abort-date`, the HTTP date the upload is eligible to be aborted
+at, and `x-amz-abort-rule-id`, the rule's ID, when an enabled
+AbortIncompleteMultipartUpload rule's prefix matches the upload's key.
+The configuration is read on each of these requests. One that cannot be
+read or decoded is logged at Warn with its bucket, and the request is
+answered without these headers.
+
 The rules are applied in the background, as S3 does: without a principal,
 so no identity policy, bucket policy, ACL or Block Public Access setting
 is evaluated, and a bucket policy denying `s3:DeleteObject` does not stop
@@ -1594,7 +1616,10 @@ does:
    not apply to an upload.
 10. Transitions are never applied, and do not delay a delete marker,
     where S3 gives a transition precedence over one.
-11. `x-amz-expiration` is not answered by any object operation.
+11. `x-amz-expiration` is computed from the configuration, for a key's
+    current version only, and the earliest matching expiry wins. Its
+    `rule-id` is URL-encoded, as the API references' text says, although
+    HeadObject's sample shows one with a raw space.
 12. `x-amz-transition-default-minimum-object-size` is answered by the Put
     and the Get only, as no other operation lists it, and defaults to
     `all_storage_classes_128K`, the value S3 gives a configuration put
@@ -1718,7 +1743,8 @@ bucket are refused, as on S3.
   `x-amz-copy-source-if-*` conditions), DeleteObject, DeleteObjects,
   GetObjectAttributes ([above](#object-attributes)), and `?versionId` on
   GetObject, HeadObject and DeleteObject and `VersionId` on DeleteObjects
-  ([above](#versioning)).
+  ([above](#versioning)). PutObject, CopyObject, GetObject and HeadObject
+  answer `x-amz-expiration` ([above](#lifecycle)).
 - **Object tagging** ([above](#object-tagging)): PutObjectTagging,
   GetObjectTagging, DeleteObjectTagging, `x-amz-tagging` on PutObject,
   CreateMultipartUpload and CopyObject, and `x-amz-tagging-count` on
@@ -1726,7 +1752,9 @@ bucket are refused, as on S3.
 - **Multipart uploads:** CreateMultipartUpload, UploadPart, UploadPartCopy
   ([above](#part-copies-and-copy-conditions)), CompleteMultipartUpload,
   AbortMultipartUpload, ListParts, ListMultipartUploads. ETags and the 5
-  MiB minimum part size follow S3.
+  MiB minimum part size follow S3. CreateMultipartUpload and ListParts
+  answer `x-amz-abort-date` and `x-amz-abort-rule-id`, and
+  CompleteMultipartUpload `x-amz-expiration` ([above](#lifecycle)).
 - **Conditional writes:** `If-None-Match: *` and `If-Match` on PutObject,
   CopyObject and CompleteMultipartUpload.
 - **Presigned URLs** for GET and PUT.
@@ -1807,9 +1835,8 @@ bucket are refused, as on S3.
   any keys to delete, or any of the upload's parts to complete.
 - **Not implemented** (requests return `501 NotImplemented`): MFA delete,
   object lock, and browser POST-policy uploads.
-- **Lifecycle transitions are never applied**, and no object operation
-  answers `x-amz-expiration`, `x-amz-abort-date` or `x-amz-abort-rule-id`
-  ([Lifecycle](#lifecycle)).
+- **Lifecycle transitions are never applied**, so no object changes
+  storage class ([Lifecycle](#lifecycle)).
 - **Version listings name no owner.** ListObjectVersions answers no
   `Owner` for a version or delete marker, as ListObjects answers none
   here.

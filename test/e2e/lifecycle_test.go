@@ -25,8 +25,7 @@ import (
 
 // The lifecycle tests run the server on a fakeClock that starts at
 // lifecycleEpoch, so every object they write was last modified then, and
-// move it to the midnights the rules make objects eligible at. The
-// expiration headers of the object operations are not checked here.
+// move it to the midnights the rules make objects eligible at.
 
 // startLifecycle starts a server on a new fakeClock at lifecycleEpoch,
 // with env over startLive's, and returns its client and the clock.
@@ -117,6 +116,32 @@ func eventuallyKeys(t *testing.T, c *s3.Client, bucket string, want ...string) {
 	eventually(t, bucket+" to hold "+strings.Join(want, ", "), func() bool {
 		return slices.Equal(keysOf(t, c, bucket), want)
 	})
+}
+
+// expiresOn is the x-amz-expiration value of an expiry at midnight UTC of
+// January d, 2014, by the rule ruleID, URL-encoded.
+func expiresOn(d int, ruleID string) string {
+	return `expiry-date="` + day(d).Format(http.TimeFormat) + `", rule-id="` + ruleID + `"`
+}
+
+// requireExpiration checks that GetObject and HeadObject of bucket/key, of
+// its version versionID when that is not "", answer x-amz-expiration want,
+// none when want is "".
+func requireExpiration(t *testing.T, c *s3.Client, bucket, key, versionID, want string) {
+	t.Helper()
+	var version *string
+	if versionID != "" {
+		version = aws.String(versionID)
+	}
+	out, _ := get(t, c, &s3.GetObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String(key), VersionId: version,
+	})
+	requireEqual(t, aws.ToString(out.Expiration), want, "GetObject expiration of "+key)
+	head, err := c.HeadObject(t.Context(), &s3.HeadObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String(key), VersionId: version,
+	})
+	requireNoErr(t, err, "head "+key)
+	requireEqual(t, aws.ToString(head.Expiration), want, "HeadObject expiration of "+key)
 }
 
 // sameJSON checks that got and want encode to the same JSON.
@@ -606,11 +631,13 @@ func TestLifecycleExpiresObjects(t *testing.T) {
 		enabled("team", &types.LifecycleRuleFilter{
 			Tag: &types.Tag{Key: aws.String("team"), Value: aws.String("x")},
 		}, days(3)),
-		enabled("big", &types.LifecycleRuleFilter{ObjectSizeGreaterThan: aws.Int64(100)},
-			days(3)),
+		enabled("big objects", &types.LifecycleRuleFilter{
+			ObjectSizeGreaterThan: aws.Int64(100),
+		}, days(3)),
 		disabled,
 	)
 	all := []string{"big", "keep/b", "logs/a", "small", "tagged", "tagged-other"}
+	requireExpiresHeaders(t, c)
 
 	// Created 1/15 10:30 with 3 days, they are eligible on 1/19 at 00:00
 	// UTC (the User Guide's example): the sweep at 1/18 23:59 leaves them,
@@ -628,6 +655,50 @@ func TestLifecycleExpiresObjects(t *testing.T) {
 	requireKeys(t, c, "exp", "dated/x", "keep/b", "small", "tagged-other")
 	advance(t, clk, day(19, 0, 1))
 	eventuallyKeys(t, c, "exp", "keep/b", "small", "tagged-other")
+}
+
+// requireExpiresHeaders checks the x-amz-expiration of TestLifecycleExpiresObjects'
+// objects before they expire: each matching object's is its rule's
+// 1/19 midnight, the rule ID URL-encoded, on GetObject, HeadObject,
+// PutObject, CopyObject and CompleteMultipartUpload, and the others have
+// none, keep/b's rule being Disabled.
+func requireExpiresHeaders(t *testing.T, c *s3.Client) {
+	t.Helper()
+	ctx := t.Context()
+	for key, want := range map[string]string{
+		"logs/a": expiresOn(19, "logs"), "tagged": expiresOn(19, "team"),
+		"big":    expiresOn(19, "big%20objects"),
+		"keep/b": "", "small": "", "tagged-other": "",
+	} {
+		requireExpiration(t, c, "exp", key, "", want)
+	}
+
+	// The writes answer it for the object they write: logs/a is written
+	// again, by each, as it was.
+	out := put(t, c, "exp", "logs/a", []byte("x"))
+	requireEqual(t, aws.ToString(out.Expiration), expiresOn(19, "logs"), "PutObject")
+	out = put(t, c, "exp", "keep/b", []byte("x"))
+	requireEqual(t, aws.ToString(out.Expiration), "", "PutObject under a Disabled rule")
+	cp, err := c.CopyObject(ctx, &s3.CopyObjectInput{
+		Bucket: aws.String("exp"), Key: aws.String("logs/a"), CopySource: aws.String("exp/keep/b"),
+	})
+	requireNoErr(t, err, "copy keep/b to logs/a")
+	requireEqual(t, aws.ToString(cp.Expiration), expiresOn(19, "logs"), "CopyObject")
+	id := createUpload(t, c, "exp", "logs/a")
+	part, err := c.UploadPart(ctx, &s3.UploadPartInput{
+		Bucket: aws.String("exp"), Key: aws.String("logs/a"), UploadId: aws.String(id),
+		PartNumber: aws.Int32(1), Body: strings.NewReader("x"),
+	})
+	requireNoErr(t, err, "upload part")
+	done, err := c.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket: aws.String("exp"), Key: aws.String("logs/a"), UploadId: aws.String(id),
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: []types.CompletedPart{
+			{ETag: part.ETag, PartNumber: aws.Int32(1)},
+		}},
+	})
+	requireNoErr(t, err, "complete")
+	requireEqual(t, aws.ToString(done.Expiration), expiresOn(19, "logs"),
+		"CompleteMultipartUpload")
 }
 
 // versionsOf returns bucket's versions and delete markers of key, newest
@@ -731,6 +802,11 @@ func TestLifecycleVersionedBucket(t *testing.T) {
 		newer = append(newer, putVersion(t, c, "ver", "newer/k", strconv.Itoa(i)))
 	}
 	putLifecycle(t, c, "ver", versionedRules()...)
+	// The current version answers its expiry, by version too, and rules
+	// with no Expiration by Days or Date answer none.
+	requireExpiration(t, c, "ver", "exp/k", "", expiresOn(17, "exp"))
+	requireExpiration(t, c, "ver", "exp/k", expV1, expiresOn(17, "exp"))
+	requireExpiration(t, c, "ver", "newer/k", "", "")
 
 	// Everything was written 1/15 10:30, so a day's rules make it eligible
 	// on 1/17 at 00:00.
@@ -741,6 +817,9 @@ func TestLifecycleVersionedBucket(t *testing.T) {
 	advance(t, clk, day(17))
 
 	requireExpiredToMarker(t, c, expV1)
+	// A noncurrent version answers none, though its rule's Expiration
+	// admits it.
+	requireExpiration(t, c, "ver", "exp/k", expV1, "")
 
 	// eodm/k's noncurrent version went, and its marker with it.
 	requireEqual(t, len(versionsOf(t, c, "ver", "eodm/k")), 0, "eodm/k versions on 1/17")
@@ -843,6 +922,50 @@ func uploadKeys(t *testing.T, c *s3.Client, bucket string) []string {
 	return keys
 }
 
+// requireAbortHeaders checks that ListParts of stale, an upload of tmp/a,
+// and CreateMultipartUpload under tmp/ answer the abort rule's 1/17
+// midnight and ID, and that those of kept, an upload of keep/b, and of
+// another under keep/ answer neither. The uploads it creates are aborted.
+func requireAbortHeaders(t *testing.T, c *s3.Client, stale, kept string) {
+	t.Helper()
+	ctx := t.Context()
+	for key, id := range map[string]string{"tmp/a": stale, "keep/b": kept} {
+		out, err := c.ListParts(ctx, &s3.ListPartsInput{
+			Bucket: aws.String("mpu"), Key: aws.String(key), UploadId: aws.String(id),
+		})
+		requireNoErr(t, err, "list parts of "+key)
+		requireAbort(t, key, out.AbortDate, out.AbortRuleId)
+	}
+	for _, key := range []string{"tmp/new", "keep/new"} {
+		out, err := c.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+			Bucket: aws.String("mpu"), Key: aws.String(key),
+		})
+		requireNoErr(t, err, "create upload "+key)
+		requireAbort(t, key, out.AbortDate, out.AbortRuleId)
+		_, err = c.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+			Bucket: aws.String("mpu"), Key: aws.String(key), UploadId: out.UploadId,
+		})
+		requireNoErr(t, err, "abort upload "+key)
+	}
+}
+
+// requireAbort checks an upload of key's AbortDate and AbortRuleId: the
+// abort rule's 1/17 midnight under tmp/, and none otherwise.
+func requireAbort(t *testing.T, key string, date *time.Time, ruleID *string) {
+	t.Helper()
+	if !strings.HasPrefix(key, "tmp/") {
+		if date != nil || ruleID != nil {
+			t.Fatalf("%s: abort date %v and rule %v, want none", key, date, aws.ToString(ruleID))
+		}
+		return
+	}
+	if date == nil {
+		t.Fatalf("%s: no abort date", key)
+	}
+	requireEqual(t, date.UTC(), day(17), key+" abort date")
+	requireEqual(t, aws.ToString(ruleID), "abort", key+" abort rule")
+}
+
 // An upload left incomplete is aborted from the midnight its rule makes it
 // eligible at, by prefix; one outside the prefix stays, and one completed
 // is untouched.
@@ -851,7 +974,7 @@ func TestLifecycleAbortsIncompleteUploads(t *testing.T) {
 	ctx := t.Context()
 	createBucket(t, c, "mpu")
 	stale := createUpload(t, c, "mpu", "tmp/a")
-	createUpload(t, c, "mpu", "keep/b")
+	kept := createUpload(t, c, "mpu", "keep/b")
 	done := createUpload(t, c, "mpu", "tmp/done")
 	part, err := c.UploadPart(ctx, &s3.UploadPartInput{
 		Bucket: aws.String("mpu"), Key: aws.String("tmp/done"), UploadId: aws.String(done),
@@ -872,6 +995,7 @@ func TestLifecycleAbortsIncompleteUploads(t *testing.T) {
 			DaysAfterInitiation: aws.Int32(1),
 		},
 	})
+	requireAbortHeaders(t, c, stale, kept)
 
 	advance(t, clk, day(16, 23, 59))
 	if got := uploadKeys(t, c, "mpu"); !slices.Equal(got, []string{"keep/b", "tmp/a"}) {
@@ -925,7 +1049,8 @@ func TestLifecycleSurvivesRestart(t *testing.T) {
 // A configuration file left from an earlier bucket of the same name, as a
 // server that does not know lifecycle configurations leaves one when it
 // deletes the bucket and creates it again, is not the new bucket's: GET
-// answers NoSuchLifecycleConfiguration, and no sweep applies it.
+// answers NoSuchLifecycleConfiguration, no object operation answers
+// x-amz-expiration by it, and no sweep applies it.
 func TestLifecycleOfAnEarlierBucketIsIgnored(t *testing.T) {
 	root := t.TempDir()
 	c, clk := startLifecycle(t, map[string]string{"TULE_Storage_RootDir": root})
@@ -941,7 +1066,9 @@ func TestLifecycleOfAnEarlierBucketIsIgnored(t *testing.T) {
 	createBucket(t, c, "gen")
 	//nolint:gosec // G703: a file of this test's own root
 	requireNoErr(t, os.WriteFile(file, left, 0o600), "leave the configuration file")
-	put(t, c, "gen", "logs/a", []byte("a"))
+	out := put(t, c, "gen", "logs/a", []byte("a"))
+	requireEqual(t, aws.ToString(out.Expiration), "", "PutObject expiration")
+	requireExpiration(t, c, "gen", "logs/a", "", "")
 
 	_, err = c.GetBucketLifecycleConfiguration(ctx,
 		&s3.GetBucketLifecycleConfigurationInput{Bucket: aws.String("gen")})
