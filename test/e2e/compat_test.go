@@ -415,3 +415,38 @@ func getWith(t *testing.T, client *http.Client, rawURL string) (int, []byte) {
 	requireNoErr(t, err, "read response")
 	return res.StatusCode, buf.Bytes()
 }
+
+// ListObjects and ListObjectsV2 with max-keys 0 answer an empty page that
+// is not truncated and gives nothing to continue from, as ceph's s3-tests
+// test_bucket_list_maxkeys_zero and test_bucket_listv2_maxkeys_zero
+// expect.
+func TestListObjectsMaxKeysZero(t *testing.T) {
+	srv := startLive(t, nil)
+	c := clientFor(srv)
+	ctx := t.Context()
+	createBucket(t, c, "zero")
+	for _, k := range []string{"a", "b/c"} {
+		put(t, c, "zero", k, []byte(k))
+	}
+
+	v2, err := c.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket: aws.String("zero"), MaxKeys: aws.Int32(0),
+	})
+	requireNoErr(t, err, "list v2")
+	requireEqual(t, aws.ToBool(v2.IsTruncated), false, "v2 truncated")
+	requireEqual(t, len(v2.Contents)+len(v2.CommonPrefixes), 0, "v2 entries")
+	requireEqual(t, aws.ToInt32(v2.KeyCount), 0, "v2 key count")
+	requireEqual(t, v2.NextContinuationToken == nil, true, "v2 no continuation token")
+	res := sendLive(t, signedRequest(t, srv, http.MethodGet, "/zero?list-type=2&max-keys=0",
+		nil, emptyHash, "s3", "us-east-1", time.Now()))
+	requireEqual(t, strings.Contains(res.Body, "NextContinuationToken"), false,
+		"v2 sends no NextContinuationToken: "+res.Body)
+
+	v1, err := c.ListObjects(ctx, &s3.ListObjectsInput{
+		Bucket: aws.String("zero"), MaxKeys: aws.Int32(0), Delimiter: aws.String("/"),
+	})
+	requireNoErr(t, err, "list v1")
+	requireEqual(t, aws.ToBool(v1.IsTruncated), false, "v1 truncated")
+	requireEqual(t, len(v1.Contents)+len(v1.CommonPrefixes), 0, "v1 entries")
+	requireEqual(t, v1.NextMarker == nil, true, "v1 no NextMarker")
+}

@@ -310,6 +310,13 @@ func TestServiceKeysFollowTheAction(t *testing.T) {
 		"s3:prefix": "logs/", "s3:max-keys": "5", "s3:delimiter": "", "s3:x-amz-acl": "",
 		"s3:authType": "REST-HEADER", "s3:signatureversion": "AWS4-HMAC-SHA256",
 	})
+	versions, err := c.context(check{action: "s3:ListBucketVersions"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireKeys(t, "ListBucketVersions", versions, map[string]string{
+		"s3:prefix": "logs/", "s3:max-keys": "5", "s3:delimiter": "", "s3:x-amz-acl": "",
+	})
 	put, err := c.context(check{action: "s3:PutObject"}, nil)
 	if err != nil {
 		t.Fatal(err)

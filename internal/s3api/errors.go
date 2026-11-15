@@ -149,8 +149,22 @@ var sentinelErrors = []struct {
 	err   error
 	s3Err *Error
 }{
+	// A missing version is also a missing object, as gas storage reports
+	// one, so it is matched first.
+	{storage.ErrVersionNotFound, NewError(http.StatusNotFound, "NoSuchVersion",
+		"The specified version does not exist.")},
 	{storage.ErrObjectNotFound, NewError(http.StatusNotFound, "NoSuchKey",
 		"The specified key does not exist.")},
+	{contracts.ErrMethodNotAllowed, NewError(http.StatusMethodNotAllowed, "MethodNotAllowed",
+		"The specified method is not allowed against this resource.")},
+	{contracts.ErrInvalidVersionID, ErrInvalidArgument("Invalid version id specified")},
+	{contracts.ErrUnversionedState, NewError(http.StatusBadRequest,
+		"IllegalVersioningConfigurationException",
+		"The Versioning element must be specified")},
+	{contracts.ErrInvalidVersioningStatus, ErrMalformedXML()},
+	{contracts.ErrMFADeleteUnsupported, ErrNotImplemented("MFA delete is not supported.")},
+	{contracts.ErrVersionMarkerWithoutKey, ErrInvalidArgument(
+		"A version-id marker cannot be specified without a key marker.")},
 	{storage.ErrBucketNotFound, NewError(http.StatusNotFound, "NoSuchBucket",
 		"The specified bucket does not exist.")},
 	{contracts.ErrBucketExists, NewError(http.StatusConflict, "BucketAlreadyOwnedByYou",

@@ -36,13 +36,17 @@ type serviceKey struct {
 	actions []string
 }
 
+// listActions are the listing actions s3:prefix, s3:delimiter and
+// s3:max-keys are listed for.
+var listActions = []string{"s3:ListBucket", "s3:ListBucketVersions"}
+
 // serviceKeys are the S3 condition keys supplied, each for the actions the
 // Service Authorization Reference lists it for. A key the request carries no
 // value for is left out of the context, as S3 leaves it out.
 var serviceKeys = []serviceKey{
-	{name: "s3:prefix", actions: []string{"s3:ListBucket"}, value: query("prefix")},
-	{name: "s3:delimiter", actions: []string{"s3:ListBucket"}, value: query("delimiter")},
-	{name: "s3:max-keys", actions: []string{"s3:ListBucket"}, value: query("max-keys")},
+	{name: "s3:prefix", actions: listActions, value: query("prefix")},
+	{name: "s3:delimiter", actions: listActions, value: query("delimiter")},
+	{name: "s3:max-keys", actions: listActions, value: query("max-keys")},
 	{
 		name: "s3:x-amz-acl",
 		actions: []string{

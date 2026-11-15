@@ -66,7 +66,8 @@ func (s *Service) ListBuckets(_ context.Context) ([]contracts.BucketInfo, error)
 	return buckets, nil
 }
 
-// ListObjects lists one page of bucket. Every call reads the bucket's whole
+// ListObjects lists one page of bucket; a MaxKeys of 0 or less is an
+// empty page that is not truncated. Every call reads the bucket's whole
 // key index, which is fine at local-development scale.
 func (s *Service) ListObjects(
 	ctx context.Context,
@@ -76,6 +77,12 @@ func (s *Service) ListObjects(
 	keys, err := s.bucketKeys(ctx, bucket)
 	if err != nil {
 		return nil, err
+	}
+	if in.MaxKeys <= 0 {
+		// A page that can hold nothing is empty, not truncated, so a
+		// client paging on its markers does not loop, as
+		// ListObjectVersions answers it.
+		return &contracts.ListObjectsOutput{}, nil
 	}
 
 	out := &contracts.ListObjectsOutput{}

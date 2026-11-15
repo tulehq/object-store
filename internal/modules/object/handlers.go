@@ -32,22 +32,17 @@ func (m *Module) getObject(ctx gas.Context) error {
 	r := ctx.Request()
 
 	// A request names one operation: any other subresource with it, such
-	// as ?versionId, is one not served with it.
+	// as ?versionId, is one not served with it. GetObject itself takes
+	// ?partNumber and ?versionId.
 	sub := s3api.Subresource(r)
-	if err := s3api.CheckSubresource(r, sub); err != nil {
-		return s3api.WriteError(ctx, t, err)
+	if serve, ok := m.getSubresource(sub); ok {
+		if err := s3api.CheckSubresource(r, sub); err != nil {
+			return s3api.WriteError(ctx, t, err)
+		}
+		return serve(ctx, t)
 	}
-	switch sub {
-	case "uploadId":
-		return m.listParts(ctx, t)
-	case "acl":
-		return m.getObjectACL(ctx, t)
-	case "tagging":
-		return m.getObjectTagging(ctx, t)
-	case "attributes":
-		return m.getObjectAttributes(ctx, t)
-	}
-	if err := s3api.CheckSubresource(r, "partNumber"); err != nil {
+	t, err := withVersion(r, t, "partNumber")
+	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
 	g, err := m.authz.AuthorizeAndPin(ctx, r, authz.GetObject, t)
@@ -56,7 +51,7 @@ func (m *Module) getObject(ctx gas.Context) error {
 	}
 	defer g.Release()
 
-	obj, err := m.storage.GetObject(g.Context(), contracts.ObjectRef{Bucket: t.Bucket, Key: t.Key})
+	obj, err := m.storage.GetObject(g.Context(), objectRef(t))
 	// The object is open, and its body is the backend's open data file,
 	// which "keeps reading the contents it opened when the object is
 	// replaced or deleted" (gas storage/dir), so streaming it needs no pin
@@ -64,7 +59,7 @@ func (m *Module) getObject(ctx gas.Context) error {
 	// and NotFound uses the policy already read.
 	g.Release()
 	if err != nil {
-		return s3api.WriteError(ctx, t, g.NotFound(t.Bucket, err))
+		return writeReadError(ctx, g, t, err)
 	}
 	defer func() {
 		if cErr := obj.Body.Close(); cErr != nil {
@@ -72,6 +67,22 @@ func (m *Module) getObject(ctx gas.Context) error {
 		}
 	}()
 	return m.serveObject(ctx, g.Caller(), t, obj)
+}
+
+// getSubresource returns the handler of the GET object operation other
+// than GetObject sub names, false for none.
+func (m *Module) getSubresource(sub string) (func(gas.Context, s3api.Target) error, bool) {
+	switch sub {
+	case "uploadId":
+		return m.listParts, true
+	case "acl":
+		return m.getObjectACL, true
+	case "tagging":
+		return m.getObjectTagging, true
+	case "attributes":
+		return m.getObjectAttributes, true
+	}
+	return nil, false
 }
 
 // serveObject answers caller's GetObject of t with obj, open, if it is
@@ -117,7 +128,8 @@ func (m *Module) headObject(ctx gas.Context) error {
 	t := target(ctx)
 	r := ctx.Request()
 
-	if err := s3api.CheckSubresource(r, "partNumber"); err != nil {
+	t, err := withVersion(r, t, "partNumber")
+	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
 	g, err := m.authz.AuthorizeAndPin(ctx, r, authz.HeadObject, t)
@@ -127,10 +139,10 @@ func (m *Module) headObject(ctx gas.Context) error {
 	defer g.Release()
 
 	// The object is opened, rather than stated, to read its tags with it.
-	obj, err := m.storage.GetObject(g.Context(), contracts.ObjectRef{Bucket: t.Bucket, Key: t.Key})
+	obj, err := m.storage.GetObject(g.Context(), objectRef(t))
 	if err != nil {
 		// A HEAD's error has no body; the status alone tells 403 from 404.
-		return s3api.WriteError(ctx, t, g.NotFound(t.Bucket, err))
+		return writeReadError(ctx, g, t, err)
 	}
 	if err = obj.Body.Close(); err != nil {
 		return s3api.WriteError(ctx, t, fmt.Errorf("close object %q: %w", t.Key, err))
@@ -269,6 +281,7 @@ func (m *Module) uploadObject(ctx gas.Context, t s3api.Target) error {
 	if etag := s3api.ETag(info.ETag); etag != "" {
 		ctx.SetHeader("ETag", etag)
 	}
+	setVersionHeader(ctx.ResponseWriter(), info.VersionID)
 	setEncryptionHeaders(ctx.ResponseWriter(), ws.encryption)
 	ctx.ResponseWriter().WriteHeader(http.StatusOK)
 	return nil
@@ -321,6 +334,7 @@ func (m *Module) copyObject(ctx gas.Context, t s3api.Target) error {
 	}
 	info := &out.ObjectInfo
 
+	setVersionHeader(ctx.ResponseWriter(), info.VersionID)
 	setEncryptionHeaders(ctx.ResponseWriter(), ws.encryption)
 	return ctx.XML(http.StatusOK, s3api.NewCopyObjectResult(info.ETag, info.LastModified))
 }
@@ -409,7 +423,8 @@ func (m *Module) deleteObject(ctx gas.Context) error {
 		}
 		return m.deleteObjectTagging(ctx, t)
 	}
-	if err := s3api.CheckSubresource(r); err != nil {
+	t, err := withVersion(r, t)
+	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
 	g, err := m.authz.AuthorizeAndPin(ctx, r, authz.DeleteObject, t)
@@ -418,10 +433,68 @@ func (m *Module) deleteObject(ctx gas.Context) error {
 	}
 	defer g.Release()
 
-	if _, err := m.storage.DeleteObject(g.Context(),
-		contracts.ObjectRef{Bucket: t.Bucket, Key: t.Key}); err != nil {
+	out, err := m.storage.DeleteObject(g.Context(), objectRef(t))
+	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
 
+	// The marker created, or the version removed, and whether it was a
+	// marker (DeleteObject API reference); neither in an Unversioned
+	// bucket.
+	setVersionHeader(ctx.ResponseWriter(), out.VersionID)
+	if out.DeleteMarker {
+		ctx.SetHeader(s3api.HeaderDeleteMarker, "true")
+	}
 	return ctx.NoContent()
+}
+
+// withVersion returns t with the version r's ?versionId names, if any,
+// once it checked that r names no subresource but ?versionId and allowed.
+func withVersion(r *http.Request, t s3api.Target, allowed ...string) (s3api.Target, error) {
+	if err := s3api.CheckSubresource(r, append(allowed, "versionId")...); err != nil {
+		return t, err //nolint:wrapcheck // an S3 error, answered as is
+	}
+	v, err := s3api.VersionID(r)
+	if err != nil {
+		return t, err //nolint:wrapcheck // an S3 error, answered as is
+	}
+	t.VersionID = v
+	return t, nil
+}
+
+// objectRef is the object version t names, its current version when it
+// names none.
+func objectRef(t s3api.Target) contracts.ObjectRef {
+	return contracts.ObjectRef{Bucket: t.Bucket, Key: t.Key, Version: t.VersionID}
+}
+
+// setVersionHeader sets x-amz-version-id to id, the version a request
+// served, wrote or deleted, unless id is "", as it is in an Unversioned
+// bucket, whose responses name no version.
+func setVersionHeader(w http.ResponseWriter, id string) {
+	if id != "" {
+		w.Header().Set(s3api.HeaderVersionID, id)
+	}
+}
+
+// writeReadError answers a GetObject or HeadObject of t that failed with
+// err: the AccessDenied g.NotFound gives a caller who may not list the
+// bucket, or err. A delete marker found adds x-amz-delete-marker and the
+// marker's x-amz-version-id: to the 404 NoSuchKey of a current marker,
+// and, with its Last-Modified, to the 405 MethodNotAllowed of a marker
+// named by version (UG "Working with delete markers"; GetObject and
+// HeadObject API references). An AccessDenied carries neither, so it
+// tells nothing of the key.
+func writeReadError(ctx gas.Context, g *authz.Grant, t s3api.Target, err error) error {
+	err = g.NotFound(t.Bucket, err)
+	var dm *contracts.DeleteMarkerError
+	if errors.As(err, &dm) {
+		h := ctx.ResponseWriter().Header()
+		h.Set(s3api.HeaderDeleteMarker, "true")
+		h.Set(s3api.HeaderVersionID, dm.VersionID)
+		if !dm.Current {
+			h.Set("Last-Modified", dm.LastModified.UTC().Format(http.TimeFormat))
+		}
+	}
+	return s3api.WriteError(ctx, t, err)
 }

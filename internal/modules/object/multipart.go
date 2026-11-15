@@ -243,6 +243,7 @@ func (m *Module) completeMultipartUpload(ctx gas.Context, t s3api.Target, upload
 	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
+	setVersionHeader(ctx.ResponseWriter(), info.VersionID)
 	setEncryptionHeaders(ctx.ResponseWriter(), encryptionOf(info.Headers))
 
 	return ctx.XML(http.StatusOK, s3api.NewCompleteMultipartUploadResult(

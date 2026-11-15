@@ -5,6 +5,8 @@ package s3api
 import (
 	"encoding/xml"
 	"time"
+
+	"tule.dev/object-store/internal/contracts"
 )
 
 const xmlns = "http://s3.amazonaws.com/doc/2006-03-01/"
@@ -136,16 +138,24 @@ func NewDeleteResult() *DeleteResult {
 	return &DeleteResult{Xmlns: xmlns}
 }
 
-// DeletedObject reports one key a DeleteObjects request removed.
+// DeletedObject reports one key a DeleteObjects request removed. VersionID
+// is the version a request named, and DeleteMarker and
+// DeleteMarkerVersionID the delete marker it created, or the one it
+// removed by version (the DeleteObjects API reference's examples).
 type DeletedObject struct {
-	Key string `xml:"Key"`
+	Key                   string `xml:"Key"`
+	VersionID             string `xml:"VersionId,omitempty"`
+	DeleteMarkerVersionID string `xml:"DeleteMarkerVersionId,omitempty"`
+	DeleteMarker          bool   `xml:"DeleteMarker,omitempty"`
 }
 
-// DeleteError reports one key a DeleteObjects request failed to remove.
+// DeleteError reports one key a DeleteObjects request failed to remove,
+// and the version it named, if any.
 type DeleteError struct {
-	Key     string `xml:"Key"`
-	Code    string `xml:"Code"`
-	Message string `xml:"Message"`
+	Key       string `xml:"Key"`
+	VersionID string `xml:"VersionId,omitempty"`
+	Code      string `xml:"Code"`
+	Message   string `xml:"Message"`
 }
 
 // InitiateMultipartUploadResult is the CreateMultipartUpload response document.
@@ -234,18 +244,25 @@ func NewLocationConstraint(region string) *LocationConstraint {
 	return &LocationConstraint{Xmlns: xmlns, Region: region}
 }
 
-// VersioningConfiguration is the GetBucketVersioning response document. An
-// empty Status means versioning was never enabled on the bucket.
+// VersioningConfiguration is the GetBucketVersioning response document and
+// the PutBucketVersioning request document. An empty Status means
+// versioning was never set on the bucket, and an empty MfaDelete that MFA
+// delete was never configured: "This element is only returned if the
+// bucket has been configured with MFA delete." (GetBucketVersioning API
+// reference).
 type VersioningConfiguration struct {
-	XMLName xml.Name `xml:"VersioningConfiguration"`
-	Xmlns   string   `xml:"xmlns,attr"`
-	Status  string   `xml:"Status,omitempty"`
+	XMLName   xml.Name `xml:"VersioningConfiguration"`
+	Xmlns     string   `xml:"xmlns,attr"`
+	Status    string   `xml:"Status,omitempty"`
+	MfaDelete string   `xml:"MfaDelete,omitempty"`
 }
 
-// NewVersioningConfiguration returns the GetBucketVersioning response for a
-// bucket that has never had versioning enabled.
-func NewVersioningConfiguration() *VersioningConfiguration {
-	return &VersioningConfiguration{Xmlns: xmlns}
+// NewVersioningConfiguration returns the GetBucketVersioning response for
+// cfg.
+func NewVersioningConfiguration(cfg contracts.VersioningConfig) *VersioningConfiguration {
+	return &VersioningConfiguration{
+		Xmlns: xmlns, Status: string(cfg.Status), MfaDelete: cfg.MFADelete,
+	}
 }
 
 // Part is one Part entry of a ListParts response.
