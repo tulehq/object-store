@@ -41,13 +41,35 @@ var kindNames = map[resourceKind]string{bucketResource: "bucket", objectResource
 // beyondReference are the actions an operation is evaluated as that the
 // reference's entry for it leaves out but its API reference names:
 // GetObjectAttributes' s3:GetObjectAttributes ("you need the s3:GetObject
-// and s3:GetObjectAttributes permissions").
-var beyondReference = map[Operation][]string{GetObjectAttributes: {"GetObjectAttributes"}}
+// and s3:GetObjectAttributes permissions") and, for a version,
+// s3:GetObjectVersionAttributes ("you need both the s3:GetObjectVersion
+// and s3:GetObjectVersionAttributes permissions"), and HeadObject's
+// s3:GetObjectVersion for a version ("the relevant read object (or
+// version) permission").
+var beyondReference = map[Operation][]string{
+	GetObjectAttributes: {"GetObjectAttributes", "GetObjectVersionAttributes"},
+	HeadObject:          {"GetObjectVersion"},
+}
+
+// versionActions returns the actions op is evaluated as on targets that
+// name a version: each check's versionAction, or its action when it has
+// none.
+func versionActions(op Operation) []string {
+	var actions []string
+	for _, c := range operations[op] {
+		if c.versionAction != "" {
+			actions = append(actions, c.versionAction)
+		} else {
+			actions = append(actions, c.action)
+		}
+	}
+	return actions
+}
 
 // Every entry is an operation of the reference, evaluated as actions the
 // reference authorizes it with, or beyondReference names, on resource
 // types the reference lists for those actions, or on "*" for an action
-// that lists none.
+// that lists none; a check's version action is held to the same.
 func TestEveryEntryMatchesTheReference(t *testing.T) {
 	ref := loadReference(t)
 	for op, checks := range operations {
@@ -62,6 +84,11 @@ func TestEveryEntryMatchesTheReference(t *testing.T) {
 		}
 		for _, c := range checks {
 			checkMatchesReference(t, ref, op, c, authorized)
+			if c.versionAction != "" {
+				v := c
+				v.action = c.versionAction
+				checkMatchesReference(t, ref, op, v, authorized)
+			}
 		}
 	}
 }
@@ -100,17 +127,21 @@ func checkMatchesReference(
 }
 
 // Every operation the reference authorizes with one action the server
-// does not check, in its entry or for its headers, is one whose extra
-// actions belong to features the server refuses (object lock, versions,
+// does not check, in its entry, for a version or for its headers, is one
+// whose extra actions belong to features the server refuses (object lock,
 // Object Lambda), the listings' s3:GetObjectAcl, which the reference lists
 // for the object owners a listing can return and the server never
-// returns, or GetObject's s3:GetObjectTagging, which decides only whether
-// its tag count is answered (Caller.Allows).
+// returns, GetObject's s3:GetObjectTagging, which decides only whether
+// its tag count is answered (Caller.Allows), or CreateBucket's
+// s3:PutBucketVersioning, which a bucket created with object lock enabled
+// needs ("if you set x-amz-bucket-object-lock-enabled to true, the
+// s3:PutBucketObjectLockConfiguration and s3:PutBucketVersioning
+// permissions are required", its API reference), and object lock is not
+// implemented.
 func TestNoAuthorizedActionIsLeftOutUnexplained(t *testing.T) {
 	ref := loadReference(t)
 	unimplemented := []string{
-		"LegalHold", "Retention", "Version", "ObjectLockConfiguration",
-		"BypassGovernanceRetention",
+		"LegalHold", "Retention", "ObjectLockConfiguration", "BypassGovernanceRetention",
 	}
 	for op := range operations {
 		for _, a := range ref.Operations[string(op)] {
@@ -122,29 +153,59 @@ func TestNoAuthorizedActionIsLeftOutUnexplained(t *testing.T) {
 	}
 }
 
-// checked reports whether op is evaluated as the action a, in its entry
-// or for its headers.
+// checked reports whether op is evaluated as the action a, in its entry,
+// for a version or for its headers.
 func checked(op Operation, a string) bool {
-	return slices.Contains(Actions(op), "s3:"+a) || slices.Contains(HeaderActions(op), "s3:"+a)
+	return slices.Contains(Actions(op), "s3:"+a) ||
+		slices.Contains(versionActions(op), "s3:"+a) ||
+		slices.Contains(HeaderActions(op), "s3:"+a)
 }
 
 // leftOut reports whether the reference's action a for op is one left out
 // for a reason TestNoAuthorizedActionIsLeftOutUnexplained gives.
 func leftOut(op Operation, a string) bool {
 	return a == "GetObjectAcl" && (op == ListObjects || op == ListObjectsV2) ||
-		a == "GetObjectTagging" && op == GetObject
+		a == "GetObjectTagging" && op == GetObject ||
+		a == "PutBucketVersioning" && op == CreateBucket
 }
 
-// Every service key is one the reference lists for each action it is
-// supplied for, and every action it is supplied for is one an entry checks.
-func TestEveryServiceKeyMatchesTheReference(t *testing.T) {
-	ref := loadReference(t)
+// usedActions are the actions an entry checks, for a version or not.
+func usedActions() []string {
 	var used []string
-	for _, checks := range operations {
+	for op, checks := range operations {
 		for _, c := range checks {
 			used = append(used, c.action)
 		}
+		used = append(used, versionActions(op)...)
 	}
+	return used
+}
+
+// s3:versionid is supplied for exactly the actions an entry checks that the
+// reference lists it for.
+func TestVersionIDKeyMatchesTheReference(t *testing.T) {
+	ref := loadReference(t)
+	used := usedActions()
+	for _, a := range used {
+		listed := slices.Contains(ref.Actions[strings.TrimPrefix(a, "s3:")].ConditionKeys,
+			versionIDKey)
+		if listed != slices.Contains(versionIDActions, a) {
+			t.Errorf("%s: the reference lists %s %t, supplied %t", a, versionIDKey, listed, !listed)
+		}
+	}
+	for _, a := range versionIDActions {
+		if !slices.Contains(used, a) {
+			t.Errorf("%s is supplied for %s, which no entry checks", versionIDKey, a)
+		}
+	}
+}
+
+// Every service key is one the reference lists for each action it is
+// supplied for, and every action it is supplied for is one an entry checks,
+// for a version or not.
+func TestEveryServiceKeyMatchesTheReference(t *testing.T) {
+	ref := loadReference(t)
+	used := usedActions()
 	for _, k := range serviceKeys {
 		actions := k.actions
 		if actions == nil {
@@ -261,6 +322,23 @@ func TestEveryCopyTagCheckMatchesTheReference(t *testing.T) {
 	}
 }
 
+// The source's tag check of a copy of a version is
+// s3:GetObjectVersionTagging, which the reference does not authorize
+// CopyObject with either, on a resource type it lists; the destination's
+// has no version action, as a destination names no version.
+func TestACopyTagCheckOfAVersionMatchesTheReference(t *testing.T) {
+	ref := loadReference(t)
+	checks := copyTagChecks(CopyObject, &http.Request{Header: http.Header{}},
+		[]contracts.Tag{{Key: "k", Value: "v"}})
+	if len(checks) != 2 || checks[0].versionAction != "s3:GetObjectVersionTagging" ||
+		checks[1].versionAction != "" {
+		t.Fatalf("copy tag checks %+v", checks)
+	}
+	v := checks[0]
+	v.action = v.versionAction
+	checkMatchesReference(t, ref, CopyObject, v, []string{"GetObjectVersionTagging"})
+}
+
 // Every check an object write's headers add is made on the object it
 // replaces, so takes no s3:ExistingObjectTag keys.
 func TestAWritesHeaderChecksAreOnWrite(t *testing.T) {
@@ -306,6 +384,9 @@ func TestTagKeysMatchTheReference(t *testing.T) {
 	checked := map[string]bool{}
 	for op := range operations {
 		for _, a := range Actions(op) {
+			checked[a] = true
+		}
+		for _, a := range versionActions(op) {
 			checked[a] = true
 		}
 		for _, a := range HeaderActions(op) {

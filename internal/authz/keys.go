@@ -47,6 +47,7 @@ var serviceKeys = []serviceKey{
 		name: "s3:x-amz-acl",
 		actions: []string{
 			"s3:CreateBucket", "s3:PutObject", "s3:PutBucketAcl", "s3:PutObjectAcl",
+			"s3:PutObjectVersionAcl",
 		},
 		value: header("X-Amz-Acl"),
 	},
@@ -97,6 +98,7 @@ func grantKey(name, h string) serviceKey {
 		name: name,
 		actions: []string{
 			"s3:CreateBucket", "s3:PutObject", "s3:PutBucketAcl", "s3:PutObjectAcl",
+			"s3:PutObjectVersionAcl",
 		},
 		value: header(h),
 	}
@@ -195,6 +197,33 @@ func unknownKeys(p sigv4.Principal) []string {
 	return nil
 }
 
+// versionIDKey is s3:versionid, the version a request names, as given
+// ("null" for the null version). It comes from the target rather than the
+// request's query, since a copy names its source's version in its
+// x-amz-copy-source header, so it is no serviceKey.
+const versionIDKey = "s3:versionid"
+
+// versionIDActions are the actions evaluated here that the reference lists
+// s3:versionid for.
+var versionIDActions = []string{
+	"s3:GetObjectVersion", "s3:DeleteObjectVersion", "s3:GetObjectVersionTagging",
+	"s3:PutObjectVersionTagging", "s3:DeleteObjectVersionTagging", "s3:GetObjectVersionAcl",
+	"s3:PutObjectVersionAcl", "s3:GetObjectVersionAttributes",
+}
+
+// actionKeys are the operation's own keys for ch's action on t, extra's,
+// and s3:versionid when t names a version and the reference lists the key
+// for the action. extra is not modified.
+func actionKeys(ch check, t s3api.Target, extra map[string]string) map[string]string {
+	if t.VersionID == "" || !slices.Contains(versionIDActions, ch.action) {
+		return extra
+	}
+	keys := make(map[string]string, len(extra)+1)
+	maps.Copy(keys, extra)
+	keys[versionIDKey] = t.VersionID
+	return keys
+}
+
 // principalTagPrefix is the prefix of the aws:PrincipalTag/<key> keys.
 const principalTagPrefix = "aws:PrincipalTag/"
 
@@ -215,8 +244,13 @@ var (
 	existingTagActions = []string{
 		"s3:GetObject", "s3:GetObjectAcl", "s3:PutObjectAcl", "s3:GetObjectAttributes",
 		"s3:GetObjectTagging", "s3:PutObjectTagging", "s3:DeleteObjectTagging",
+		"s3:GetObjectVersion", "s3:GetObjectVersionAcl", "s3:PutObjectVersionAcl",
+		"s3:GetObjectVersionAttributes", "s3:GetObjectVersionTagging",
+		"s3:PutObjectVersionTagging", "s3:DeleteObjectVersionTagging",
 	}
-	requestTagActions = []string{"s3:PutObject", "s3:PutObjectTagging"}
+	requestTagActions = []string{
+		"s3:PutObject", "s3:PutObjectTagging", "s3:PutObjectVersionTagging",
+	}
 )
 
 // SetRequestTags gives the tags of the request's document, which
@@ -316,37 +350,43 @@ func setTagKey(keys map[string][]string, name, v string) error {
 }
 
 // evaluatedObject is the object a request's s3:ExistingObjectTag keys were
-// read from: whether there was one, and its ETag, modification time and
-// tags, as one read of it returned them (contracts.StorageProvider's
-// StatObjectTagging).
+// read from: whether there was one, and its ETag, modification time, tags
+// and version ID, the ID of the version read, as one read of it returned
+// them (contracts.StorageProvider's StatObjectTagging).
 type evaluatedObject struct {
 	lastModified time.Time
 	etag         string
+	versionID    string
 	tags         []contracts.Tag
 	found        bool
 }
 
-// existing returns the tags stored for the object t, read once per
-// request, and records which object they are the tags of, which the
-// operation must then act on (see CheckObject): none when there is no
-// such object or bucket, or the key is not one an object can have. A read
-// that fails otherwise fails the request; the tags are never treated as
-// absent.
+// existing returns the tags stored for the object t, the version it names
+// or else the current one, read once per request, and records which
+// object version they are the tags of, which the operation must then act
+// on (see CheckObject): none when there is no such object, version or
+// bucket, when the version read is a delete marker, or when the key or
+// version ID is not one an object can have; the handler answers the
+// error for those. A read that fails otherwise fails the request; the
+// tags are never treated as absent.
 func (c *Caller) existing(t s3api.Target) ([]contracts.Tag, error) {
 	if o, ok := c.evaluated[t]; ok {
 		return o.tags, nil
 	}
 	var o evaluatedObject
+	var marker *contracts.DeleteMarkerError
 	info, err := c.a.policies.StatObjectTagging(c.req.Context(),
-		contracts.ObjectRef{Bucket: t.Bucket, Key: t.Key})
+		contracts.ObjectRef{Bucket: t.Bucket, Key: t.Key, Version: t.VersionID})
 	switch {
 	case errors.Is(err, storage.ErrObjectNotFound), errors.Is(err, storage.ErrBucketNotFound),
-		errors.Is(err, storage.ErrInvalidKey):
+		errors.Is(err, storage.ErrInvalidKey), errors.Is(err, storage.ErrVersionNotFound),
+		errors.Is(err, contracts.ErrInvalidVersionID), errors.As(err, &marker):
 	case err != nil:
 		return nil, fmt.Errorf("authz: read the tags of %s/%s: %w", t.Bucket, t.Key, err)
 	default:
 		o = evaluatedObject{
-			lastModified: info.LastModified, etag: info.ETag, tags: info.Tags, found: true,
+			lastModified: info.LastModified, etag: info.ETag, versionID: info.VersionID,
+			tags: info.Tags, found: true,
 		}
 	}
 	if c.evaluated == nil {
@@ -357,12 +397,14 @@ func (c *Caller) existing(t s3api.Target) ([]contracts.Tag, error) {
 }
 
 // CheckObject checks that info, the object t as the operation opened it,
-// with its Tags, is the object whose tags the request was evaluated with:
-// the same ETag, modification time and tags, so a decision made on the
-// tags of one object is never applied to another written at its key
-// meanwhile, or to the same object retagged meanwhile. The tags are
-// compared too, as a set (sameTagSet), since a retagging changes neither
-// of the other two. When
+// with its Tags and VersionID, is the object version whose tags the
+// request was evaluated with: the same version, ETag, modification time
+// and tags, so a decision made on the tags of one object is never applied
+// to another written at its key meanwhile, even one with the same ETag
+// and modification time that became the current version, or to the same
+// version retagged meanwhile. The tags are compared too, as a set
+// (sameTagSet), since a retagging changes none of the other three. The
+// version IDs are compared as sameVersion does. When
 // it is not, the operation fails with contracts.ErrOperationAborted,
 // S3's 409 OperationAborted, which asks the client to try again; it is
 // not evaluated again against the object opened, a choice, as simpler and
@@ -374,12 +416,26 @@ func (c *Caller) CheckObject(t s3api.Target, info *contracts.ObjectInfo) error {
 	if !ok {
 		return nil
 	}
-	if o.found && o.etag == info.ETag && o.lastModified.Equal(info.LastModified) &&
-		sameTagSet(o.tags, info.Tags) {
+	if o.found && sameVersion(o.versionID, info.VersionID) && o.etag == info.ETag &&
+		o.lastModified.Equal(info.LastModified) && sameTagSet(o.tags, info.Tags) {
 		return nil
 	}
 	return fmt.Errorf("authz: %s/%s changed after the request was evaluated: %w",
 		t.Bucket, t.Key, contracts.ErrOperationAborted)
+}
+
+// sameVersion reports whether a and b, the version IDs of two reads, name
+// the same version: "", which a read of an Unversioned bucket's object
+// reports, is its null version, so a bucket whose versioning was enabled
+// between the two reads still binds its object.
+func sameVersion(a, b string) bool {
+	canon := func(id string) string {
+		if id == "" {
+			return contracts.VersionNull
+		}
+		return id
+	}
+	return canon(a) == canon(b)
 }
 
 // sameTagSet reports whether a and b are the same tag set, in any order:

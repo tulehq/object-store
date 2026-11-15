@@ -464,10 +464,15 @@ func (c *Caller) NotFound(bucket string, err error) error {
 // evaluated in the caller's own account, as AWS lists the caller's own
 // buckets. The deny's message ends with the reason tule.dev/policy gives.
 // An Allow of an owner-only check for a principal of another account is
-// S3's 405 MethodNotAllowed.
+// S3's 405 MethodNotAllowed. On a target that names a version, ch is
+// evaluated as its versionAction, when it has one, for its keys and its
+// deny as well.
 func (c *Caller) evaluate(ch check, t s3api.Target, extra map[string]map[string]string) error {
+	if t.VersionID != "" && ch.versionAction != "" {
+		ch.action = ch.versionAction
+	}
 	resource := resourceARN(ch.kind, t)
-	keys, err := c.context(ch, extra[ch.action])
+	keys, err := c.context(ch, actionKeys(ch, t, extra[ch.action]))
 	if err != nil {
 		return err
 	}
