@@ -11,7 +11,6 @@ import (
 	"errors"
 	"io"
 	"maps"
-	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -20,7 +19,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/aws/smithy-go"
 )
 
 // The test here loads a storage root v0.10.1 wrote, the one
@@ -200,8 +198,7 @@ func versionRoot(t *testing.T, c *s3.Client, fx *rootFixture) versionedIDs {
 	requireEqual(t, len(acl.Grants), 1, "grants of a version written without an ACL")
 	requireLegacyObject(t, c, fx, "legacy", "retagged.txt", "null")
 	requireLegacyObject(t, c, fx, "legacy-writer", "public.txt", "null")
-	const todo = "TODO after PR 5: the legacy null version's tags and ACL by versionId"
-	t.Run(todo, func(t *testing.T) {
+	t.Run("the legacy null version's tags and ACL by versionId", func(t *testing.T) {
 		requireTags(t, c, "retagged.txt", "null",
 			map[string]string{"stage": "new", "reviewed": "yes"})
 		requirePublicRead(t, c, "null")
@@ -352,8 +349,7 @@ func requireLegacyParts(t *testing.T, c *s3.Client, sizes []int64, version strin
 }
 
 // requireTags checks the tags of legacy/key, of version or the current
-// one for "". A read by version skips the test while it answers 501
-// NotImplemented, as it does until tagging by version is served.
+// one for "".
 func requireTags(t *testing.T, c *s3.Client, key, version string, want map[string]string) {
 	t.Helper()
 	in := &s3.GetObjectTaggingInput{Bucket: aws.String("legacy"), Key: aws.String(key)}
@@ -361,9 +357,6 @@ func requireTags(t *testing.T, c *s3.Client, key, version string, want map[strin
 		in.VersionId = aws.String(version)
 	}
 	out, err := c.GetObjectTagging(t.Context(), in)
-	if version != "" {
-		skipNotImplemented(t, err, "GetObjectTagging by versionId")
-	}
 	requireNoErr(t, err, "get tags of "+key)
 	got := map[string]string{}
 	for _, tag := range out.TagSet {
@@ -375,8 +368,7 @@ func requireTags(t *testing.T, c *s3.Client, key, version string, want map[strin
 }
 
 // requirePublicRead checks that legacy-writer/public.txt, of version or
-// the current one for "", has the public-read ACL it was written with. A
-// read by version skips the test while it answers 501 NotImplemented.
+// the current one for "", has the public-read ACL it was written with.
 func requirePublicRead(t *testing.T, c *s3.Client, version string) {
 	t.Helper()
 	in := &s3.GetObjectAclInput{Bucket: aws.String("legacy-writer"), Key: aws.String("public.txt")}
@@ -384,25 +376,11 @@ func requirePublicRead(t *testing.T, c *s3.Client, version string) {
 		in.VersionId = aws.String(version)
 	}
 	acl, err := c.GetObjectAcl(t.Context(), in)
-	if version != "" {
-		skipNotImplemented(t, err, "GetObjectAcl by versionId")
-	}
 	requireNoErr(t, err, "get object acl")
 	requireEqual(t, len(acl.Grants), 2, "public-read grants")
 	requireEqual(t, aws.ToString(acl.Grants[1].Grantee.URI),
 		"http://acs.amazonaws.com/groups/global/AllUsers", "AllUsers grantee")
 	requireEqual(t, acl.Grants[1].Permission, types.PermissionRead, "AllUsers permission")
-}
-
-// skipNotImplemented skips the test when err is the 501 NotImplemented
-// that tagging and ACLs by versionId answer until they are served.
-func skipNotImplemented(t *testing.T, err error, what string) {
-	t.Helper()
-	var apiErr smithy.APIError
-	if errors.As(err, &apiErr) && apiErr.ErrorCode() == "NotImplemented" {
-		requireResponse(t, err, http.StatusNotImplemented)
-		t.Skipf("TODO after PR 5: %s answers 501: %v", what, err)
-	}
 }
 
 // requireNewVersion writes body at bucket/key and checks that it is a new

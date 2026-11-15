@@ -31,15 +31,16 @@ func (m *Module) getObject(ctx gas.Context) error {
 	t := target(ctx)
 	r := ctx.Request()
 
-	// A request names one operation: any other subresource with it, such
-	// as ?versionId, is one not served with it. GetObject itself takes
-	// ?partNumber and ?versionId.
+	// A request names one operation: any other subresource with it is one
+	// not served with it, except ?versionId where the operation takes it.
+	// GetObject itself takes ?partNumber and ?versionId.
 	sub := s3api.Subresource(r)
 	if serve, ok := m.getSubresource(sub); ok {
-		if err := s3api.CheckSubresource(r, sub); err != nil {
+		st, err := subresourceTarget(r, t, sub)
+		if err != nil {
 			return s3api.WriteError(ctx, t, err)
 		}
-		return serve(ctx, t)
+		return serve(ctx, st)
 	}
 	t, err := withVersion(r, t, "partNumber")
 	if err != nil {
@@ -83,6 +84,18 @@ func (m *Module) getSubresource(sub string) (func(gas.Context, s3api.Target) err
 		return m.getObjectAttributes, true
 	}
 	return nil, false
+}
+
+// subresourceTarget returns t with the version r names, for sub, the
+// subresource of an object operation, once it checked that r names no
+// other subresource but ?versionId where the operation takes it: the
+// tagging, ACL and attributes operations do (their API references), and
+// ListParts' ?uploadId does not.
+func subresourceTarget(r *http.Request, t s3api.Target, sub string) (s3api.Target, error) {
+	if sub == "uploadId" {
+		return t, s3api.CheckSubresource(r, sub) //nolint:wrapcheck // an S3 error, answered as is
+	}
+	return withVersion(r, t, sub)
 }
 
 // serveObject answers caller's GetObject of t with obj, open, if it is
@@ -229,15 +242,16 @@ func (m *Module) putObject(ctx gas.Context) error {
 		return m.uploadPart(ctx, t)
 	}
 
-	sub := s3api.Subresource(r)
-	if err := s3api.CheckSubresource(r, sub); err != nil {
-		return s3api.WriteError(ctx, t, err)
-	}
-	switch sub {
-	case "acl":
-		return m.putObjectACL(ctx, t)
-	case "tagging":
-		return m.putObjectTagging(ctx, t)
+	switch sub := s3api.Subresource(r); sub {
+	case "acl", "tagging":
+		st, err := subresourceTarget(r, t, sub)
+		if err != nil {
+			return s3api.WriteError(ctx, t, err)
+		}
+		if sub == "acl" {
+			return m.putObjectACL(ctx, st)
+		}
+		return m.putObjectTagging(ctx, st)
 	}
 	if err := s3api.CheckSubresource(r); err != nil {
 		return s3api.WriteError(ctx, t, err)
@@ -292,19 +306,32 @@ func (m *Module) uploadObject(ctx gas.Context, t s3api.Target) error {
 // on the destination, and its tags are the destination's
 // s3:RequestObjectTag keys (see authz). The copy is made only of the
 // source the request was evaluated for, with the tags it was evaluated
-// with (authz.CheckObject).
+// with (authz.CheckObject). A source named by version is read, and its
+// tags checked, as s3:GetObjectVersion and s3:GetObjectVersionTagging,
+// with its s3:versionid; the destination's s3:PutObject is evaluated
+// without one, and with s3:x-amz-copy-source <bucket>/<key>, without the
+// version. A version copied onto its own key restores it (selfCopy).
 func (m *Module) copyObject(ctx gas.Context, t s3api.Target) error {
 	in, err := copyInput(ctx.Request(), t)
 	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
-	src := s3api.Target{Bucket: in.SrcBucket, Key: in.SrcKey}
+	src := s3api.Target{Bucket: in.SrcBucket, Key: in.SrcKey, VersionID: in.SrcVersion}
 	// s3:PutObject on the destination, then s3:GetObject on the source.
 	g, err := m.authz.AuthorizeAndPin(ctx, ctx.Request(), authz.CopyObject, t, src)
 	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
 	defer g.Release()
+	if selfCopy(in) {
+		cfg, vErr := m.storage.GetBucketVersioning(g.Context(), t.Bucket)
+		if vErr != nil {
+			return s3api.WriteError(ctx, t, vErr)
+		}
+		if cfg.Status == contracts.Unversioned {
+			return s3api.WriteError(ctx, t, errCopyToItself())
+		}
+	}
 
 	// The copy is encrypted and given an ACL as its own request says, or
 	// its bucket's default, not as its source was.
@@ -330,11 +357,12 @@ func (m *Module) copyObject(ctx gas.Context, t s3api.Target) error {
 
 	out, err := m.storage.CopyObject(g.Context(), in)
 	if err != nil {
-		return s3api.WriteError(ctx, t, m.copyNotFound(g, in, err))
+		return s3api.WriteError(ctx, t, m.copyNotFound(g, in, copySourceError(err)))
 	}
 	info := &out.ObjectInfo
 
 	setVersionHeader(ctx.ResponseWriter(), info.VersionID)
+	setCopySourceVersionHeader(ctx.ResponseWriter(), out.SourceVersionID)
 	setEncryptionHeaders(ctx.ResponseWriter(), ws.encryption)
 	return ctx.XML(http.StatusOK, s3api.NewCopyObjectResult(info.ETag, info.LastModified))
 }
@@ -348,8 +376,9 @@ func (m *Module) copyNotFound(g *authz.Grant, in contracts.CopyObjectInput, err 
 		return err
 	}
 	bucket := in.DstBucket
-	if _, sErr := m.storage.StatObject(g.Context(),
-		contracts.ObjectRef{Bucket: in.SrcBucket, Key: in.SrcKey}); errors.Is(sErr,
+	if _, sErr := m.storage.StatObject(g.Context(), contracts.ObjectRef{
+		Bucket: in.SrcBucket, Key: in.SrcKey, Version: in.SrcVersion,
+	}); errors.Is(sErr,
 		storage.ErrObjectNotFound) {
 		bucket = in.SrcBucket
 	}
@@ -418,10 +447,11 @@ func (m *Module) deleteObject(ctx gas.Context) error {
 	}
 
 	if s3api.Subresource(r) == "tagging" {
-		if err := s3api.CheckSubresource(r, "tagging"); err != nil {
+		st, err := subresourceTarget(r, t, "tagging")
+		if err != nil {
 			return s3api.WriteError(ctx, t, err)
 		}
-		return m.deleteObjectTagging(ctx, t)
+		return m.deleteObjectTagging(ctx, st)
 	}
 	t, err := withVersion(r, t)
 	if err != nil {
@@ -477,6 +507,17 @@ func setVersionHeader(w http.ResponseWriter, id string) {
 	}
 }
 
+// setCopySourceVersionHeader sets x-amz-copy-source-version-id to id,
+// the version a CopyObject or UploadPartCopy copied, unless id is "", as
+// it is for a source in an Unversioned bucket: "The version of the source
+// object that was copied, if you have enabled versioning on the source
+// bucket." (UploadPartCopy API reference).
+func setCopySourceVersionHeader(w http.ResponseWriter, id string) {
+	if id != "" {
+		w.Header().Set(s3api.HeaderCopySourceVersionID, id)
+	}
+}
+
 // writeReadError answers a GetObject or HeadObject of t that failed with
 // err: the AccessDenied g.NotFound gives a caller who may not list the
 // bucket, or err. A delete marker found adds x-amz-delete-marker and the
@@ -487,14 +528,47 @@ func setVersionHeader(w http.ResponseWriter, id string) {
 // tells nothing of the key.
 func writeReadError(ctx gas.Context, g *authz.Grant, t s3api.Target, err error) error {
 	err = g.NotFound(t.Bucket, err)
-	var dm *contracts.DeleteMarkerError
-	if errors.As(err, &dm) {
-		h := ctx.ResponseWriter().Header()
-		h.Set(s3api.HeaderDeleteMarker, "true")
-		h.Set(s3api.HeaderVersionID, dm.VersionID)
+	if dm := deleteMarker(err, true); dm != nil {
+		setDeleteMarkerHeaders(ctx.ResponseWriter(), dm)
 		if !dm.Current {
-			h.Set("Last-Modified", dm.LastModified.UTC().Format(http.TimeFormat))
+			ctx.SetHeader("Last-Modified", dm.LastModified.UTC().Format(http.TimeFormat))
 		}
 	}
 	return s3api.WriteError(ctx, t, err)
+}
+
+// writeSubresourceError answers a tagging or ACL operation of t that
+// failed with err. A delete marker named by version is 405
+// MethodNotAllowed with x-amz-delete-marker and the marker's
+// x-amz-version-id, as a GetObject of it is, without its Last-Modified,
+// which the S3 User Guide's "Working with delete markers" gives "only
+// when using the HeadObject or GetObject API operations"; a delete
+// marker has no tags and no ACL ("A delete marker isn't associated with
+// an access control list (ACL) value", the same page). A current marker
+// is the plain 404 NoSuchKey of a missing object, as the tagging and ACL
+// API references list no x-amz-delete-marker header.
+func writeSubresourceError(ctx gas.Context, t s3api.Target, err error) error {
+	if dm := deleteMarker(err, false); dm != nil {
+		setDeleteMarkerHeaders(ctx.ResponseWriter(), dm)
+	}
+	return s3api.WriteError(ctx, t, err)
+}
+
+// deleteMarker returns the delete marker err is the error of, one named by
+// version or, with current, the current version, nil for none. err must
+// already be the error answered, so an AccessDenied, which is not a
+// marker's, carries no marker header.
+func deleteMarker(err error, current bool) *contracts.DeleteMarkerError {
+	var dm *contracts.DeleteMarkerError
+	if !errors.As(err, &dm) || dm.Current && !current {
+		return nil
+	}
+	return dm
+}
+
+// setDeleteMarkerHeaders sets x-amz-delete-marker and dm's
+// x-amz-version-id.
+func setDeleteMarkerHeaders(w http.ResponseWriter, dm *contracts.DeleteMarkerError) {
+	w.Header().Set(s3api.HeaderDeleteMarker, "true")
+	w.Header().Set(s3api.HeaderVersionID, dm.VersionID)
 }

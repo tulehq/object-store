@@ -37,10 +37,20 @@ var objectAttributes = []string{
 // x-amz-max-parts and x-amz-part-number-marker, each with its number and
 // size. A missing object is NoSuchKey or AccessDenied as for GetObject.
 // The attributes are answered only for the object the request was
-// evaluated for (authz.CheckObject).
+// evaluated for (authz.CheckObject). With ?versionId they are that
+// version's, and need s3:GetObjectVersion and
+// s3:GetObjectVersionAttributes: "If you pass a version ID in your
+// request, you need both" (its API reference). It answers the version's
+// x-amz-version-id in a bucket that is not Unversioned, and a delete
+// marker, current or named by version, with x-amz-delete-marker and the
+// marker's x-amz-version-id (the response headers its API reference
+// lists), without the Last-Modified the S3 User Guide's "Working with
+// delete markers" gives only to GetObject and HeadObject.
 func (m *Module) getObjectAttributes(ctx gas.Context, t s3api.Target) error {
 	r := ctx.Request()
-	// s3:GetObject, then s3:GetObjectAttributes, both on the object.
+	// s3:GetObject, then s3:GetObjectAttributes, both on the object, each
+	// evaluated as its version action on a version. The two checks and
+	// CheckObject below share t, so both are bound to the version read.
 	g, err := m.authz.AuthorizeAndPin(ctx, r, authz.GetObjectAttributes, t, t)
 	if err != nil {
 		return s3api.WriteError(ctx, t, err)
@@ -53,10 +63,13 @@ func (m *Module) getObjectAttributes(ctx gas.Context, t s3api.Target) error {
 	}
 	// The object is read with its tags, to check it against those it was
 	// evaluated with.
-	info, err := m.storage.StatObjectTagging(g.Context(),
-		contracts.ObjectRef{Bucket: t.Bucket, Key: t.Key})
+	info, err := m.storage.StatObjectTagging(g.Context(), objectRef(t))
 	if err != nil {
-		return s3api.WriteError(ctx, t, g.NotFound(t.Bucket, err))
+		err = g.NotFound(t.Bucket, err)
+		if dm := deleteMarker(err, true); dm != nil {
+			setDeleteMarkerHeaders(ctx.ResponseWriter(), dm)
+		}
+		return s3api.WriteError(ctx, t, err)
 	}
 	if err = g.CheckObject(t, info); err != nil {
 		return s3api.WriteError(ctx, t, err)
@@ -65,6 +78,7 @@ func (m *Module) getObjectAttributes(ctx gas.Context, t s3api.Target) error {
 		return s3api.WriteError(ctx, t, err)
 	}
 	ctx.SetHeader("Last-Modified", info.LastModified.UTC().Format(http.TimeFormat))
+	setVersionHeader(ctx.ResponseWriter(), info.VersionID)
 	return ctx.XML(http.StatusOK, q.response(info))
 }
 

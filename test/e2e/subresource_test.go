@@ -18,27 +18,32 @@ import (
 )
 
 // versionIDRefusal is the answer to method with query, a subresource
-// with ?versionId=X: 501 naming ?versionId, or, as DELETE serves neither
-// ?acl nor ?partNumber, naming that subresource; and for a GET of
-// ?partNumber, a GetObject of version X, 400 for an ID the server does not
-// issue.
+// with ?versionId=X. The tagging and ACL operations, and a GET of
+// ?partNumber, a GetObject of that version's part, read version X, which
+// is 400 for an ID the server does not issue. An UploadPart, a PUT of
+// ?partNumber, takes no version, so it is 501 naming ?versionId; DELETE
+// serves neither ?acl nor ?partNumber, so it is 501 naming that
+// subresource.
 func versionIDRefusal(method, query string) (int, string, string) {
-	if method == http.MethodGet && query == "partNumber=1&versionId=X" {
+	sub := strings.SplitN(strings.SplitN(query, "&", 2)[0], "=", 2)[0]
+	switch {
+	case method == http.MethodGet,
+		method == http.MethodPut && sub != "partNumber",
+		method == http.MethodDelete && sub == "tagging":
 		return http.StatusBadRequest, "InvalidArgument", "Invalid version id specified"
-	}
-	refused := "versionId"
-	if method == http.MethodDelete && query != "tagging&versionId=X" {
-		refused = strings.SplitN(strings.SplitN(query, "&", 2)[0], "=", 2)[0]
+	case method == http.MethodPut:
+		return http.StatusNotImplemented, "NotImplemented",
+			"The ?versionId subresource is not supported."
 	}
 	return http.StatusNotImplemented, "NotImplemented",
-		"The ?" + refused + " subresource is not supported."
+		"The ?" + sub + " subresource is not supported."
 }
 
 // TestVersionIDWithSubresource checks that ?versionId with a subresource
-// not served with it is refused with 501 NotImplemented, rather than
-// ignored so the request acts on the current object. A GET of
-// ?partNumber with ?versionId is a GetObject of that version's part, so it
-// reads version X, which is not one the server issues.
+// is either served for the version it names or refused with 501
+// NotImplemented, never ignored so the request acts on the current
+// object: version X is not one the server issues, so a request that reads
+// it is 400, and the object is untouched.
 func TestVersionIDWithSubresource(t *testing.T) {
 	srv := startLive(t, nil)
 	c := clientFor(srv)

@@ -122,14 +122,16 @@ func (m *Module) uploadPart(ctx gas.Context, t s3api.Target) error {
 // x-amz-copy-source-if-* conditions hold of it and it is the source the
 // request was evaluated for (authz.CheckObject). It answers a
 // CopyPartResult and, as UploadPart does, the encryption headers of the
-// upload's object.
+// upload's object, and the x-amz-copy-source-version-id of a source in a
+// bucket that is not Unversioned. A source named by version is read as
+// s3:GetObjectVersion, with its s3:versionid, and the destination's
+// s3:PutObject is evaluated as copyObject's is.
 func (m *Module) uploadPartCopy(ctx gas.Context, t s3api.Target) error {
 	r := ctx.Request()
-	srcBucket, srcKey, err := parseCopySource(r.Header.Get("X-Amz-Copy-Source"))
+	src, err := parseCopySource(r.Header.Get("X-Amz-Copy-Source"))
 	if err != nil {
 		return s3api.WriteError(ctx, t, err)
 	}
-	src := s3api.Target{Bucket: srcBucket, Key: srcKey}
 	// s3:PutObject on the destination, then s3:GetObject on the source.
 	g, err := m.authz.AuthorizeAndPin(ctx, r, authz.UploadPartCopy, t, src)
 	if err != nil {
@@ -140,8 +142,8 @@ func (m *Module) uploadPartCopy(ctx gas.Context, t s3api.Target) error {
 	q := r.URL.Query()
 	in := contracts.UploadPartCopyInput{
 		Bucket: t.Bucket, Key: t.Key, UploadID: q.Get("uploadId"),
-		SrcBucket: srcBucket, SrcKey: srcKey, SourceCondition: sourceCondition(r),
-		SourceCheck: g.ObjectCheck(src),
+		SrcBucket: src.Bucket, SrcKey: src.Key, SrcVersion: src.VersionID,
+		SourceCondition: sourceCondition(r), SourceCheck: g.ObjectCheck(src),
 	}
 	if in.UploadID == "" {
 		return s3api.WriteError(ctx, t,
@@ -156,8 +158,9 @@ func (m *Module) uploadPartCopy(ctx gas.Context, t s3api.Target) error {
 
 	out, err := m.storage.UploadPartCopy(g.Context(), in)
 	if err != nil {
-		return s3api.WriteError(ctx, t, g.NotFound(srcBucket, err))
+		return s3api.WriteError(ctx, t, g.NotFound(src.Bucket, copySourceError(err)))
 	}
+	setCopySourceVersionHeader(ctx.ResponseWriter(), out.SourceVersionID)
 	setEncryptionHeaders(ctx.ResponseWriter(), encryptionOf(out.Headers))
 	return ctx.XML(http.StatusOK, s3api.NewCopyPartResult(out.Part.ETag, out.Part.LastModified))
 }
