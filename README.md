@@ -609,7 +609,7 @@ refused with `400 InvalidArgument`, which bounds the cost of evaluating it.
   evaluates any key, so a caller with no permission learns whether a bucket
   exists; S3's order is not documented either.
 
-### Changes in this version
+### Changes in v0.14.0
 
 - **Behavior:** POST Object, the browser-based upload of a form signed
   with a POST policy (`PresignPostObject` in the AWS SDKs), is served
