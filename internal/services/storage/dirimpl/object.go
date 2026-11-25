@@ -304,6 +304,18 @@ func (s *Service) PutObject(
 	return s.putObjectAs(ctx, bucket, key, body, in, cond, contracts.EventObjectCreatedPut)
 }
 
+// PostObject is PutObject for a POST Object form: its event is
+// ObjectCreated:Post.
+func (s *Service) PostObject(
+	ctx context.Context,
+	bucket, key string,
+	body io.Reader,
+	in contracts.PutObjectInput,
+) (*contracts.ObjectInfo, error) {
+	return s.putObjectAs(ctx, bucket, key, body, in, contracts.Precondition{},
+		contracts.EventObjectCreatedPost)
+}
+
 // putObjectAs is PutObject for a write that causes event once committed.
 func (s *Service) putObjectAs(
 	ctx context.Context,

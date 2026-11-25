@@ -354,6 +354,10 @@ var writeOps = map[string]func(f *fixture) (*contracts.ObjectInfo, error){
 		return f.s.PutObject(f.ctx, "bucket", "k", strings.NewReader("new"),
 			contracts.PutObjectInput{ACL: []byte("<new/>")}, contracts.Precondition{})
 	},
+	"post": func(f *fixture) (*contracts.ObjectInfo, error) {
+		return f.s.PostObject(f.ctx, "bucket", "k", strings.NewReader("new"),
+			contracts.PutObjectInput{ACL: []byte("<new/>")})
+	},
 	"copy": func(f *fixture) (*contracts.ObjectInfo, error) {
 		out, err := f.s.CopyObject(f.ctx, contracts.CopyObjectInput{
 			SrcBucket: "bucket", SrcKey: "src", DstBucket: "bucket", DstKey: "k",

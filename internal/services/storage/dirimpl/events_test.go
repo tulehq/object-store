@@ -261,6 +261,7 @@ func none(*eventFixture, contracts.Versioning, string) *contracts.BucketEvent { 
 // on the keys eventSetup leaves.
 var eventOps = map[string]eventOp{
 	"put":  {run: writeOp(writeOps["put"]), want: created(contracts.EventObjectCreatedPut)},
+	"post": {run: writeOp(writeOps["post"]), want: created(contracts.EventObjectCreatedPost)},
 	"copy": {run: writeOp(writeOps["copy"]), want: created(contracts.EventObjectCreatedCopy)},
 	"complete": {
 		run:  writeOp(writeOps["complete"]),

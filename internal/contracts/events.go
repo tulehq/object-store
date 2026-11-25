@@ -20,6 +20,7 @@ type EventName string
 // configuration are accepted and never fire.
 const (
 	EventObjectCreatedPut                       EventName = "ObjectCreated:Put"
+	EventObjectCreatedPost                      EventName = "ObjectCreated:Post"
 	EventObjectCreatedCopy                      EventName = "ObjectCreated:Copy"
 	EventObjectCreatedCompleteMultipartUpload   EventName = "ObjectCreated:CompleteMultipartUpload"
 	EventObjectRemovedDelete                    EventName = "ObjectRemoved:Delete"

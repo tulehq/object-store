@@ -53,7 +53,8 @@ Settings come from environment variables prefixed with `TULE_`, and from a
 | `TULE_GasEnv` | | `development` logs at trace level, `testing` disables logging |
 
 The server refuses to start without credentials, and every request must be
-signed with them (SigV4) or carry a presigned URL made with them. Any web page
+signed with them (SigV4), carry a presigned URL made with them, or, for a
+[POST Object](#post-object) form, carry a POST policy signed with them. Any web page
 you visit can send requests to a server on localhost; signatures are what stop
 it from using this one.
 
@@ -488,9 +489,9 @@ CompleteMultipartUpload, `false` for CreateMultipartUpload, UploadPart and
 UploadPartCopy, as "Enforce conditional writes" (S3 User Guide) uses it
 (S3 documents no value for UploadPartCopy; `false` is a choice, as for the
 other multipart steps); the object tag keys (below); and
-`s3:x-amz-content-sha256`, `s3:authType` (`REST-QUERY-STRING` for a
-presigned URL, by the same test the signature check makes, else
-`REST-HEADER`), `s3:signatureversion` and `s3:ResourceAccount` (every
+`s3:x-amz-content-sha256`, `s3:authType` (`POST` for a
+[POST Object](#post-object) form, `REST-QUERY-STRING` for a presigned URL,
+by the same test the signature check makes, else `REST-HEADER`), `s3:signatureversion` and `s3:ResourceAccount` (every
 action; the bucket owner, `TULE_Auth_AccountID`, or, for ListBuckets, the
 caller's own account). The reference lists `s3:ResourceAccount`,
 `s3:TlsVersion`, `s3:authType`, `s3:signatureAge`, `s3:signatureversion`
@@ -608,8 +609,13 @@ refused with `400 InvalidArgument`, which bounds the cost of evaluating it.
   evaluates any key, so a caller with no permission learns whether a bucket
   exists; S3's order is not documented either.
 
-### Changes in this version
+### Changes in v0.14.0
 
+- **Behavior:** POST Object, the browser-based upload of a form signed
+  with a POST policy (`PresignPostObject` in the AWS SDKs), is served
+  ([POST Object](#post-object)); such a form was refused as an unsigned
+  request (`403 AccessDenied`). Its `s3:authType` is `POST`, and it sends
+  `ObjectCreated:Post` events.
 - **Behavior:** the `server started` log is written once the port is
   bound, and its `addr` is the bound address (such as `[::]:9000`) where it
   was the configured one (`:9000`); it also has a `tls` field. A port that
@@ -1337,6 +1343,78 @@ missing object is `404 NoSuchKey` to a caller allowed `s3:ListBucket` and
   not the number it was uploaded and completed with
   ([Differences from S3](#differences-from-s3)).
 
+## POST Object
+
+A POST to a bucket alone (`/<bucket>` path-style, or `/` on a
+`<bucket>.<TULE_Server_Domain>` host) with a `multipart/form-data` body,
+no `Authorization` header and no query is a POST Object: a browser-based
+upload whose form carries a POST policy signed with SigV4, as the AWS
+SDKs' `PresignPostObject` makes one ("POST Object" and "POST Policy", S3
+API Reference). Its fields come first and the `file` last; parts after the
+file are not read. Field names match regardless of case, as the SDKs send
+`X-Amz-Date` where the reference writes `x-amz-date`.
+
+Before any of the file is read, the form is checked in this order:
+
+1. `key` is required (`400 UserKeyMustBeSpecified`), and so is a `file`
+   part (`400 IncorrectNumberOfFilesInPostRequest`). The fields before the
+   file may total 64 KiB, a choice (`400
+   MaxPostPreDataLengthExceededError`); a field sent twice is refused with
+   `400 InvalidArgument`, a choice, as S3 does not document which value it
+   would take. `${filename}` in the key is replaced with the file's name.
+2. A form without `policy` is anonymous and refused with `403
+   AccessDenied`, as no bucket here is publicly writable. `x-amz-algorithm`
+   must be `AWS4-HMAC-SHA256`, and `x-amz-credential`, `x-amz-date` and
+   `x-amz-signature` are required (`400 InvalidArgument`); the credential
+   must be scoped to `s3` on the day of `x-amz-date`.
+3. The signature, the hex HMAC-SHA256 of the base64 policy as sent, keyed
+   with the credential's signing key, must match (`403
+   SignatureDoesNotMatch`). The key is looked up as a signed request's is,
+   with its `x-amz-security-token`, so an unknown key, a bad or expired
+   session token, or identity failing are answered as for a signed request.
+4. The policy must decode, as base64 JSON with an `expiration` and
+   `conditions` (`400 InvalidPolicyDocument`), and must not have expired.
+5. Every condition must hold: exact matches as `{"field": "value"}` or
+   `["eq", "$field", "value"]`, `["starts-with", "$field", "prefix"]`
+   (a `starts-with` on `Content-Type` holds of a comma-separated list when
+   each item does), and `["content-length-range", min, max]`. `bucket` is
+   matched against the bucket posted to. A field the form does not send is
+   matched as empty.
+6. Every field the form sends must be named by a condition, except
+   `x-amz-signature`, `file`, `policy` and `x-ignore-*` fields, so no field
+   is added that the policy did not sign.
+
+An expired policy, a condition that fails and a field no condition names
+are refused with `403 AccessDenied` and a message starting `Invalid
+according to Policy:`, such as `Invalid according to Policy: Policy
+Condition failed: {"Content-Type":"application/pdf"}` (the condition as the
+policy has it) or `Invalid according to Policy: Extra input fields:
+x-amz-meta-owner`. That code and prefix are a choice, modeled on what S3
+is reported to answer and not verified against it; S3's error code list
+describes the condition as `400 InvalidPolicyDocument`, which is answered
+here only to a policy that does not decode.
+
+The fields acted on are `key`, `Content-Type`, `success_action_status`,
+and the signing fields above. Any other field the policy covers, such as
+`acl`, `tagging`, `x-amz-meta-*`, `Cache-Control`,
+`x-amz-server-side-encryption`, `x-amz-checksum-*` or
+`success_action_redirect`, is refused with `501 NotImplemented` rather
+than ignored. The request's own headers set nothing: the object gets the
+form's `Content-Type` and its bucket's defaults, as a PutObject without
+headers would.
+
+The form is then evaluated as `s3:PutObject` on the key for the principal
+whose key signed the policy, with `s3:authType` `POST`, and the file is
+stored as PutObject stores a body. A file outside `content-length-range` is
+refused with `400 EntityTooLarge` or `400 EntityTooSmall` once that is
+known, and nothing is stored: an object already at the key is left as it
+was. A stored upload is answered `204 No Content` with an empty body, or
+`200 OK` with `success_action_status` `200`; `201`, which answers an XML
+document, is refused with `501 NotImplemented`, and any other value is
+`204`, as on S3. The response has `ETag`, `x-amz-version-id`, the
+encryption headers and `x-amz-expiration`, as PutObject's does, and the
+upload sends an `ObjectCreated:Post` event.
+
 ## Versioning
 
 PutBucketVersioning (`PUT /<bucket>?versioning`, `200` with no body) sets a
@@ -1880,6 +1958,7 @@ request that fails or is refused, a precondition failure included:
 | Operation | Event | Object fields |
 |---|---|---|
 | PutObject, presigned PUTs included | `ObjectCreated:Put` | `key`, `size`, `eTag`, `versionId`, `sequencer` |
+| [POST Object](#post-object) | `ObjectCreated:Post` | as Put |
 | CopyObject (the destination bucket's configuration) | `ObjectCreated:Copy` | as Put, and `"hasObjectAnnotation": false` |
 | CompleteMultipartUpload, UploadPartCopy parts included | `ObjectCreated:CompleteMultipartUpload` | as Put; `eTag` is `<md5>-<parts>` |
 | DeleteObject, or a key of DeleteObjects, in an Unversioned bucket, of an object that existed | `ObjectRemoved:Delete` | `key`, `sequencer` |
@@ -1894,7 +1973,7 @@ value of the response's `x-amz-version-id`. Lifecycle expirations send
 the `LifecycleExpiration` events ([Lifecycle events](#lifecycle-events)).
 The other event types a configuration accepts
 (restore, replication, reduced redundancy, Intelligent-Tiering, object
-annotation and retention, `ObjectCreated:Post`, `LifecycleTransition`)
+annotation and retention, `LifecycleTransition`)
 never fire, as their features are not served. Overlapping configurations
 are refused, so an event matches at most one configuration and is sent
 once.
@@ -2128,7 +2207,8 @@ as on S3. Treat both as opaque; their format may change.
   (ranges, `partNumber`, `response-*` overrides, conditional GETs), HeadObject,
   CopyObject (`COPY` and `REPLACE` metadata and tagging directives,
   `x-amz-copy-source-if-*` conditions), DeleteObject, DeleteObjects,
-  GetObjectAttributes ([above](#object-attributes)), and `?versionId` on
+  GetObjectAttributes ([above](#object-attributes)), POST Object
+  ([above](#post-object)), and `?versionId` on
   GetObject, HeadObject and DeleteObject and `VersionId` on DeleteObjects
   ([above](#versioning)). PutObject, CopyObject, GetObject and HeadObject
   answer `x-amz-expiration` ([above](#lifecycle)).
@@ -2220,8 +2300,8 @@ as on S3. Treat both as opaque; their format may change.
   as on S3. Whoever holds such a URL chooses the document it sends, so the
   URL is a bearer grant over every key in the bucket for that operation:
   any keys to delete, or any of the upload's parts to complete.
-- **Not implemented** (requests return `501 NotImplemented`): MFA delete,
-  object lock, and browser POST-policy uploads.
+- **Not implemented** (requests return `501 NotImplemented`): MFA delete
+  and object lock.
 - **Lifecycle transitions are never applied**, so no object changes
   storage class ([Lifecycle](#lifecycle)).
 - **Version listings name no owner.** ListObjectVersions answers no

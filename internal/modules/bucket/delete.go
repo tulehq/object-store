@@ -11,6 +11,7 @@ import (
 
 	"tule.dev/object-store/internal/authz"
 	"tule.dev/object-store/internal/contracts"
+	"tule.dev/object-store/internal/postpolicy"
 	"tule.dev/object-store/internal/s3api"
 )
 
@@ -18,9 +19,31 @@ import (
 // 1024 bytes each, plus markup, stays well under it.
 const maxDeleteBody = 2 << 20
 
-// postBucket serves the POST bucket operations. Only DeleteObjects (?delete)
-// is supported.
+// postBucket serves the POST bucket operations: POST Object, a form the
+// signature middleware verified against its policy
+// (postpolicy.FromContext), which the object module stores, and
+// DeleteObjects.
 func (m *Module) postBucket(ctx gas.Context) error {
+	if up, ok := postpolicy.FromContext(ctx.Request().Context()); ok {
+		return m.postObject(ctx, up)
+	}
+	return m.deleteObjects(ctx)
+}
+
+// postObject hands up, the POST Object posted to the route's bucket, to
+// the object module. The middleware read its bucket before virtualHost; a
+// route that names another is a mistake, which fails closed.
+func (m *Module) postObject(ctx gas.Context, up *postpolicy.Upload) error {
+	if bucket := ctx.Param("bucket"); up.Bucket != bucket {
+		return s3api.WriteError(ctx, s3api.Target{Bucket: bucket}, fmt.Errorf(
+			"bucket: POST Object verified for bucket %q is routed to %q", up.Bucket, bucket))
+	}
+	return m.objects.PostObject(ctx, up)
+}
+
+// deleteObjects serves DeleteObjects (?delete), the only other POST bucket
+// operation supported.
+func (m *Module) deleteObjects(ctx gas.Context) error {
 	bucket := ctx.Param("bucket")
 	target := s3api.Target{Bucket: bucket}
 	r := ctx.Request()
