@@ -148,7 +148,7 @@ func verifyAs(t *testing.T, v *sigv4.Verifier, id string) error {
 }
 
 func TestVerifierWithoutIdentityKnowsOnlyTheRootKey(t *testing.T) {
-	v, err := newVerifier(&authSettings{AccessKeyID: "root", SecretAccessKey: "secret"})
+	v, _, err := newVerifier(&authSettings{AccessKeyID: "root", SecretAccessKey: "secret"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +167,7 @@ func TestVerifierWithoutIdentityKnowsOnlyTheRootKey(t *testing.T) {
 func TestVerifierFailsClosedWhenIdentityIsUnreachable(t *testing.T) {
 	srv := httptest.NewServer(http.NotFoundHandler())
 	srv.Close()
-	v, err := newVerifier(&authSettings{
+	v, _, err := newVerifier(&authSettings{
 		AccessKeyID: "root", SecretAccessKey: "secret", IdentityEndpoint: srv.URL,
 	})
 	if err != nil {
@@ -197,7 +197,7 @@ func TestVerifierFailsClosedWhenIdentityHangs(t *testing.T) {
 	identityTimeout = 100 * time.Millisecond
 	t.Cleanup(func() { identityTimeout = saved })
 
-	v, err := newVerifier(&authSettings{
+	v, _, err := newVerifier(&authSettings{
 		AccessKeyID: "root", SecretAccessKey: "secret", IdentityEndpoint: srv.URL,
 	})
 	if err != nil {
@@ -218,7 +218,7 @@ func TestVerifierFailsClosedWhenIdentityHangs(t *testing.T) {
 // account's for the root key, its peer's address, and the request and host
 // IDs its response carries; a request without a principal gets none.
 func TestEventSourceRecordsTheRequest(t *testing.T) {
-	v, err := newVerifier(&authSettings{
+	v, keys, err := newVerifier(&authSettings{
 		AccessKeyID: "root", SecretAccessKey: "secret", AccountID: "123456789012",
 	})
 	if err != nil {
@@ -226,7 +226,7 @@ func TestEventSourceRecordsTheRequest(t *testing.T) {
 	}
 	var got contracts.EventSource
 	var found bool
-	h := httpx.RequestID(verifySignature(v, "")(eventSource(http.HandlerFunc(
+	h := httpx.RequestID(verifySignature(v, keys, "")(eventSource(http.HandlerFunc(
 		func(_ http.ResponseWriter, r *http.Request) {
 			got, found = contracts.EventSourceFrom(r.Context())
 		}))))

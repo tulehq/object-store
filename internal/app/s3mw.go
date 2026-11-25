@@ -33,15 +33,16 @@ var identityTimeout = 10 * time.Second
 // payloads, the path encoded once, Host and X-Amz-Date signed (a presigned
 // URL signs its date in the query), credentials scoped to s3, and failures
 // answered with S3's errors. The credential's region is not checked, so a
-// client may sign for any region.
-func newVerifier(auth *authSettings) (*sigv4.Verifier, error) {
+// client may sign for any region. It also returns the keys it verifies
+// with, which POST Object policies are verified with too.
+func newVerifier(auth *authSettings) (*sigv4.Verifier, sigv4.KeySource, error) {
 	root, err := sigv4.NewStaticKey(sigv4.StaticKeyConfig{
 		AccessKeyID:     auth.AccessKeyID,
 		SecretAccessKey: auth.SecretAccessKey,
 		AccountID:       auth.AccountID,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("app: failed to create the signing key: %w", err)
+		return nil, nil, fmt.Errorf("app: failed to create the signing key: %w", err)
 	}
 	var keys sigv4.KeySource = root
 	if auth.IdentityEndpoint != "" {
@@ -52,7 +53,7 @@ func newVerifier(auth *authSettings) (*sigv4.Verifier, error) {
 			SecretAccessKey: auth.SecretAccessKey,
 		})
 		if kErr != nil {
-			return nil, fmt.Errorf("app: failed to create the identity key source: %w", kErr)
+			return nil, nil, fmt.Errorf("app: failed to create the identity key source: %w", kErr)
 		}
 		keys = sigv4.Chain(root, identity)
 	}
@@ -68,9 +69,9 @@ func newVerifier(auth *authSettings) (*sigv4.Verifier, error) {
 		sigv4.WithErrorMap(s3AuthError),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("app: failed to create the signature verifier: %w", err)
+		return nil, nil, fmt.Errorf("app: failed to create the signature verifier: %w", err)
 	}
-	return v, nil
+	return v, keys, nil
 }
 
 // s3AuthErrors are the S3 errors a verification failure is answered with.
@@ -162,11 +163,22 @@ func s3AuthError(e *sigv4.Error) error {
 // CORS preflights, which browsers send without credentials, never reach
 // it: bucketCORS, which runs before, answers every one, so a middleware
 // order that let one through would fail closed here.
-func verifySignature(v *sigv4.Verifier, domain string) func(http.Handler) http.Handler {
+//
+// A POST Object form (formBucket) is verified against the POST policy it
+// carries instead, with keys, the keys v verifies with (serveForm).
+func verifySignature(
+	v *sigv4.Verifier,
+	keys sigv4.KeySource,
+	domain string,
+) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if isProbe(r.URL.Path) && hostBucket(r.Host, domain) == "" {
 				next.ServeHTTP(w, r)
+				return
+			}
+			if bucket, ok := formBucket(r, domain); ok {
+				serveForm(w, r, next, keys, bucket)
 				return
 			}
 			verified, err := v.Verify(r)

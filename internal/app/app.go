@@ -36,7 +36,7 @@ func New(cfg *Config, extra ...gas.Option) (*gas.App, error) {
 	if lErr != nil {
 		return nil, lErr
 	}
-	verifier, vErr := newVerifier(cfg.Auth)
+	verifier, keys, vErr := newVerifier(cfg.Auth)
 	if vErr != nil {
 		return nil, vErr
 	}
@@ -72,7 +72,7 @@ func New(cfg *Config, extra ...gas.Option) (*gas.App, error) {
 	ready := make(chan struct{})
 	registerAppServices(app, cfg, verifier, bound, ready, implicitACL, queues, functions)
 	registerAppModules(app, cfg)
-	installMiddleware(app.Router(), cfg, logger, verifier)
+	installMiddleware(app.Router(), cfg, logger, verifier, keys)
 	app.ReadyFunc(createBuckets(cfg.Storage.Buckets))
 	app.ReadyFunc(recoverEvents(logger))
 	// Last, so no lifecycle rule applies and no event is delivered before
@@ -264,7 +264,13 @@ func recoverEvents(logger gas.Logger) func(*gas.ServiceContainer) error {
 	}
 }
 
-func installMiddleware(r *gas.Router, cfg *Config, logger gas.Logger, verifier *sigv4.Verifier) {
+func installMiddleware(
+	r *gas.Router,
+	cfg *Config,
+	logger gas.Logger,
+	verifier *sigv4.Verifier,
+	keys sigv4.KeySource,
+) {
 	r.UseMiddlewareFunc(nil, httpx.RequestID)
 
 	r.UseMiddlewareFunc(nil, middleware.ClientIPFromXFFTrustedProxies(1))
@@ -277,7 +283,7 @@ func installMiddleware(r *gas.Router, cfg *Config, logger gas.Logger, verifier *
 	// answered, and so the CORS headers reach a page on its errors too.
 	r.UseMiddlewareFunc(nil, bucketCORS(cfg.Server.Domain))
 
-	r.UseMiddlewareFunc(nil, verifySignature(verifier, cfg.Server.Domain))
+	r.UseMiddlewareFunc(nil, verifySignature(verifier, keys, cfg.Server.Domain))
 	// After the request IDs and the signature, whose values it records.
 	r.UseMiddlewareFunc(nil, eventSource)
 	if cfg.Server.Domain != "" {

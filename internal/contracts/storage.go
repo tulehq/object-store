@@ -234,6 +234,14 @@ type StorageProvider interface {
 		in PutObjectInput,
 		cond Precondition,
 	) (*ObjectInfo, error)
+	// PostObject is PutObject for a POST Object form, whose event is
+	// ObjectCreated:Post; it takes no precondition.
+	PostObject(
+		ctx context.Context,
+		bucket, key string,
+		body io.Reader,
+		in PutObjectInput,
+	) (*ObjectInfo, error)
 	CopyObject(ctx context.Context, in CopyObjectInput) (*CopyObjectOutput, error)
 
 	// CreateMultipartUpload starts an upload of key and returns its ID

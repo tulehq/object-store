@@ -14,6 +14,7 @@ import (
 	"tule.dev/sigv4"
 
 	"tule.dev/object-store/internal/contracts"
+	"tule.dev/object-store/internal/postpolicy"
 	"tule.dev/object-store/internal/s3api"
 )
 
@@ -125,11 +126,16 @@ func header(name string) func(*http.Request) (string, bool) {
 	}
 }
 
-// authType is s3:authType: REST-QUERY-STRING for a presigned URL,
-// REST-HEADER for an Authorization header. It tells them apart with the
-// test Verify makes (a non-empty X-Amz-Algorithm query parameter, with
+// authType is s3:authType: POST for a POST Object form, verified by its
+// POST policy, REST-QUERY-STRING for a presigned URL, REST-HEADER for an
+// Authorization header ("Amazon S3 condition keys", Signature Version 4
+// authentication-specific policy keys). It tells the last two apart with
+// the test Verify makes (a non-empty X-Amz-Algorithm query parameter, with
 // presigned URLs accepted), since sigv4 does not report which it verified.
 func authType(r *http.Request) (string, bool) {
+	if _, ok := postpolicy.FromContext(r.Context()); ok {
+		return "POST", true
+	}
 	if r.URL.Query().Get("X-Amz-Algorithm") != "" {
 		return "REST-QUERY-STRING", true
 	}

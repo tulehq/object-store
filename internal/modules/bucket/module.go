@@ -1,6 +1,7 @@
 // Package bucket serves the S3 bucket operations: listing buckets and their
-// contents, creating and deleting buckets, reading bucket configuration, and
-// batch object deletes.
+// contents, creating and deleting buckets, reading bucket configuration,
+// batch object deletes, and POST Object forms, which it hands to the object
+// module.
 package bucket
 
 import (
@@ -12,6 +13,7 @@ import (
 
 	"tule.dev/object-store/internal/authz"
 	"tule.dev/object-store/internal/contracts"
+	"tule.dev/object-store/internal/modules/object"
 )
 
 const moduleName = "tule/modules/bucket"
@@ -33,13 +35,16 @@ type Module struct {
 	// destinations validates the destinations of a notification
 	// configuration before it is stored.
 	destinations contracts.Destinations
+	// objects stores the POST Object forms posted to a bucket, which are
+	// object writes.
+	objects *object.Module
 }
 
 // NewModule returns a Module serving from storage, reading request
 // documents through verifier, authorizing operations with az and binding
-// bucket policies' principals with bound, and validating notification
-// destinations with dests. It registers its routes when the app
-// initializes it.
+// bucket policies' principals with bound, validating notification
+// destinations with dests, and storing POST Object forms with objects. It
+// registers its routes when the app initializes it.
 func NewModule(
 	router *gas.Router,
 	logger gas.Logger,
@@ -48,6 +53,7 @@ func NewModule(
 	az *authz.Authorizer,
 	bound contracts.PolicyPrincipals,
 	dests contracts.Destinations,
+	objects *object.Module,
 ) *Module {
 	return &Module{
 		router:       router,
@@ -57,6 +63,7 @@ func NewModule(
 		authz:        az,
 		principals:   bound,
 		destinations: dests,
+		objects:      objects,
 	}
 }
 
@@ -91,6 +98,6 @@ func (m *Module) registerRoutes() {
 		m.router.Handle(m, http.MethodHead, p, m.headBucket)     // Check a bucket exists
 		m.router.Handle(m, http.MethodPut, p, m.putBucket)       // Create bucket
 		m.router.Handle(m, http.MethodDelete, p, m.deleteBucket) // Delete (empty) bucket
-		m.router.Handle(m, http.MethodPost, p, m.postBucket)     // Delete objects (?delete)
+		m.router.Handle(m, http.MethodPost, p, m.postBucket)     // Delete objects, or POST Object
 	}
 }
